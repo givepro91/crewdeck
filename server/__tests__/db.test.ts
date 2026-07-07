@@ -128,12 +128,15 @@ describe('Agent creation with project foreign key', () => {
     }).toThrow();
   });
 
-  it('rejects invalid role value', () => {
-    expect(() => {
-      db.prepare(
-        `INSERT INTO agents (id, project_id, name, role) VALUES (?, ?, ?, ?)`
-      ).run('agent4', 'proj-fk', 'X', 'hacker');
-    }).toThrow();
+  it('accepts arbitrary role values (role CHECK constraint intentionally removed)', () => {
+    // Custom project-defined agents (.claude/agents/*.md) can declare any role,
+    // so the schema migration drops the legacy role CHECK — see schema.ts migrate().
+    db.prepare(
+      `INSERT INTO agents (id, project_id, name, role) VALUES (?, ?, ?, ?)`
+    ).run('agent4', 'proj-fk', 'X', 'growth_hacker');
+
+    const row = db.prepare('SELECT role FROM agents WHERE id = ?').get('agent4') as any;
+    expect(row.role).toBe('growth_hacker');
   });
 });
 

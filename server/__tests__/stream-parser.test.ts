@@ -60,13 +60,16 @@ describe('parseStreamJson — valid stream-json output', () => {
 });
 
 describe('parseStreamJson — empty string', () => {
-  it('returns empty/null fields', () => {
+  it('returns empty fields with an empty-stdout diagnostic error', () => {
     const result = parseStreamJson('');
     expect(result.text).toBe('');
     expect(result.sessionId).toBeNull();
     expect(result.lineCount).toBe(0);
     expect(result.toolUses).toHaveLength(0);
-    expect(result.errors).toHaveLength(0);
+    // Empty stdout is a failure signal, not a silent no-op — the parser
+    // reports it so the task doesn't false-positive as "completed with no output".
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toMatch(/Empty stdout/);
   });
 });
 
@@ -112,13 +115,18 @@ describe('parseStreamJson — error extraction', () => {
   });
 
   it('collects multiple errors across lines', () => {
+    // Include an assistant text line so the unrelated "no text extracted"
+    // fallback warning doesn't inflate the error count (same convention as
+    // the rate_limit_event tests below).
     const lines = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'done' }] } }),
       JSON.stringify({ type: 'error', message: 'Error one' }),
       JSON.stringify({ type: 'error', message: 'Error two' }),
     ].join('\n');
 
     const result = parseStreamJson(lines);
     expect(result.errors).toHaveLength(2);
+    expect(result.errors).toEqual(['Error one', 'Error two']);
   });
 });
 

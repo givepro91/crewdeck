@@ -18,7 +18,6 @@
     "build:dashboard": "cd dashboard && npm run build && mkdir -p ../dist/dashboard && cp -r dist/* ../dist/dashboard/",
     "postbuild": "mkdir -p dist/server/core/nova-rules && cp -r server/core/nova-rules/*.md server/core/nova-rules/*.json dist/server/core/nova-rules/ 2>/dev/null; chmod +x dist/bin/nova-orbit.js",
     "start": "node dist/bin/nova-orbit.js",
-    "db:migrate": "tsx server/db/migrate.ts",
     "sync:nova": "bash scripts/sync-nova-rules.sh",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
@@ -49,7 +48,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "better-sqlite3": "^12.8.0",
+    "better-sqlite3": "^12.11.1",
     "express": "^5.2.1",
     "ws": "^8.20.0",
     "yaml": "^2.8.3"
