@@ -48,7 +48,8 @@ if [ "$ts_changed" = "true" ]; then
 
   if printf '%s\n' "$staged" | grep -q '^dashboard/'; then
     echo "[pre-commit] typecheck (dashboard)..."
-    if ! (cd dashboard && npx -s tsc --noEmit); then
+    # 주의: tsconfig.json이 files:[]+references 구조라 `tsc --noEmit`은 아무것도 검사하지 않는다.
+    if ! (cd dashboard && npx -s tsc -b); then
       echo "[pre-commit] ❌ dashboard typecheck 실패" >&2
       exit 1
     fi

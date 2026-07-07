@@ -3,7 +3,12 @@
 > 이 파일이 프로젝트의 살아있는 상태 문서다 (구 `NOVA-STATE.md` 대체 — Nova Engineering 방법론 파일은 2026-07-07 폐기).
 > 굵직한 세션을 마칠 때마다 갱신한다.
 
-## 현재 상태 (2026-07-07 · R1+R2+실프로젝트 dogfooding 완료)
+## 현재 상태 (2026-07-07 · 일상 도구화 완료 — 상시 기동 운영 모드)
+
+- **일상 도구화 세션 완료**: `npm run build` → `node dist/bin/nova-orbit.js` 패키지 실행 경로 검증 (4월 이후 처음 — dashboard 빌드가 실제로 깨져 있던 것 발견·수정), launchd 상시 기동(`scripts/service-macos.sh`, label `com.nova-orbit.server`), **데이터 디렉토리 정식 위치 `~/.nova-orbit` 확정** + 오늘 dogfooding 데이터(휘발성 tmp에 있던 proof·smoke-calc DB) 이관. D-2(tech stack 감지)·D-3(한글 slug) 해소.
+- 이제 로그인하면 서버가 이미 떠 있다: `http://localhost:7200` (관리: `scripts/service-macos.sh status|logs|restart`, dev 시 predev가 자동 정지).
+
+## (기록) R1+R2+실프로젝트 dogfooding 완료 시점 상태
 
 - **실프로젝트 dogfooding 성공** (`givepro91/proof` — Python+React 모노레포): AI 목표 추천 → "감사·원장 어휘 폐기 → 카피 통일" goal(7태스크) → Evaluator 차별 판정(pass/conditional/fail) → fail 자동수정·blocked 자동재시도 → 서버 3회 중단·복구 관통 → acceptance(pytest 146) → 승인 리뷰(스코프 이탈 검출·원복 포함) → **main 머지 `46fb88d`**, vitest 38/38·pytest 146/146 그린.
 - dogfooding이 **P1 1건 발견 → 수정**: architect residue 자동커밋이 사용자의 기존 untracked 자산(목업 PNG 6개)을 "잔여물"로 오인해 **대상 레포 main에 직접 커밋**. 세션 전 dirty 스냅샷 대비 신규 항목만 스테이징·커밋하도록 수정 (사용자 main은 수동 원복 완료).
@@ -63,10 +68,20 @@
 | # | 발견 | 등급 | 조치 |
 |---|------|------|------|
 | D-1 | **architect residue 커밋이 사용자 main 오염** — pre-existing untracked 자산을 잔여물로 오인해 대상 레포 main에 커밋 | **P1** | **수정**: 세션 전 dirty 스냅샷 기준선 + 신규 경로만 `git add` (add -A . 제거) |
-| D-2 | tech stack 감지 실패 — `requirements-dev.txt`(접미사)·중첩 `web/package.json`(모노레포) 미인식 → 팀 제안 fallback | Medium | 미해소 — analyzer 확장 필요 |
-| D-3 | 한글 goal 제목이 slugify에서 통째로 소거 → `goal-goal-xxx` 무의미 worktree/브랜치명 | Low | 미해소 — 유니코드 slug 또는 goal id 사용 |
+| D-2 | tech stack 감지 실패 — `requirements-dev.txt`(접미사)·중첩 `web/package.json`(모노레포) 미인식 → 팀 제안 fallback | Medium | **해소 (07-07)**: analyzer가 루트+1-depth 하위 디렉토리 순회, `requirements*.txt` 변형 인식 — proof 실물로 검증(Python+TS+React+pytest 감지), 회귀테스트 4건. 단, 기존 등록 프로젝트의 저장된 tech_stack은 소급 안 됨(재분석 endpoint 없음 — 아래 표) |
+| D-3 | 한글 goal 제목이 slugify에서 통째로 소거 → `goal-goal-xxx` 무의미 worktree/브랜치명 | Low | **해소 (07-07)**: worktree·github 브랜치 slug 한글 보존(NFC), 빈 slug 시 `agent/x/` 잘못된 ref 방지 fallback — 회귀테스트 5건 (`worktree-slug.test.ts`) |
 | D-4 | (관찰) 실레포 스케일: 태스크 ~7분/$1.7/116K tokens, 7태스크 goal ~2.5h @ concurrency 1 — 야간 autopilot 전제로는 적정, 대화형 UX로는 김 | — | 참고 데이터 |
 | D-5 | (긍정 실증) Evaluator 차별 판정·fail→자동수정·blocked→백오프 재시도·restoreCheckpoint 부분 롤백·3회 중단-복구·에이전트의 worktree npm install 적응 — 전부 설계대로 동작 | — | — |
+
+### 일상 도구화 세션 발견 (2026-07-07)
+
+| # | 발견 | 등급 | 조치 |
+|---|------|------|------|
+| T-1 | **dashboard 빌드가 4월부터 깨져 있었음** — `tsc -b` 에러 2건(ActivityFeed 타입, ProjectHome null 가드). 그동안의 "dashboard tsc PASS"는 `npx tsc --noEmit`이 files:[]+references 구조에서 **아무것도 검사하지 않는 no-op**이었던 착시 | P1 | **수정**: 에러 2건 해소 + 검증 명령을 `tsc -b`로 정정 (AGENTS.md·pre-commit hook) |
+| T-2 | health API의 package.json 경로가 dist 구조에서 미해석 → version "unknown" | Low | **수정**: dev/dist 양쪽 후보 경로 탐색 |
+| T-3 | 대시보드 API key가 최초 1회만 브라우저에 발급(`.key-issued`) — 새 브라우저·다른 origin(localhost↔127.0.0.1)에서 잠기고 **복구 UI가 없음** (마커 수동 삭제 필요). 이관 직후라 마커 리셋해둠 — 다음 브라우저 접속이 key를 받아감 | Medium | 미해소 — 대시보드에 key 재연결 플로우(파일 경로 안내 + 수동 입력) 필요 |
+| T-4 | 기존 등록 프로젝트의 tech_stack 재분석 endpoint 부재 — D-2 수정이 신규 임포트에만 적용 | Low | 미해소 |
+| T-5 | **번들 실행 시 role preset 전멸** — `roles.ts`가 `__dirname` 고정 3-up으로 templates를 찾는데, dist 루트 chunk 기준으로는 레포 밖을 가리켜 ENOENT → 9종 preset 전부 fallback 프롬프트로 강등 (dev tsx에서는 재현 안 됨, 서비스 첫 spec spawn 로그에서 발견) | P2 | **수정**: dev/dist 깊이별 후보 경로 순회 + cwd fallback |
 
 ### 유지보수성 / 부채
 
@@ -104,6 +119,7 @@ R1 승계 gap 전부 해소 + 크래시 복구(SIGKILL 2회)·환경 오류(clau
 
 | 날짜 | 내용 |
 |------|------|
+| 2026-07-07 (6) | 일상 도구화: dist 실행 경로 검증(T-1 dashboard 빌드 파손 발견·수정), 데이터 디렉토리 `~/.nova-orbit` 확정+이관(휘발성 tmp에서 구조), launchd 상시 기동(`service-macos.sh`), D-2·D-3 해소(회귀테스트 9건), typecheck 명령 정정. 검증: tsc×2 PASS, vitest 171/171, 산출물 서버 curl+Playwright 관통 |
 | 2026-07-07 (5) | R3 결정: **개인 운영 도구(givepro91) 확정, 사내 보류, 대외 제품화 중단** — 분석 `docs/design/r3-product-direction.md`, README 상태 표기. 부활 로드맵(R1·R2·dogfooding·R3) 전체 완료 |
 | 2026-07-07 (4) | 실프로젝트 dogfooding (proof): AI 추천 goal 완주 → main 머지 `46fb88d`. P1(architect residue의 사용자 자산 오커밋) 발견·수정, D-2~D-5 기록. 검증: tsc×2 PASS, vitest 162/162, proof 양 스택 테스트 그린 |
 | 2026-07-07 (3) | Phase R2: R1 gaps 10건 해소 + 크래시/환경 오류 E2E로 P0 3건(worktree 삭제·env 가짜 done·WIP 커밋 부재) 발견·수정. 최종 관통 `29bf871` (acceptance 게이트 포함). audit 11→1. 검증: tsc×2 PASS, vitest 162/162 |

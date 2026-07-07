@@ -447,6 +447,12 @@ export function dropCheckpoint(worktreePath: string, taskId: string): void {
   log.info(`Dropped stash checkpoint for task ${taskId}`);
 }
 
+// 한글 보존 slug — engine.ts goalSlug와 동일 문자 클래스 (D-3: 한글 제목이 통째로 소거돼
+// goal-goal-xxx 무의미 이름이 되던 문제). NFC 정규화로 macOS NFD 입력도 흡수.
 function slugify(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return s
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/[^a-z0-9가-힣]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }

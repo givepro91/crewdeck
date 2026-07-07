@@ -28,92 +28,13 @@ export function analyzeProject(dirPath: string): AnalysisResult {
     packageManager: undefined,
   };
 
-  const files = listTopLevelFiles(dirPath);
-
-  // Node.js / TypeScript / JavaScript
-  if (files.includes("package.json")) {
-    const pkg = readJsonSafe(join(dirPath, "package.json"));
-    techStack.packageManager = files.includes("pnpm-lock.yaml")
-      ? "pnpm"
-      : files.includes("yarn.lock")
-        ? "yarn"
-        : "npm";
-
-    const allDeps = {
-      ...(pkg.dependencies ?? {}),
-      ...(pkg.devDependencies ?? {}),
-    };
-
-    if (allDeps.typescript || files.includes("tsconfig.json")) {
-      techStack.languages.push("TypeScript");
-    } else {
-      techStack.languages.push("JavaScript");
-    }
-
-    // Frameworks
-    if (allDeps.next) techStack.frameworks.push("Next.js");
-    if (allDeps.react) techStack.frameworks.push("React");
-    if (allDeps.vue) techStack.frameworks.push("Vue");
-    if (allDeps.svelte) techStack.frameworks.push("Svelte");
-    if (allDeps.express) techStack.frameworks.push("Express");
-    if (allDeps.fastify) techStack.frameworks.push("Fastify");
-    if (allDeps["@nestjs/core"]) techStack.frameworks.push("NestJS");
-    if (allDeps.tailwindcss) techStack.frameworks.push("TailwindCSS");
-
-    // Build tools
-    if (allDeps.vite) techStack.buildTool = "Vite";
-    else if (allDeps.webpack) techStack.buildTool = "Webpack";
-    else if (allDeps.tsup) techStack.buildTool = "tsup";
-
-    // Test frameworks
-    if (allDeps.vitest) techStack.testFramework = "Vitest";
-    else if (allDeps.jest) techStack.testFramework = "Jest";
-    else if (allDeps.mocha) techStack.testFramework = "Mocha";
-  }
-
-  // Python
-  if (files.includes("requirements.txt") || files.includes("pyproject.toml") || files.includes("setup.py")) {
-    techStack.languages.push("Python");
-    if (files.includes("pyproject.toml")) {
-      const content = readFileSafe(join(dirPath, "pyproject.toml"));
-      if (content.includes("django")) techStack.frameworks.push("Django");
-      if (content.includes("fastapi")) techStack.frameworks.push("FastAPI");
-      if (content.includes("flask")) techStack.frameworks.push("Flask");
-      if (content.includes("pytest")) techStack.testFramework = "pytest";
-    }
-    techStack.packageManager = files.includes("poetry.lock") ? "Poetry" : "pip";
-  }
-
-  // Java / Kotlin
-  if (files.includes("build.gradle") || files.includes("build.gradle.kts") || files.includes("pom.xml")) {
-    if (files.includes("build.gradle.kts")) {
-      techStack.languages.push("Kotlin");
-    } else {
-      techStack.languages.push("Java");
-    }
-    techStack.buildTool = files.includes("pom.xml") ? "Maven" : "Gradle";
-    const content = readFileSafe(
-      join(dirPath, files.includes("pom.xml") ? "pom.xml" : "build.gradle"),
-    );
-    if (content.includes("spring")) techStack.frameworks.push("Spring Boot");
-  }
-
-  // Go
-  if (files.includes("go.mod")) {
-    techStack.languages.push("Go");
-    const content = readFileSafe(join(dirPath, "go.mod"));
-    if (content.includes("gin")) techStack.frameworks.push("Gin");
-    if (content.includes("echo")) techStack.frameworks.push("Echo");
-  }
-
-  // Rust
-  if (files.includes("Cargo.toml")) {
-    techStack.languages.push("Rust");
-    techStack.buildTool = "Cargo";
-  }
-
-  // Directory structure hints
+  // 루트 + 1-depth 하위 디렉토리 순회 — 모노레포(web/package.json 등)의 중첩 매니페스트 인식.
+  // 루트를 먼저 처리하므로 packageManager/buildTool/testFramework 단일 필드는 루트가 우선.
   const dirs = listSubDirs(dirPath);
+  detectDirStack(dirPath, techStack);
+  for (const sub of dirs) {
+    detectDirStack(join(dirPath, sub), techStack);
+  }
   if (dirs.includes("src") || dirs.includes("lib")) {
     // Standard project structure
   }
@@ -132,6 +53,100 @@ export function analyzeProject(dirPath: string): AnalysisResult {
 
   log.info("Analysis complete", { techStack, agents: suggestedAgents.length, mission: mission.slice(0, 50) });
   return { techStack, suggestedAgents, mission, projectDocs };
+}
+
+/** 한 디렉토리의 매니페스트 파일들로 techStack을 누적 감지 (dedupe, 단일 필드는 선착순 유지) */
+function detectDirStack(dirPath: string, techStack: TechStack): void {
+  const files = listTopLevelFiles(dirPath);
+  const addLang = (v: string) => { if (!techStack.languages.includes(v)) techStack.languages.push(v); };
+  const addFw = (v: string) => { if (!techStack.frameworks.includes(v)) techStack.frameworks.push(v); };
+
+  // Node.js / TypeScript / JavaScript
+  if (files.includes("package.json")) {
+    const pkg = readJsonSafe(join(dirPath, "package.json"));
+    techStack.packageManager ??= files.includes("pnpm-lock.yaml")
+      ? "pnpm"
+      : files.includes("yarn.lock")
+        ? "yarn"
+        : "npm";
+
+    const allDeps = {
+      ...(pkg.dependencies ?? {}),
+      ...(pkg.devDependencies ?? {}),
+    };
+
+    if (allDeps.typescript || files.includes("tsconfig.json")) {
+      addLang("TypeScript");
+    } else {
+      addLang("JavaScript");
+    }
+
+    // Frameworks
+    if (allDeps.next) addFw("Next.js");
+    if (allDeps.react) addFw("React");
+    if (allDeps.vue) addFw("Vue");
+    if (allDeps.svelte) addFw("Svelte");
+    if (allDeps.express) addFw("Express");
+    if (allDeps.fastify) addFw("Fastify");
+    if (allDeps["@nestjs/core"]) addFw("NestJS");
+    if (allDeps.tailwindcss) addFw("TailwindCSS");
+
+    // Build tools
+    if (allDeps.vite) techStack.buildTool ??= "Vite";
+    else if (allDeps.webpack) techStack.buildTool ??= "Webpack";
+    else if (allDeps.tsup) techStack.buildTool ??= "tsup";
+
+    // Test frameworks
+    if (allDeps.vitest) techStack.testFramework ??= "Vitest";
+    else if (allDeps.jest) techStack.testFramework ??= "Jest";
+    else if (allDeps.mocha) techStack.testFramework ??= "Mocha";
+  }
+
+  // Python — requirements.txt 변형(requirements-dev.txt 등)도 인식 (D-2)
+  const reqFiles = files.filter((f) => /^requirements[\w.-]*\.txt$/.test(f));
+  if (reqFiles.length > 0 || files.includes("pyproject.toml") || files.includes("setup.py")) {
+    addLang("Python");
+    const pyManifests = [
+      ...(files.includes("pyproject.toml") ? ["pyproject.toml"] : []),
+      ...reqFiles,
+    ];
+    for (const manifest of pyManifests) {
+      const content = readFileSafe(join(dirPath, manifest));
+      if (content.includes("django")) addFw("Django");
+      if (content.includes("fastapi")) addFw("FastAPI");
+      if (content.includes("flask")) addFw("Flask");
+      if (content.includes("pytest")) techStack.testFramework ??= "pytest";
+    }
+    techStack.packageManager ??= files.includes("poetry.lock") ? "Poetry" : "pip";
+  }
+
+  // Java / Kotlin
+  if (files.includes("build.gradle") || files.includes("build.gradle.kts") || files.includes("pom.xml")) {
+    if (files.includes("build.gradle.kts")) {
+      addLang("Kotlin");
+    } else {
+      addLang("Java");
+    }
+    techStack.buildTool ??= files.includes("pom.xml") ? "Maven" : "Gradle";
+    const content = readFileSafe(
+      join(dirPath, files.includes("pom.xml") ? "pom.xml" : "build.gradle"),
+    );
+    if (content.includes("spring")) addFw("Spring Boot");
+  }
+
+  // Go
+  if (files.includes("go.mod")) {
+    addLang("Go");
+    const content = readFileSafe(join(dirPath, "go.mod"));
+    if (content.includes("gin")) addFw("Gin");
+    if (content.includes("echo")) addFw("Echo");
+  }
+
+  // Rust
+  if (files.includes("Cargo.toml")) {
+    addLang("Rust");
+    techStack.buildTool ??= "Cargo";
+  }
 }
 
 function suggestAgents(

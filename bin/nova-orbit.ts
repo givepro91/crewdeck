@@ -1,8 +1,25 @@
 import { resolve } from "node:path";
+import { homedir } from "node:os";
 import { existsSync } from "node:fs";
 import { exec } from "node:child_process";
 
 const DEFAULT_PORT = 7200;
+
+/**
+ * 데이터 디렉토리 결정 순서:
+ * 1. --data-dir=<path> 플래그
+ * 2. NOVA_ORBIT_DATA_DIR 환경변수
+ * 3. cwd의 기존 .nova-orbit (레거시 — DB가 이미 있을 때만)
+ * 4. ~/.nova-orbit (정식 기본 위치)
+ */
+function resolveDataDir(args: string[]): string {
+  const flag = args.find((a) => a.startsWith("--data-dir="))?.split("=")[1];
+  if (flag) return resolve(flag);
+  if (process.env.NOVA_ORBIT_DATA_DIR) return resolve(process.env.NOVA_ORBIT_DATA_DIR);
+  const cwdDir = resolve(process.cwd(), ".nova-orbit");
+  if (existsSync(resolve(cwdDir, "nova-orbit.db"))) return cwdDir;
+  return resolve(homedir(), ".nova-orbit");
+}
 
 async function main() {
   const args = process.argv.slice(2);
@@ -20,11 +37,13 @@ async function main() {
   `);
 
   // Ensure data directory exists
-  const dataDir = resolve(process.cwd(), ".nova-orbit");
+  const dataDir = resolveDataDir(args);
   if (!existsSync(dataDir)) {
     const { mkdirSync } = await import("node:fs");
     mkdirSync(dataDir, { recursive: true });
     console.log(`  Created data directory: ${dataDir}`);
+  } else {
+    console.log(`  Data directory: ${dataDir}`);
   }
 
   // Start server

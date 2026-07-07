@@ -95,15 +95,17 @@ export function createAgentBranch(
   taskTitle: string,
 ): string {
   const slug = taskTitle
+    .normalize("NFC")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 50);
+    .replace(/[^a-z0-9가-힣]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 50) || "task"; // 빈 slug면 agent/x/ 형태의 잘못된 ref가 됨
 
   const sanitizedAgent = agentName
+    .normalize("NFC")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
+    .replace(/[^a-z0-9가-힣]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "agent";
 
   const branch = `agent/${sanitizedAgent}/${slug}`;
 

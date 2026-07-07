@@ -72,7 +72,12 @@ function formatWsMessage(
     case "project:updated":
       return t("activityProjectUpdated");
     case "system:error": {
-      const errMsg = p.error?.message ?? p.message ?? type;
+      // payload.error는 문자열 또는 { message } 객체 양쪽으로 broadcast됨
+      const err = p.error as unknown;
+      const errMsg =
+        (typeof err === "string" ? err : (err as { message?: string } | null)?.message) ??
+        p.message ??
+        type;
       const errAgent = p.agentName ? `[${p.agentName}] ` : "";
       return `${errAgent}${t("activitySystemError", { message: errMsg })}`;
     }

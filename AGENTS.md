@@ -23,12 +23,16 @@ npm run build                       # server (tsup) + dashboard (vite)
 npm start                           # 빌드 산출물 실행 (dist/bin/nova-orbit.js)
 
 npm run typecheck                   # server tsc --noEmit
-cd dashboard && npx tsc --noEmit    # dashboard tsc --noEmit
+cd dashboard && npx tsc -b          # dashboard typecheck — ⚠ `tsc --noEmit`은 files:[]+references 구조라 no-op
 npm test                            # vitest run (unit only — 통합/E2E 없음)
+
+# 상시 기동 (macOS launchd — 로그인 자동 시작, 개인 도구 운영 모드)
+scripts/service-macos.sh install|start|stop|restart|status|logs
 ```
 
 - Node >= 20. `better-sqlite3`는 네이티브 모듈 — Node 메이저 변경 시 재설치/`npm rebuild better-sqlite3` 필요.
 - 런타임 전제: `claude` CLI가 PATH에 있고 인증된 상태여야 오케스트레이션이 동작한다.
+- **데이터 디렉토리 정식 위치 = `~/.nova-orbit`** (bin 해석 순서: `--data-dir=` > `NOVA_ORBIT_DATA_DIR` > cwd `.nova-orbit`(DB 있을 때만, 레거시) > `~/.nova-orbit`). dev(`npm run dev`)는 레포 로컬 `.nova-orbit` 사용 — 상시 서비스와 데이터가 분리된다. `npm run dev`는 predev가 launchd 서비스를 자동 정지하므로, dev 종료 후 `scripts/service-macos.sh start`로 복구.
 
 ## Non-Negotiables
 

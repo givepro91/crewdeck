@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
@@ -18,9 +18,16 @@ export interface AgentPreset {
 
 // Resolve templates/agents/ relative to this file's location at runtime.
 // __dirname is unavailable in ESM; derive it from import.meta.url instead.
+// dev(server/core/agent)와 번들(dist 루트 chunk / dist/server) 각각 깊이가 달라 후보 순회.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const TEMPLATES_DIR = join(__dirname, "../../../templates/agents");
+const TEMPLATE_CANDIDATES = [
+  join(__dirname, "../../../templates/agents"), // dev: server/core/agent/ → repo/templates
+  join(__dirname, "../../templates/agents"),    // dist/server/ → pkg/templates
+  join(__dirname, "../templates/agents"),       // dist/ 루트 chunk → pkg/templates
+  join(process.cwd(), "templates/agents"),      // fallback: cwd
+];
+const TEMPLATES_DIR = TEMPLATE_CANDIDATES.find((p) => existsSync(p)) ?? TEMPLATE_CANDIDATES[0];
 
 let _cache: Map<string, AgentPreset> | null = null;
 

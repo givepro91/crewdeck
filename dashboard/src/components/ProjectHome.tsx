@@ -2144,6 +2144,7 @@ export function ProjectHome() {
                     )}
                     <button
                       onClick={async () => {
+                        if (!currentProjectId) return;
                         const result = await api.orchestration.reassignAll(currentProjectId);
                         showToast(t("reassignAllDone", { count: result.count }), "success");
                         loadData();

@@ -196,8 +196,11 @@ export async function startServer(config: ServerConfig): Promise<void> {
   app.get("/api/health", (_req, res) => {
     let version = "unknown";
     try {
-      const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-      version = JSON.parse(readFileSync(pkgPath, "utf-8")).version;
+      // dev: server/../package.json · dist: dist/server/../../package.json
+      const here = dirname(fileURLToPath(import.meta.url));
+      const pkgPath = [resolve(here, "..", "package.json"), resolve(here, "..", "..", "package.json")]
+        .find((p) => existsSync(p));
+      if (pkgPath) version = JSON.parse(readFileSync(pkgPath, "utf-8")).version;
     } catch { /* fallback */ }
     res.json({ status: "ok", version });
   });
