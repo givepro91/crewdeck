@@ -79,7 +79,7 @@
 |---|------|------|------|
 | T-1 | **dashboard 빌드가 4월부터 깨져 있었음** — `tsc -b` 에러 2건(ActivityFeed 타입, ProjectHome null 가드). 그동안의 "dashboard tsc PASS"는 `npx tsc --noEmit`이 files:[]+references 구조에서 **아무것도 검사하지 않는 no-op**이었던 착시 | P1 | **수정**: 에러 2건 해소 + 검증 명령을 `tsc -b`로 정정 (AGENTS.md·pre-commit hook) |
 | T-2 | health API의 package.json 경로가 dist 구조에서 미해석 → version "unknown" | Low | **수정**: dev/dist 양쪽 후보 경로 탐색 |
-| T-3 | 대시보드 API key가 최초 1회만 브라우저에 발급(`.key-issued`) — 새 브라우저·다른 origin(localhost↔127.0.0.1)에서 잠기고 **복구 UI가 없음** (마커 수동 삭제 필요). 이관 직후라 마커 리셋해둠 — 다음 브라우저 접속이 key를 받아감 | Medium | 미해소 — 대시보드에 key 재연결 플로우(파일 경로 안내 + 수동 입력) 필요 |
+| T-3 | 대시보드 API key가 최초 1회만 브라우저에 발급(`.key-issued`) — 낡은 키가 localStorage에 있으면 `initAuth`가 재발급 시도조차 안 해 401 무한 반복 (데이터 디렉토리 이관 직후 실제 발생) | Medium | **부분 해소 (07-08)**: 401 시 키 폐기→재발급 1회 자동 시도→성공 시 리로드 (`api.ts tryReauth`, Playwright 검증). 잔여: 마커가 살아 있는 상태의 다른 브라우저는 여전히 잠김 — key 수동 입력 UI 필요 |
 | T-4 | 기존 등록 프로젝트의 tech_stack 재분석 endpoint 부재 — D-2 수정이 신규 임포트에만 적용 | Low | 미해소 |
 | T-5 | **번들 실행 시 role preset 전멸** — `roles.ts`가 `__dirname` 고정 3-up으로 templates를 찾는데, dist 루트 chunk 기준으로는 레포 밖을 가리켜 ENOENT → 9종 preset 전부 fallback 프롬프트로 강등 (dev tsx에서는 재현 안 됨, 서비스 첫 spec spawn 로그에서 발견) | P2 | **수정**: dev/dist 깊이별 후보 경로 순회 + cwd fallback |
 | T-6 | **스케줄러 reviewer-gate 데드락** — "reviewer 태스크는 sibling 완료까지 연기" 휴리스틱이 DAG를 무시. decompose가 감사/분석 태스크(DAG 루트)를 reviewer 역할에 배정하자 루트는 gate에 연기, siblings는 루트 의존 대기 → 순환 대기로 큐 영구 정지 (proof goal 2호 "목업 정합 감사 매트릭스"에서 실측, stuck 경고만 반복) | **P1** | **수정**: 미완료 dependent가 있는 reviewer 태스크는 gate 면제 — DAG가 순서를 이미 보장 |

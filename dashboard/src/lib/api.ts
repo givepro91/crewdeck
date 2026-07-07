@@ -21,6 +21,26 @@ export async function initAuth(): Promise<void> {
   }
 }
 
+// 401 복구 — localStorage의 키가 낡았을 때(데이터 디렉토리 교체·키 회전 등) 재발급을
+// 페이지 로드당 1회만 시도한다. 서버 발급 마커(.key-issued)가 살아 있으면 403이라 실패하고,
+// 그 경우 기존대로 Unauthorized를 던진다 (마커 리셋은 서버 쪽 수동 조치).
+let reauthPromise: Promise<boolean> | null = null;
+function tryReauth(): Promise<boolean> {
+  reauthPromise ??= (async () => {
+    apiKey = null;
+    localStorage.removeItem("nova-orbit-api-key");
+    try {
+      const res = await fetch("/api/auth/key?init=true");
+      if (!res.ok) return false;
+      setApiKey((await res.json()).key);
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  return reauthPromise;
+}
+
 // Global server status — components can check this
 let serverDown = false;
 export function isServerDown() { return serverDown; }
@@ -41,6 +61,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       window.dispatchEvent(new CustomEvent("nova:server-status", { detail: { up: true } }));
     }
     if (!res.ok) {
+      if (res.status === 401 && (await tryReauth())) {
+        // 새 키 확보 — 전체 상태(WS 포함)를 깨끗하게 다시 세우기 위해 리로드
+        window.location.reload();
+        return new Promise<never>(() => {});
+      }
       const body = await res.json().catch(() => ({ error: res.statusText }));
       const err = new Error(body.error ?? "Request failed");
       (err as any).status = res.status;
