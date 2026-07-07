@@ -52,6 +52,12 @@ Claude Code 네이티브가 Nova Orbit의 오케스트레이션 코어와 정면
 - C: CC Agent Teams 안정화(experimental 해제) 시점에 "Nova Quality Gate as CC Workflow/plugin" PoC 1회 — Evaluator 프롬프트·verdict 스키마·acceptance 게이트는 그대로 이식 가능한 자산.
 - A 포기에 따른 정리: README의 대외 제품 포지셔닝(vs Paperclip 비교표 등)은 방향 확정 후 사내 도구 톤으로 조정.
 
-## 5. 결정
+## 5. 결정 (2026-07-07 확정)
 
-- [ ] 사용자 확정 대기 — 확정 시 이 문서와 ROADMAP에 결정 기록.
+**개인 운영 도구(givepro91)로 확정. 사내(SPWK) 활용은 보류.**
+
+- 대외 제품화(A)는 추진하지 않는다 — npm publish 없음, 외부 사용자 획득 없음.
+- givepro91 개인 프로젝트(proof 등)의 야간 autopilot + 품질 게이트로 상시 운용하며, 운용 중 발견되는 결함만 수정한다 (dogfooding = 유지보수 신호).
+- 사내 확산은 보류 — 필요가 생기면 그때 재검토.
+- C(Quality Gate의 CC 생태계 이식)는 이번에 확정하지 않음 — CC Agent Teams 안정화 시점에 재판단.
+- 후속 정리 후보(비긴급): 레포 위치(TeamSPWK → 개인 계정) 재검토, README의 대외 제품 포지셔닝 완화(이번에 상태 표기 추가).

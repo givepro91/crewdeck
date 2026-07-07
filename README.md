@@ -4,6 +4,9 @@
 
 "Build like a team, even when you're alone." — Orchestrate Claude Code sessions as AI agents, decompose goals into tasks, and verify every output with Nova Quality Gate.
 
+> **Status (2026-07)**: 개인 운영 도구로 유지·관리된다 (대외 배포/npm publish 계획 없음).
+> 방향 결정의 배경과 현재 상태는 `docs/design/r3-product-direction.md` · `docs/ROADMAP.md` 참고.
+
 ## Screenshots
 
 ### Dark Mode (Korean)

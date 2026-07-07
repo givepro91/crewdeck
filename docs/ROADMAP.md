@@ -91,8 +91,8 @@
 R1 승계 gap 전부 해소 + 크래시 복구(SIGKILL 2회)·환경 오류(claude-less 격리 서버) E2E 실측으로 P0 3건 추가 발견·수정. 최종 관통: acceptance 게이트 포함 goal이 main 머지(`29bf871`)까지 완주.
 미완주 잔여: PR 모드 실검증(원격 저장소 필요), concurrency>1 고부하 — 아래 유지보수 표 참고.
 
-### Phase R3 — 제품 방향 재점검 (전략) — 분석 완료, 결정 대기
-**분석 문서: `docs/design/r3-product-direction.md`** (2026-07-07). 요지: CC 네이티브 Agent Teams/Workflows 등장으로 오케스트레이션 축의 대외 제품화(A)는 비추천. **추천 = B(사내/개인 운영 도구 확정) + C(Quality Gate의 CC 생태계 이식을 탐색 과제로)**. 사용자 결정 대기.
+### ~~Phase R3 — 제품 방향 재점검~~ ✅ 결정 완료 (2026-07-07)
+**결정: 개인 운영 도구(givepro91)로 확정, 사내 활용 보류, 대외 제품화 중단.** 분석·결정 상세: `docs/design/r3-product-direction.md`. 이후 운영 모델: 개인 프로젝트 dogfooding 중 발견 결함만 수정. C(Quality Gate의 CC 생태계 이식)는 CC Agent Teams 안정화 시 재판단.
 
 #### (기록) R3 원래 프레임
 개발 중단(2026-04) 이후 Claude Code 자체가 네이티브 멀티에이전트(팀/워크플로우) 기능을 갖추며 가치제안이 일부 겹침. 부활 시점의 차별화 포인트 재정의 필요:
@@ -104,6 +104,7 @@ R1 승계 gap 전부 해소 + 크래시 복구(SIGKILL 2회)·환경 오류(clau
 
 | 날짜 | 내용 |
 |------|------|
+| 2026-07-07 (5) | R3 결정: **개인 운영 도구(givepro91) 확정, 사내 보류, 대외 제품화 중단** — 분석 `docs/design/r3-product-direction.md`, README 상태 표기. 부활 로드맵(R1·R2·dogfooding·R3) 전체 완료 |
 | 2026-07-07 (4) | 실프로젝트 dogfooding (proof): AI 추천 goal 완주 → main 머지 `46fb88d`. P1(architect residue의 사용자 자산 오커밋) 발견·수정, D-2~D-5 기록. 검증: tsc×2 PASS, vitest 162/162, proof 양 스택 테스트 그린 |
 | 2026-07-07 (3) | Phase R2: R1 gaps 10건 해소 + 크래시/환경 오류 E2E로 P0 3건(worktree 삭제·env 가짜 done·WIP 커밋 부재) 발견·수정. 최종 관통 `29bf871` (acceptance 게이트 포함). audit 11→1. 검증: tsc×2 PASS, vitest 162/162 |
 | 2026-07-07 (2) | Phase R1 스모크: smoke-calc 대상 전 루프 실관통 성공 (`6c2cd21` squash merge). P0 checkpoint stash WIP 파괴 + P1 대시보드 백화 발견·수정, 회귀테스트 6건 추가, 발견 이슈 7건 Known Gaps 승계. 검증: tsc×2 PASS, vitest 157/157 |
