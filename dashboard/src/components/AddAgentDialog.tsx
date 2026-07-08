@@ -289,7 +289,11 @@ export function AddAgentDialog({
   return (
     <div
       className="fixed inset-0 bg-black/20 dark:bg-black/50 flex items-center justify-center z-50"
-      onClick={onClose}
+      onClick={() => {
+        // 설계 로딩 중 backdrop 오클릭으로 모달이 닫히는 사고 방지 — 명시적 취소/뒤로만 허용
+        if (mode === "smart" && scanLoading) return;
+        onClose();
+      }}
     >
       <div
         className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[540px] max-w-[calc(100vw-2rem)] max-h-[85vh] overflow-y-auto"

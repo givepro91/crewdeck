@@ -1528,13 +1528,31 @@ export function ProjectHome() {
               </button>
             );
           })}
-          <button
-            onClick={() => window.dispatchEvent(new CustomEvent("nova:show-guide"))}
-            title={t("viewGuide")}
-            className="ml-auto mb-2 text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400 transition-colors text-sm font-medium w-5 h-5 flex items-center justify-center rounded-full border border-gray-200 dark:border-gray-700 hover:border-gray-400 dark:hover:border-gray-500"
-          >
-            ?
-          </button>
+          <div className="ml-auto mb-2 flex items-center gap-2">
+            {/* AI 팀 설계 상태 칩 — 탭 바에 두어 어느 탭·에이전트 0명 상태에서도 보이게 */}
+            {!showAddAgent && teamDesign && (
+              <button
+                onClick={() => { setAddAgentSmart(true); setShowAddAgent(true); }}
+                className={`flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-lg font-medium transition-colors whitespace-nowrap ${
+                  teamDesign === "running"
+                    ? "bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50"
+                    : "bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/50"
+                }`}
+              >
+                {teamDesign === "running" && (
+                  <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
+                )}
+                {teamDesign === "running" ? t("teamDesignRunning") : t("teamDesignReady")}
+              </button>
+            )}
+            <button
+              onClick={() => window.dispatchEvent(new CustomEvent("nova:show-guide"))}
+              title={t("viewGuide")}
+              className="text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400 transition-colors text-sm font-medium w-5 h-5 flex items-center justify-center rounded-full border border-gray-200 dark:border-gray-700 hover:border-gray-400 dark:hover:border-gray-500"
+            >
+              ?
+            </button>
+          </div>
         </div>
 
         {tab === "settings" ? (
@@ -1625,21 +1643,6 @@ export function ProjectHome() {
                             ({t("agentCount", { count: agents.length })})
                           </span>
                         </span>
-                        {!showAddAgent && teamDesign && (
-                          <button
-                            onClick={() => { setAddAgentSmart(true); setShowAddAgent(true); }}
-                            className={`shrink-0 flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded-lg font-medium transition-colors whitespace-nowrap ${
-                              teamDesign === "running"
-                                ? "bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50"
-                                : "bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/50"
-                            }`}
-                          >
-                            {teamDesign === "running" && (
-                              <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
-                            )}
-                            {teamDesign === "running" ? t("teamDesignRunning") : t("teamDesignReady")}
-                          </button>
-                        )}
                         <button
                           onClick={() => setTab("agents")}
                           className="shrink-0 text-blue-500 hover:text-blue-700 dark:hover:text-blue-300 transition-colors whitespace-nowrap"

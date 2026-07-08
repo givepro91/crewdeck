@@ -100,6 +100,10 @@ export function createAgentRoutes(ctx: AppContext): Router {
 
         // AI 팀 설계 (opt-in) — .claude/agents/ 사용자 정의가 있으면 그쪽이 우선
         if (mode === "ai" && !hasProjectDefs) {
+          // 클라이언트 이탈 감지 — 전송 전에 연결이 닫히면(새로고침·모달 이탈) 미소비로 남긴다.
+          // 주의: req.destroyed는 Node가 body를 다 읽은 정상 요청에서도 true라 판정에 못 쓴다.
+          let clientAborted = false;
+          res.once("close", () => { if (!res.writableEnded) clientAborted = true; });
           try {
             // 진행 상태 broadcast — 새로고침/모달 이탈 후에도 UI가 진행 중임을 표시할 수 있게
             broadcast("team_design:status", { projectId: project_id, state: "running" });
@@ -111,8 +115,8 @@ export function createAgentRoutes(ctx: AppContext): Router {
             }, { refresh: refresh === true });
             broadcast("team_design:status", { projectId: project_id, state: "ready" });
             // 이 응답이 실제로 클라이언트에 도달하는 경우에만 소비 처리 —
-            // 새로고침으로 연결이 끊긴 요청은 미소비로 남아 "결과 보기" 칩의 근거가 된다
-            if (!req.destroyed) markDesignConsumed(project_id);
+            // 이탈한 요청은 미소비로 남아 "결과 보기" 칩의 근거가 된다
+            if (!clientAborted) markDesignConsumed(project_id);
             return res.json(designed);
           } catch (err: any) {
             broadcast("team_design:status", { projectId: project_id, state: "failed" });
