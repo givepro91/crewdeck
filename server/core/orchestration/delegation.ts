@@ -94,9 +94,24 @@ export function createDelegationEngine(
         "SELECT COUNT(*) as count FROM tasks WHERE parent_task_id = ?",
       ).get(taskId) as { count: number };
       if (existingSubtasks.count > 0) {
-        log.info(`Task ${taskId} already has ${existingSubtasks.count} subtasks — skipping re-delegation`);
-        // Re-mark parent as in_progress so subtask completion flow works
+        const nonTerminal = db.prepare(
+          "SELECT COUNT(*) as count FROM tasks WHERE parent_task_id = ? AND status IN ('todo', 'pending_approval', 'in_progress', 'in_review')",
+        ).get(taskId) as { count: number };
+
+        if (nonTerminal.count > 0) {
+          log.info(`Task ${taskId} already has ${existingSubtasks.count} subtasks (${nonTerminal.count} active) — skipping re-delegation, waiting`);
+          // Re-mark parent as in_progress so subtask completion flow works
+          db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = datetime('now') WHERE id = ? AND status = 'todo'").run(taskId);
+          return { delegated: true, subtaskIds: [] };
+        }
+
+        // 하위 작업이 전부 종결됐는데 부모가 다시 실행됐다 = 마지막 하위 작업 완료
+        // 시점의 checkParentCompletion 을 놓친 상태 (당시 부모가 todo 로 리셋돼 CAS
+        // 불발 등). 완료 신호는 다시 오지 않으므로 여기서 직접 완료 흐름을 밟는다.
+        // 방치하면 "대기 → 30분 뒤 ghost 복구(todo) → 재픽 → 대기" 무한 루프 (07-08 실측).
+        log.info(`Task ${taskId}: all ${existingSubtasks.count} subtasks terminal — running parent completion now`);
         db.prepare("UPDATE tasks SET status = 'in_progress', updated_at = datetime('now') WHERE id = ? AND status = 'todo'").run(taskId);
+        await this.checkParentCompletion(taskId);
         return { delegated: true, subtaskIds: [] };
       }
 
@@ -270,11 +285,13 @@ Respond in this EXACT JSON format:
       if (!task) return;
 
       if (allDone) {
-        // CAS guard: atomically transition parent to in_review only if it's still
-        // in_progress. Prevents duplicate verification when multiple subtasks
-        // finish concurrently — only the first caller wins the CAS.
+        // CAS guard: atomically transition parent to in_review. Prevents duplicate
+        // verification when multiple subtasks finish concurrently — only the first
+        // caller wins the CAS. 'todo' 도 허용: ghost 복구/재시도 분류가 부모를 todo 로
+        // 되돌린 채 마지막 하위 작업이 완료되면, in_progress 한정 CAS 는 불발되고
+        // 완료 신호가 영영 다시 오지 않는다 (07-08 실측 — 30분 ghost 루프의 시작점).
         const cas = db.prepare(
-          "UPDATE tasks SET status = 'in_review', updated_at = datetime('now') WHERE id = ? AND status = 'in_progress'",
+          "UPDATE tasks SET status = 'in_review', updated_at = datetime('now') WHERE id = ? AND status IN ('in_progress', 'todo')",
         ).run(parentTaskId);
         if (cas.changes === 0) return; // already transitioned by concurrent caller
 
