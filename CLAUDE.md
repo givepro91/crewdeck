@@ -61,6 +61,7 @@ templates/agents/     → 9 role presets (cto, pm, backend, frontend, ux, qa, re
 - **spawn 전 emit**: `session.process`가 null인 상태에서 이벤트 emit하면 리스너가 데이터를 못 잡음. spawn 후 즉시 별도 이벤트로 전달.
 - **Node 메이저 업그레이드**: `better-sqlite3` 네이티브 빌드가 깨진다. 업그레이드 전 지원 범위 확인 (2026-07: Node 26 ↔ better-sqlite3 ^12.11.1).
 - **`npm run build:server` 단독 실행 금지**: tsup `clean:true`가 dist 전체를 비우는데 postbuild(dashboard·nova-rules 복사)는 `build`에서만 실행된다 → 서빙 중인 dist/dashboard가 증발. 항상 `npm run build` 전체 실행.
+- **drain 없이 서비스 재시작 금지**: 실행 중 에이전트 세션이 SIGTERM(exit 143)으로 죽는다. 절차 = 큐 정지 → activeTasks=0 대기 → 빌드 → restart → 큐 재가동 (ROADMAP 현재 상태 참고). 대시보드만 변경 시 `npm run build:dashboard`(루트에서)로 무중단.
 
 ## 세션 마무리
 

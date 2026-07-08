@@ -3,10 +3,13 @@
 > 이 파일이 프로젝트의 살아있는 상태 문서다 (구 `NOVA-STATE.md` 대체 — Nova Engineering 방법론 파일은 2026-07-07 폐기).
 > 굵직한 세션을 마칠 때마다 갱신한다.
 
-## 현재 상태 (2026-07-07 · 일상 도구화 완료 — 상시 기동 운영 모드)
+## 현재 상태 (2026-07-08 · 병렬 실행 + 검증 수렴 + 상태 가시화 — 상시 기동 운영 모드)
 
-- **일상 도구화 세션 완료**: `npm run build` → `node dist/bin/nova-orbit.js` 패키지 실행 경로 검증 (4월 이후 처음 — dashboard 빌드가 실제로 깨져 있던 것 발견·수정), launchd 상시 기동(`scripts/service-macos.sh`, label `com.nova-orbit.server`), **데이터 디렉토리 정식 위치 `~/.nova-orbit` 확정** + 오늘 dogfooding 데이터(휘발성 tmp에 있던 proof·smoke-calc DB) 이관. D-2(tech stack 감지)·D-3(한글 slug) 해소.
-- 이제 로그인하면 서버가 이미 떠 있다: `http://localhost:7200` (관리: `scripts/service-macos.sh status|logs|restart`, dev 시 predev가 자동 정지).
+- **goal 간 병렬 실행** (기본 동시성 2): goal 내부는 순차 1 유지, worktree 격리로 안전. decompose는 lookahead 1개 선행 파이프라인. 큐 재시작 3중 결함(stop 무시·busy wipe 이중 스폰·위임 기아)과 오류 책임 분류(사용량 한도가 재시도 예산을 태우던 것) 근본수정.
+- **검증 수렴 보장**: fail 라운드 상한(기본 3) 도달 시 완료 처리 + 미해결 이슈 goal QA 이월(`verification-policy.ts`), Evaluator 재검증 범위 게이트, 폐기 diff 보존 — 7라운드 무한 검토 인시던트의 재발 방지 3중 장치.
+- **상태 가시화**: 태스크 상세 좌/우 분할 + 라이브 활동 터미널(심장박동+실시간 명령 스트림), 대기 사유 칩, 실패 사유 인라인, 하위 작업 진행 칩, 재시도 카운터. Evaluator 이슈 메시지 한국어화.
+- 로그인하면 서버가 이미 떠 있다: `http://localhost:7200` (관리: `scripts/service-macos.sh status|logs|restart`, dev 시 predev가 자동 정지). 데이터 정식 위치 `~/.nova-orbit`.
+- ⚠ **서버 재배포 절차**: 큐 정지(stop-queue) → activeTasks=0 drain → `npm run build` 전체 → `service-macos.sh restart` → 큐 재가동. drain 없이 재시작하면 실행 중 에이전트 세션이 SIGTERM으로 죽는다(분류기가 예산은 보호하지만 작업 시간 손실). 대시보드만 변경 시 `npm run build:dashboard`(루트에서)로 무중단 배포.
 
 ## (기록) R1+R2+실프로젝트 dogfooding 완료 시점 상태
 
