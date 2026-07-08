@@ -234,6 +234,10 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
     const childTasks = subtaskMap[task.id];
     const hasChildren = childTasks && childTasks.length > 0;
     const isExpanded = expandedParents.has(task.id);
+    // 위임 부모의 실제 진행 상태 — 부모 status는 위임 동안 todo/in_progress로 남아
+    // "멈춘 것처럼" 보이므로, 하위 작업 집계를 부모 행에 직접 표기한다
+    const childDone = hasChildren ? childTasks.filter((c) => c.status === "done").length : 0;
+    const childActive = hasChildren && childTasks.some((c) => c.status === "in_progress" || c.status === "in_review");
 
     return (
       <div key={task.id}>
@@ -264,6 +268,20 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
               <span className="text-gray-300 dark:text-gray-600 text-xs shrink-0">└</span>
             )}
             <span className="text-sm text-gray-800 dark:text-gray-200 truncate">{task.title}</span>
+          {hasChildren && task.status !== "done" && (
+            <span
+              className={`text-[10px] px-1.5 py-0.5 rounded-full shrink-0 ${
+                childActive
+                  ? "bg-blue-50 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400 animate-pulse"
+                  : "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400"
+              }`}
+              title={t("subtaskProgressHint")}
+            >
+              {childActive
+                ? t("subtaskProgressActive", { done: childDone, total: childTasks.length })
+                : t("subtaskProgress", { done: childDone, total: childTasks.length })}
+            </span>
+          )}
           {task.verification_verdict ? (
             <span
               className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium shrink-0 cursor-help ${
