@@ -21,6 +21,22 @@ const DIM_LABEL_KEYS: Record<string, string> = {
   edgeCases: "dimEdgeCases",
 };
 
+// Live activity: kind → { icon, i18n label key }. Unknown kinds fall back to "tool".
+const ACTIVITY_KIND_META: Record<string, { icon: string; labelKey: string }> = {
+  command: { icon: "$", labelKey: "activityKindCommand" },
+  file_read: { icon: "◎", labelKey: "activityKindFileRead" },
+  file_edit: { icon: "✎", labelKey: "activityKindFileEdit" },
+  search: { icon: "⌕", labelKey: "activityKindSearch" },
+  text: { icon: "…", labelKey: "activityKindText" },
+  tool: { icon: "⚙", labelKey: "activityKindTool" },
+};
+
+interface ActivityEvent {
+  ts: string;
+  kind: string;
+  detail: string;
+}
+
 interface Task {
   id: string;
   title: string;
@@ -241,6 +257,12 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
             </div>
           </div>
 
+          {/* Live activity — 실행 중인 태스크의 담당 에이전트 실시간 활동 */}
+          {(status === "in_progress" || status === "in_review") && assigneeId && (
+            // key=agentId → remount (fresh state) when the assignee changes
+            <LiveActivity key={assigneeId} agentId={assigneeId} />
+          )}
+
           {/* Approval Gate — pending_approval 상태일 때만 표시 */}
           {task.status === "pending_approval" && (
             <div className="border border-amber-200 dark:border-amber-800 rounded-lg p-4 bg-amber-50 dark:bg-amber-900/20 space-y-3">
@@ -384,6 +406,101 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Live activity feed for the task's assigned agent. Fetches the ring buffer on
+ * open, then appends `agent:activity` WebSocket events. A 5s local timer keeps
+ * the "heartbeat" (time since last activity) fresh without server round-trips.
+ */
+function LiveActivity({ agentId }: { agentId: string }) {
+  const { t } = useTranslation();
+  const [events, setEvents] = useState<ActivityEvent[]>([]);
+  const [lastEventAt, setLastEventAt] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  // Load initial buffer + subscribe to live events for this agent.
+  // State starts empty on mount; the parent remounts via key={agentId} when the
+  // assignee changes, so no manual reset is needed here.
+  useEffect(() => {
+    let alive = true;
+    api.agents.activityLog(agentId).then((data) => {
+      if (!alive) return;
+      setEvents(data.events);
+      setLastEventAt(data.lastEventAt);
+    }).catch(() => { /* agent may have no activity yet */ });
+
+    const onActivity = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { agentId: string; event: ActivityEvent; lastEventAt: string };
+      if (!detail || detail.agentId !== agentId) return;
+      setEvents((prev) => [...prev, detail.event].slice(-50));
+      setLastEventAt(detail.lastEventAt ?? detail.event.ts);
+    };
+    window.addEventListener("nova:agent-activity", onActivity);
+    return () => {
+      alive = false;
+      window.removeEventListener("nova:agent-activity", onActivity);
+    };
+  }, [agentId]);
+
+  // Heartbeat tick — recompute elapsed every 5s
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Heartbeat classification: <60s recent (green pulse), <180s idle (gray), else stale (orange)
+  const elapsedSec = lastEventAt ? Math.max(0, Math.floor((now - new Date(lastEventAt).getTime()) / 1000)) : null;
+  let dotClass = "bg-gray-300 dark:bg-gray-600";
+  let heartbeatText = t("activityNone");
+  let textClass = "text-gray-400 dark:text-gray-500";
+  if (elapsedSec !== null) {
+    if (elapsedSec < 60) {
+      dotClass = "bg-green-500 animate-pulse";
+      textClass = "text-green-600 dark:text-green-400";
+      heartbeatText = t("activityRecentSec", { n: elapsedSec });
+    } else if (elapsedSec < 180) {
+      dotClass = "bg-gray-400 dark:bg-gray-500";
+      textClass = "text-gray-500 dark:text-gray-400";
+      heartbeatText = t("activityRecentMin", { n: Math.floor(elapsedSec / 60) });
+    } else {
+      dotClass = "bg-orange-500";
+      textClass = "text-orange-600 dark:text-orange-400";
+      heartbeatText = t("activityStaleMin", { n: Math.floor(elapsedSec / 60) });
+    }
+  }
+
+  const recent = events.slice(-15).reverse();
+
+  return (
+    <div className="border border-gray-100 dark:border-gray-700 rounded-lg p-3 bg-gray-50 dark:bg-gray-800/50 space-y-2">
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wider">{t("liveActivityTitle")}</span>
+        <span className="flex items-center gap-1.5 ml-auto">
+          <span className={`inline-block w-2 h-2 rounded-full ${dotClass}`} />
+          <span className={`text-[11px] ${textClass}`}>{heartbeatText}</span>
+        </span>
+      </div>
+      {recent.length > 0 && (
+        <ul className="space-y-0.5 max-h-56 overflow-y-auto">
+          {recent.map((ev, i) => {
+            const meta = ACTIVITY_KIND_META[ev.kind] ?? ACTIVITY_KIND_META.tool;
+            return (
+              <li key={`${ev.ts}-${i}`} className="flex items-center gap-2 text-[11px] font-mono leading-relaxed">
+                <span className="text-gray-400 dark:text-gray-500 shrink-0 tabular-nums">
+                  {new Date(ev.ts).toLocaleTimeString([], { hour12: false })}
+                </span>
+                <span className="text-gray-500 dark:text-gray-400 shrink-0 w-4 text-center" title={t(meta.labelKey)}>
+                  {meta.icon}
+                </span>
+                <span className="text-gray-700 dark:text-gray-300 truncate">{ev.detail}</span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }

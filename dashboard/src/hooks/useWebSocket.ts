@@ -146,6 +146,10 @@ export function useWebSocket() {
             case "autopilot:full-status":
               window.dispatchEvent(new CustomEvent("nova:autopilot-full-status", { detail: msg.payload }));
               break;
+            case "agent:activity":
+              // Live activity feed for TaskDetail — no full refresh, just append
+              window.dispatchEvent(new CustomEvent("nova:agent-activity", { detail: msg.payload }));
+              break;
             case "agent:status":
             case "project:updated":
               // Trigger a refetch — handled by components

@@ -17,6 +17,7 @@ import { createActivityRoutes } from "./api/routes/activities.js";
 import { createFsRoutes } from "./api/routes/fs.js";
 import { createSessionRoutes } from "./api/routes/sessions.js";
 import { createWSHandler } from "./api/websocket.js";
+import { agentActivityLog } from "./core/agent/activity-log.js";
 
 import { loadOrCreateApiKey, authMiddleware } from "./api/middleware/auth.js";
 import type { Database } from "better-sqlite3";
@@ -174,6 +175,9 @@ export async function startServer(config: ServerConfig): Promise<void> {
   };
 
   const ctx: AppContext = { db, wss, broadcast };
+
+  // Wire the agent activity ring buffer to WebSocket (throttled to 1/sec per agent)
+  agentActivityLog.setBroadcaster(broadcast);
 
   // M-3: pending_approval goal broadcast 재발송 (broadcast 준비 후)
   rebroadcastPendingApprovals(db, broadcast);

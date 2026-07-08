@@ -6,6 +6,7 @@ import { getAgentPresets } from "../../core/agent/roles.js";
 import { suggestAgentsFromMission, suggestFromProject, getTeamPresets } from "../../core/agent/suggest.js";
 import { designTeamCached, getDesignStatus, markDesignConsumed } from "../../core/agent/team-designer.js";
 import { resolvePrompt } from "../../core/agent/prompt-resolver.js";
+import { agentActivityLog } from "../../core/agent/activity-log.js";
 import { getPreset } from "../../core/agent/roles.js";
 import { VALID_ROLES } from "../../utils/constants.js";
 import { createLogger } from "../../utils/logger.js";
@@ -298,6 +299,13 @@ export function createAgentRoutes(ctx: AppContext): Router {
       totalTokens: sessionRow.totalTokens,
       totalCostUsd: sessionRow.totalCostUsd,
     });
+  });
+
+  // Get agent live activity log (in-memory ring buffer — recent 50 events)
+  router.get("/:id/activity-log", (req, res) => {
+    const agent = db.prepare("SELECT id FROM agents WHERE id = ?").get(req.params.id);
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    res.json(agentActivityLog.snapshot(req.params.id));
   });
 
   // Get single agent — resolved_prompt_source 포함

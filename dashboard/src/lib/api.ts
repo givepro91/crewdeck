@@ -144,6 +144,10 @@ export const api = {
     deleteAll: (projectId: string) => request<{ success: boolean; deleted: number }>(`/agents/bulk/${projectId}`, { method: "DELETE" }),
     stats: (id: string) =>
       request<{ taskCount: number; totalTokens: number; totalCostUsd: number }>(`/agents/${id}/stats`),
+    activityLog: (id: string) =>
+      request<{ lastEventAt: string | null; events: Array<{ ts: string; kind: string; detail: string }> }>(
+        `/agents/${id}/activity-log`,
+      ),
   },
   goals: {
     list: (projectId: string) => request<any[]>(`/goals?projectId=${projectId}`),

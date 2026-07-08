@@ -809,6 +809,19 @@ const ko = {
 
   // L-5: GoalSquashApprovalDialog 라벨
   goalSquashDialogGoalLabel: "목표",
+
+  // 라이브 활동 (태스크 상세 — 실행 중 에이전트 실시간 활동)
+  liveActivityTitle: "라이브 활동",
+  activityNone: "아직 활동이 없습니다",
+  activityRecentSec: "{{n}}초 전 활동",
+  activityRecentMin: "{{n}}분 전 활동",
+  activityStaleMin: "{{n}}분째 활동 없음",
+  activityKindCommand: "명령 실행",
+  activityKindFileRead: "파일 읽기",
+  activityKindFileEdit: "파일 수정",
+  activityKindSearch: "검색",
+  activityKindText: "생각 정리",
+  activityKindTool: "도구 사용",
 } as const;
 
 export default ko;

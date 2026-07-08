@@ -808,6 +808,19 @@ const en = {
 
   // L-5: GoalSquashApprovalDialog labels
   goalSquashDialogGoalLabel: "Goal",
+
+  // Live activity (task detail — real-time activity of the running agent)
+  liveActivityTitle: "Live Activity",
+  activityNone: "No activity yet",
+  activityRecentSec: "Active {{n}}s ago",
+  activityRecentMin: "Active {{n}}m ago",
+  activityStaleMin: "No activity for {{n}}m",
+  activityKindCommand: "Command",
+  activityKindFileRead: "Reading file",
+  activityKindFileEdit: "Editing file",
+  activityKindSearch: "Search",
+  activityKindText: "Thinking",
+  activityKindTool: "Tool",
 } as const;
 
 export default en;

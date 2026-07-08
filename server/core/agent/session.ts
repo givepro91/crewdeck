@@ -5,6 +5,7 @@ import { createClaudeCodeAdapter, type ClaudeCodeSession } from "./adapters/clau
 import { createLogger } from "../../utils/logger.js";
 import { resolvePrompt } from "./prompt-resolver.js";
 import { loadMemory } from "./memory.js";
+import { agentActivityLog, parseActivityEvents } from "./activity-log.js";
 import { ROLE_DEFAULT_MODEL } from "../../utils/constants.js";
 
 const log = createLogger("session-manager");
@@ -153,11 +154,33 @@ export function createSessionManager(db: Database): SessionManager {
         }
       });
 
+      // Per-session buffer for stream-json line reassembly (chunks split lines).
+      let activityLineBuf = "";
       session.on("output", (text: string) => {
         // Store last output snippet — scope to this specific session row to avoid
         // clobbering sibling sessions that share the same agent_id.
         db.prepare("UPDATE sessions SET last_output = ? WHERE id = ?")
           .run(text.slice(-500), sessionRow.id);
+
+        // Activity ring buffer — parse complete stream-json lines into a
+        // human-readable feed for the dashboard "라이브 활동" view. Recorded
+        // against agentId (survives resume/fix cycles; see ActivityLogStore).
+        activityLineBuf += text;
+        const nl = activityLineBuf.lastIndexOf("\n");
+        if (nl < 0) {
+          // No complete line yet — guard against unbounded growth on a giant
+          // single line (e.g. a huge tool result) by keeping only the tail.
+          if (activityLineBuf.length > 1_000_000) activityLineBuf = activityLineBuf.slice(-1_000_000);
+          return;
+        }
+        const complete = activityLineBuf.slice(0, nl);
+        activityLineBuf = activityLineBuf.slice(nl + 1);
+        for (const line of complete.split("\n")) {
+          if (!line.trim()) continue;
+          for (const ev of parseActivityEvents(line)) {
+            agentActivityLog.record(agentId, ev.kind, ev.detail);
+          }
+        }
       });
 
       sessions.set(key, session);
