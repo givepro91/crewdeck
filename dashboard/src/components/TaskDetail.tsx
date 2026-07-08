@@ -22,13 +22,14 @@ const DIM_LABEL_KEYS: Record<string, string> = {
 };
 
 // Live activity: kind → { icon, i18n label key }. Unknown kinds fall back to "tool".
-const ACTIVITY_KIND_META: Record<string, { icon: string; labelKey: string }> = {
-  command: { icon: "$", labelKey: "activityKindCommand" },
-  file_read: { icon: "◎", labelKey: "activityKindFileRead" },
-  file_edit: { icon: "✎", labelKey: "activityKindFileEdit" },
-  search: { icon: "⌕", labelKey: "activityKindSearch" },
-  text: { icon: "…", labelKey: "activityKindText" },
-  tool: { icon: "⚙", labelKey: "activityKindTool" },
+// 터미널 룩: kind별 프롬프트 기호 + 색 (다크 터미널 배경 전제의 고정 팔레트)
+const ACTIVITY_KIND_META: Record<string, { icon: string; labelKey: string; iconClass: string }> = {
+  command: { icon: "$", labelKey: "activityKindCommand", iconClass: "text-green-400" },
+  file_read: { icon: "◎", labelKey: "activityKindFileRead", iconClass: "text-sky-400" },
+  file_edit: { icon: "✎", labelKey: "activityKindFileEdit", iconClass: "text-amber-400" },
+  search: { icon: "⌕", labelKey: "activityKindSearch", iconClass: "text-violet-400" },
+  text: { icon: "…", labelKey: "activityKindText", iconClass: "text-gray-500" },
+  tool: { icon: "⚙", labelKey: "activityKindTool", iconClass: "text-gray-400" },
 };
 
 interface ActivityEvent {
@@ -164,7 +165,7 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
       onClick={handleOverlayClick}
     >
-      <div className="relative w-full max-w-lg mx-4 bg-white dark:bg-[#1e1e2e] rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+      <div className="relative w-full max-w-3xl mx-4 bg-white dark:bg-[#1e1e2e] rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-700">
           <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200">{t("taskDetail")}</h2>
@@ -177,7 +178,7 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
         </div>
 
         {/* Body */}
-        <div className="px-5 py-4 space-y-4 max-h-[70vh] overflow-y-auto">
+        <div className="px-5 py-4 space-y-4 max-h-[82vh] overflow-y-auto">
           {/* Title */}
           <div>
             <p className="text-base font-medium text-gray-900 dark:text-gray-100">{task.title}</p>
@@ -472,35 +473,59 @@ function LiveActivity({ agentId }: { agentId: string }) {
     }
   }
 
-  const recent = events.slice(-15).reverse();
+  // 터미널 순서: 오래된 것 위 → 최신 아래, 새 이벤트 시 맨 아래로 자동 스크롤
+  const recent = events.slice(-30);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [events.length]);
 
   return (
-    <div className="border border-gray-100 dark:border-gray-700 rounded-lg p-3 bg-gray-50 dark:bg-gray-800/50 space-y-2">
-      <div className="flex items-center gap-2">
-        <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wider">{t("liveActivityTitle")}</span>
+    // 터미널은 의도적으로 라이트/다크 공통 다크 패널 (터미널 관례)
+    <div className="rounded-lg overflow-hidden border border-gray-800 bg-[#0d1117] shadow-inner">
+      {/* 터미널 타이틀바 — 신호등 + 제목 + 심장박동 */}
+      <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-gray-800">
+        <span className="flex gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full bg-red-500/80" />
+          <span className="w-2.5 h-2.5 rounded-full bg-yellow-500/80" />
+          <span className="w-2.5 h-2.5 rounded-full bg-green-500/80" />
+        </span>
+        <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wider ml-1">{t("liveActivityTitle")}</span>
         <span className="flex items-center gap-1.5 ml-auto">
           <span className={`inline-block w-2 h-2 rounded-full ${dotClass}`} />
           <span className={`text-[11px] ${textClass}`}>{heartbeatText}</span>
         </span>
       </div>
-      {recent.length > 0 && (
-        <ul className="space-y-0.5 max-h-56 overflow-y-auto">
-          {recent.map((ev, i) => {
-            const meta = ACTIVITY_KIND_META[ev.kind] ?? ACTIVITY_KIND_META.tool;
-            return (
-              <li key={`${ev.ts}-${i}`} className="flex items-center gap-2 text-[11px] font-mono leading-relaxed">
-                <span className="text-gray-400 dark:text-gray-500 shrink-0 tabular-nums">
-                  {new Date(ev.ts).toLocaleTimeString([], { hour12: false })}
-                </span>
-                <span className="text-gray-500 dark:text-gray-400 shrink-0 w-4 text-center" title={t(meta.labelKey)}>
-                  {meta.icon}
-                </span>
-                <span className="text-gray-700 dark:text-gray-300 truncate">{ev.detail}</span>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+      {/* 터미널 본문 */}
+      <div ref={scrollRef} className="px-3 py-2 max-h-72 overflow-y-auto font-mono text-[11px] leading-relaxed">
+        {recent.length === 0 ? (
+          <div className="text-gray-500">
+            <span className="text-green-400">$</span> {t("activityWaiting")}
+            <span className="text-gray-300 animate-pulse"> ▋</span>
+          </div>
+        ) : (
+          <>
+            {recent.map((ev, i) => {
+              const meta = ACTIVITY_KIND_META[ev.kind] ?? ACTIVITY_KIND_META.tool;
+              return (
+                <div key={`${ev.ts}-${i}`} className="flex items-start gap-2 whitespace-nowrap">
+                  <span className="text-gray-600 shrink-0 tabular-nums">
+                    {new Date(ev.ts).toLocaleTimeString([], { hour12: false })}
+                  </span>
+                  <span className={`shrink-0 w-4 text-center ${meta.iconClass}`} title={t(meta.labelKey)}>
+                    {meta.icon}
+                  </span>
+                  <span className="text-gray-300 truncate" title={ev.detail}>{ev.detail}</span>
+                </div>
+              );
+            })}
+            <div className="text-green-400">
+              <span className="animate-pulse">▋</span>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

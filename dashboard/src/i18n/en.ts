@@ -812,6 +812,7 @@ const en = {
   // Live activity (task detail — real-time activity of the running agent)
   liveActivityTitle: "Live Activity",
   activityNone: "No activity yet",
+  activityWaiting: "waiting for agent activity",
   activityRecentSec: "Active {{n}}s ago",
   activityRecentMin: "Active {{n}}m ago",
   activityStaleMin: "No activity for {{n}}m",

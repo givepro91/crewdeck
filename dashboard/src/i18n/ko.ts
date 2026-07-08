@@ -813,6 +813,7 @@ const ko = {
   // 라이브 활동 (태스크 상세 — 실행 중 에이전트 실시간 활동)
   liveActivityTitle: "라이브 활동",
   activityNone: "아직 활동이 없습니다",
+  activityWaiting: "에이전트 활동 대기 중",
   activityRecentSec: "{{n}}초 전 활동",
   activityRecentMin: "{{n}}분 전 활동",
   activityStaleMin: "{{n}}분째 활동 없음",
