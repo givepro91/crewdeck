@@ -172,6 +172,7 @@ const en = {
   verdictFail: "FAIL",
   failClickDetail: "Click to see failure details",
   conditionalClickDetail: "Click to see conditional details",
+  moreIssues: "+{{count}} more",
   waitDeps: "waiting on {{count}} task(s)",
   waitDepsHint: "Starts automatically after",
   waitGoalSerial: "goal running another task",

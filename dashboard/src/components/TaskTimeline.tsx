@@ -136,12 +136,17 @@ export function TaskTimeline({ activeTasks, agents }: TaskTimelineProps) {
     const onVerification = (e: Event) => {
       const d = (e as CustomEvent).detail;
       if (!d?.verdict) return;
+      // FAIL/CONDITIONAL은 판정만으로는 정보가 없다 — 첫 이슈를 같이 싣는다
+      const firstIssue =
+        d.verdict !== "pass" && Array.isArray(d.issues) && d.issues.length > 0
+          ? d.issues[0]?.message
+          : null;
       addEvent({
         id: `ev-${++eventCounter}`,
         type: d.verdict === "pass" ? "verified" : "failed",
         taskTitle: "",
         agentName: "Quality Gate",
-        message: d.verdict.toUpperCase(),
+        message: d.verdict.toUpperCase() + (firstIssue ? ` — ${String(firstIssue).slice(0, 100)}` : ""),
         timestamp: new Date(),
       });
     };

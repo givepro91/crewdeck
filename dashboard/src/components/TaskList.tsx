@@ -393,15 +393,26 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
             </span>
           )}
         </div>
-        {/* Block reason — show top verification failure for blocked tasks only */}
-        {task.status === "blocked" && task.verification_issues && (() => {
+        {/* 실패 사유 한 줄 노출 — blocked 뿐 아니라 "FAIL 후 재시도 중"(todo/in_progress로
+            돌아간 상태)에도 보여준다. FAIL 배지만으로는 무엇이 왜 실패했는지 알 수 없어
+            사용자가 매번 상세를 열거나 물어봐야 했다. 행 클릭 시 상세에서 전체 목록. */}
+        {(task.status === "blocked" || task.verification_verdict === "fail") && task.verification_issues && (() => {
           try {
             const issues = JSON.parse(task.verification_issues);
             if (!Array.isArray(issues) || issues.length === 0) return null;
             const top = issues[0];
+            const fileRef = top.file
+              ? `${String(top.file).split("/").pop()}${top.line != null ? `:${top.line}` : ""} — `
+              : "";
             return (
-              <div className="text-[11px] text-red-500/80 dark:text-red-400/70 pl-6 truncate" title={top.message}>
-                {top.severity === "critical" ? "⚠ " : ""}{top.message?.slice(0, 120)}
+              <div
+                className="text-[11px] text-red-500/80 dark:text-red-400/70 pl-6 truncate"
+                title={`${top.message ?? ""}\n\n${t("failClickDetail")}`}
+              >
+                {top.severity === "critical" ? "⚠ " : ""}{fileRef}{top.message?.slice(0, 140)}
+                {issues.length > 1 && (
+                  <span className="text-red-400/60 dark:text-red-500/50"> · {t("moreIssues", { count: issues.length - 1 })}</span>
+                )}
               </div>
             );
           } catch { return null; }
