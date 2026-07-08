@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
+import { LiveActivity } from "./LiveActivity";
 
 const STATUSES = ["pending_approval", "todo", "in_progress", "in_review", "done", "blocked"];
 
@@ -13,6 +14,16 @@ const STATUS_LABEL_KEYS: Record<string, string> = {
   blocked: "statusBlocked",
 };
 
+// 헤더 상태 칩 — status 값과 동기화되는 컬러 배지
+const STATUS_CHIP_CLASS: Record<string, string> = {
+  pending_approval: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300",
+  todo: "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300",
+  in_progress: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
+  in_review: "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300",
+  done: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300",
+  blocked: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
+};
+
 const DIM_LABEL_KEYS: Record<string, string> = {
   functionality: "dimFunctionality",
   dataFlow: "dimDataFlow",
@@ -20,23 +31,6 @@ const DIM_LABEL_KEYS: Record<string, string> = {
   craft: "dimCraft",
   edgeCases: "dimEdgeCases",
 };
-
-// Live activity: kind → { icon, i18n label key }. Unknown kinds fall back to "tool".
-// 터미널 룩: kind별 프롬프트 기호 + 색 (다크 터미널 배경 전제의 고정 팔레트)
-const ACTIVITY_KIND_META: Record<string, { icon: string; labelKey: string; iconClass: string }> = {
-  command: { icon: "$", labelKey: "activityKindCommand", iconClass: "text-green-400" },
-  file_read: { icon: "◎", labelKey: "activityKindFileRead", iconClass: "text-sky-400" },
-  file_edit: { icon: "✎", labelKey: "activityKindFileEdit", iconClass: "text-amber-400" },
-  search: { icon: "⌕", labelKey: "activityKindSearch", iconClass: "text-violet-400" },
-  text: { icon: "…", labelKey: "activityKindText", iconClass: "text-gray-500" },
-  tool: { icon: "⚙", labelKey: "activityKindTool", iconClass: "text-gray-400" },
-};
-
-interface ActivityEvent {
-  ts: string;
-  kind: string;
-  detail: string;
-}
 
 interface Task {
   id: string;
@@ -97,6 +91,36 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
       });
     }
   }, [task.id, task.verification_id]);
+
+  // 검토 중엔 실제로 일하는 건 담당자가 아니라 검토자(Evaluator) 세션이다 —
+  // 담당자 링만 보여주면 "N분째 활동 없음"으로 멈춘 듯 보인다. 이 태스크를
+  // 잡고 있는 다른 에이전트의 active 세션을 찾아 라이브 페인을 전환한다.
+  const [reviewer, setReviewer] = useState<{ id: string; name: string } | null>(null);
+  useEffect(() => {
+    if (!(status === "in_progress" || status === "in_review")) {
+      setReviewer(null);
+      return;
+    }
+    let alive = true;
+    const probe = () => {
+      api.sessions
+        .list({ status: "active", ...(task.project_id ? { projectId: task.project_id } : {}) })
+        .then((list) => {
+          if (!alive) return;
+          const rev = (list as Array<{ agent_id: string; agent_name: string; current_task_id?: string | null }>).find(
+            (s) => s.current_task_id === task.id && s.agent_id && s.agent_id !== assigneeId,
+          );
+          setReviewer(rev ? { id: rev.agent_id, name: rev.agent_name } : null);
+        })
+        .catch(() => { /* sessions unavailable — keep assignee feed */ });
+    };
+    probe();
+    const timer = setInterval(probe, 15_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [status, task.id, task.project_id, assigneeId]);
 
   // Close on Escape
   useEffect(() => {
@@ -159,8 +183,10 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
     fail: "bg-red-100 text-red-700",
   };
 
-  // 실행 중이면 좌(정보)/우(터미널) 분할 — 터미널이 상시 보이도록
-  const showLive = (status === "in_progress" || status === "in_review") && !!assigneeId;
+  // 실행 중이면 좌(정보)/우(터미널) 분할 — 터미널이 상시 보이도록.
+  // 검토자 세션이 있으면 그 에이전트의 활동을 보여준다 (없으면 담당자).
+  const showLive = (status === "in_progress" || status === "in_review") && (!!assigneeId || !!reviewer);
+  const liveAgentId = reviewer?.id ?? assigneeId;
 
   return (
     <div
@@ -168,30 +194,42 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm"
       onClick={handleOverlayClick}
     >
-      <div className={`relative w-full ${showLive ? "max-w-5xl" : "max-w-3xl"} mx-4 bg-white dark:bg-[#1e1e2e] rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 overflow-hidden`}>
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-700">
-          <h2 className="text-sm font-semibold text-gray-800 dark:text-gray-200">{t("taskDetail")}</h2>
+      {/* 라이브 페인이 있으면 뷰포트를 최대로 사용 (여백 24px), 정보만 있으면 컴팩트 유지 */}
+      <div className={`relative w-full mx-4 bg-white dark:bg-[#1e1e2e] rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700 overflow-hidden ${showLive ? "max-w-[calc(100vw-3rem)] h-[calc(100vh-3rem)] flex flex-col" : "max-w-3xl"}`}>
+        {/* Header — 태스크 제목 + 상태 칩 (본문 제목 중복 제거, 밀도 향상) */}
+        <div className="shrink-0 flex items-center gap-3 px-5 py-3.5 border-b border-gray-200 dark:border-gray-700">
+          <div className="min-w-0 flex-1">
+            <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-gray-500 mb-0.5">
+              {t("taskDetail")}
+            </p>
+            <div className="flex items-center gap-2 min-w-0">
+              <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">
+                {task.title}
+              </h2>
+              <span
+                className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium shrink-0 ${STATUS_CHIP_CLASS[status] ?? "bg-gray-100 text-gray-600"}`}
+              >
+                {t(STATUS_LABEL_KEYS[status] ?? status)}
+              </span>
+            </div>
+          </div>
           <button
             onClick={onClose}
-            className="text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
+            className="shrink-0 text-xs text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 px-2 py-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
           >
             {t("closeDetail")}
           </button>
         </div>
 
-        {/* Body — showLive 시 좌(정보 스크롤)/우(터미널 고정) 2단 */}
-        <div className={showLive ? "flex flex-col md:flex-row md:h-[82vh]" : ""}>
+        {/* Body — showLive 시 좌(정보 스크롤)/우(터미널 고정) 2단, 모달 잔여 높이 전부 사용 */}
+        <div className={showLive ? "flex flex-col md:flex-row flex-1 min-h-0" : ""}>
         <div className={`px-5 py-4 space-y-4 overflow-y-auto ${showLive ? "flex-1 min-w-0 max-h-[40vh] md:max-h-none" : "max-h-[82vh]"}`}>
-          {/* Title */}
-          <div>
-            <p className="text-base font-medium text-gray-900 dark:text-gray-100">{task.title}</p>
-            {task.description && (
-              <div className="mt-3 text-sm text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-[#1a1a2e] rounded-lg p-4 whitespace-pre-wrap leading-relaxed border border-gray-100 dark:border-gray-700">
-                {task.description}
-              </div>
-            )}
-          </div>
+          {/* Description — 제목은 헤더로 이동 */}
+          {task.description && (
+            <div className="text-sm text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-[#1a1a2e] rounded-lg p-4 whitespace-pre-wrap leading-relaxed border border-gray-100 dark:border-gray-700">
+              {task.description}
+            </div>
+          )}
 
           {/* Scope anchor — target files + stack hint (P2) */}
           {(() => {
@@ -404,10 +442,14 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
             </div>
           )}
         </div>
-        {/* 우측 터미널 페인 — 실행 중일 때만. key=agentId → 담당 변경 시 리마운트 */}
+        {/* 우측 터미널 페인 — 실행 중일 때만. key=agentId → 대상 에이전트 변경 시 리마운트 */}
         {showLive && (
-          <div className="md:w-[46%] shrink-0 border-t md:border-t-0 md:border-l border-gray-200 dark:border-gray-700 p-3 flex min-h-[40vh] md:min-h-0">
-            <LiveActivity key={assigneeId} agentId={assigneeId} />
+          <div className="md:w-1/2 shrink-0 border-t md:border-t-0 md:border-l border-gray-200 dark:border-gray-700 p-3 flex min-h-[40vh] md:min-h-0">
+            <LiveActivity
+              key={liveAgentId}
+              agentId={liveAgentId}
+              contextLabel={reviewer ? t("liveActorReviewer", { name: reviewer.name }) : undefined}
+            />
           </div>
         )}
         </div>
@@ -416,123 +458,3 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
   );
 }
 
-/**
- * Live activity feed for the task's assigned agent. Fetches the ring buffer on
- * open, then appends `agent:activity` WebSocket events. A 5s local timer keeps
- * the "heartbeat" (time since last activity) fresh without server round-trips.
- */
-function LiveActivity({ agentId }: { agentId: string }) {
-  const { t } = useTranslation();
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
-  const [lastEventAt, setLastEventAt] = useState<string | null>(null);
-  const [now, setNow] = useState(() => Date.now());
-
-  // Load initial buffer + subscribe to live events for this agent.
-  // State starts empty on mount; the parent remounts via key={agentId} when the
-  // assignee changes, so no manual reset is needed here.
-  useEffect(() => {
-    let alive = true;
-    api.agents.activityLog(agentId).then((data) => {
-      if (!alive) return;
-      setEvents(data.events);
-      setLastEventAt(data.lastEventAt);
-    }).catch(() => { /* agent may have no activity yet */ });
-
-    const onActivity = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { agentId: string; event: ActivityEvent; lastEventAt: string };
-      if (!detail || detail.agentId !== agentId) return;
-      setEvents((prev) => [...prev, detail.event].slice(-50));
-      setLastEventAt(detail.lastEventAt ?? detail.event.ts);
-    };
-    window.addEventListener("nova:agent-activity", onActivity);
-    return () => {
-      alive = false;
-      window.removeEventListener("nova:agent-activity", onActivity);
-    };
-  }, [agentId]);
-
-  // Heartbeat tick — recompute elapsed every 5s
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 5000);
-    return () => clearInterval(timer);
-  }, []);
-
-  // Heartbeat classification: <60s recent (green pulse), <180s idle (gray), else stale (orange)
-  const elapsedSec = lastEventAt ? Math.max(0, Math.floor((now - new Date(lastEventAt).getTime()) / 1000)) : null;
-  let dotClass = "bg-gray-300 dark:bg-gray-600";
-  let heartbeatText = t("activityNone");
-  let textClass = "text-gray-400 dark:text-gray-500";
-  if (elapsedSec !== null) {
-    if (elapsedSec < 60) {
-      dotClass = "bg-green-500 animate-pulse";
-      textClass = "text-green-600 dark:text-green-400";
-      heartbeatText = t("activityRecentSec", { n: elapsedSec });
-    } else if (elapsedSec < 180) {
-      dotClass = "bg-gray-400 dark:bg-gray-500";
-      textClass = "text-gray-500 dark:text-gray-400";
-      heartbeatText = t("activityRecentMin", { n: Math.floor(elapsedSec / 60) });
-    } else {
-      dotClass = "bg-orange-500";
-      textClass = "text-orange-600 dark:text-orange-400";
-      heartbeatText = t("activityStaleMin", { n: Math.floor(elapsedSec / 60) });
-    }
-  }
-
-  // 터미널 순서: 오래된 것 위 → 최신 아래, 새 이벤트 시 맨 아래로 자동 스크롤.
-  // 페인이 세로로 커졌으므로 링버퍼 전체(50건)를 그대로 보여준다.
-  const recent = events;
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [events.length]);
-
-  return (
-    // 터미널은 의도적으로 라이트/다크 공통 다크 패널 (터미널 관례).
-    // 부모(우측 분할 페인)의 높이를 flex로 가득 채운다.
-    <div className="rounded-lg overflow-hidden border border-gray-800 bg-[#0d1117] shadow-inner flex flex-col h-full w-full min-h-0">
-      {/* 터미널 타이틀바 — 신호등 + 제목 + 심장박동 */}
-      <div className="flex items-center gap-2 px-3 py-2 bg-[#161b22] border-b border-gray-800">
-        <span className="flex gap-1.5">
-          <span className="w-2.5 h-2.5 rounded-full bg-red-500/80" />
-          <span className="w-2.5 h-2.5 rounded-full bg-yellow-500/80" />
-          <span className="w-2.5 h-2.5 rounded-full bg-green-500/80" />
-        </span>
-        <span className="text-[10px] font-medium text-gray-400 uppercase tracking-wider ml-1">{t("liveActivityTitle")}</span>
-        <span className="flex items-center gap-1.5 ml-auto">
-          <span className={`inline-block w-2 h-2 rounded-full ${dotClass}`} />
-          <span className={`text-[11px] ${textClass}`}>{heartbeatText}</span>
-        </span>
-      </div>
-      {/* 터미널 본문 — 페인 높이에 맞춰 성장 */}
-      <div ref={scrollRef} className="px-3 py-2 flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-relaxed">
-        {recent.length === 0 ? (
-          <div className="text-gray-500">
-            <span className="text-green-400">$</span> {t("activityWaiting")}
-            <span className="text-gray-300 animate-pulse"> ▋</span>
-          </div>
-        ) : (
-          <>
-            {recent.map((ev, i) => {
-              const meta = ACTIVITY_KIND_META[ev.kind] ?? ACTIVITY_KIND_META.tool;
-              return (
-                <div key={`${ev.ts}-${i}`} className="flex items-start gap-2 whitespace-nowrap">
-                  <span className="text-gray-600 shrink-0 tabular-nums">
-                    {new Date(ev.ts).toLocaleTimeString([], { hour12: false })}
-                  </span>
-                  <span className={`shrink-0 w-4 text-center ${meta.iconClass}`} title={t(meta.labelKey)}>
-                    {meta.icon}
-                  </span>
-                  <span className="text-gray-300 truncate" title={ev.detail}>{ev.detail}</span>
-                </div>
-              );
-            })}
-            <div className="text-green-400">
-              <span className="animate-pulse">▋</span>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}

@@ -16,10 +16,23 @@
 export interface ActivityEvent {
   /** ISO timestamp when recorded */
   ts: string;
-  /** command | file_read | file_edit | search | text | tool */
+  /** command | file_read | file_edit | search | browser | web | subagent | plan | text | tool */
   kind: string;
   /** Short human-readable detail, truncated to ACTIVITY_DETAIL_MAX chars */
   detail: string;
+  /**
+   * Semantic action key within the kind (e.g. browser "click"/"navigate").
+   * Data only — the dashboard maps this to a localized label (i18n rule:
+   * user-facing labels are translated on the frontend, never stored here).
+   */
+  action?: string;
+}
+
+/** Parsed-but-not-yet-stored event (no timestamp). */
+export interface ActivityInput {
+  kind: string;
+  detail: string;
+  action?: string;
 }
 
 export interface ActivitySnapshot {
@@ -50,24 +63,105 @@ const TOOL_KIND: Record<string, string> = {
   Glob: "search",
 };
 
-/** Summarize a tool_use block into { kind, detail }. Pure. */
-function summarizeTool(name: string, input: unknown): { kind: string; detail: string } {
-  const kind = TOOL_KIND[name] ?? "tool";
+const str = (v: unknown): string => (v == null ? "" : String(v));
+const firstLine = (s: string): string => s.split("\n")[0].trim();
+
+/** Best-effort detail for tools we don't specifically know. Pure. */
+function genericDetail(inp: Record<string, unknown>): string {
+  const detail = str(
+    inp.description ?? inp.command ?? inp.file_path ?? inp.path ?? inp.url ??
+    inp.query ?? inp.pattern ?? inp.element ?? inp.name ?? "",
+  );
+  if (detail) return detail;
+  if (Object.keys(inp).length === 0) return "";
+  try { return JSON.stringify(inp); } catch { return ""; }
+}
+
+/**
+ * Extract the human-relevant argument of a Playwright browser_* tool.
+ * The raw input JSON ({"element":"...","target":"e31"}) is meaningless to
+ * users — pull out the one field a person would ask about. Pure.
+ */
+function browserDetail(action: string, inp: Record<string, unknown>): string {
+  switch (action) {
+    case "navigate": return str(inp.url);
+    case "click":
+    case "hover": return str(inp.element);
+    case "type":
+      return [str(inp.element), inp.text ? `"${str(inp.text)}"` : ""].filter(Boolean).join(" — ");
+    case "press_key": return str(inp.key);
+    case "select_option":
+      return [str(inp.element), Array.isArray(inp.values) ? inp.values.join(", ") : ""]
+        .filter(Boolean).join(" — ");
+    case "fill_form":
+      return Array.isArray(inp.fields)
+        ? inp.fields.map((f: any) => str(f?.name)).filter(Boolean).join(", ")
+        : "";
+    case "wait_for":
+      return str(inp.text ?? inp.textGone ?? (inp.time != null ? `${inp.time}s` : ""));
+    case "console_messages": return str(inp.level ?? "");
+    case "evaluate":
+    case "run_code_unsafe": return firstLine(str(inp.function ?? inp.code ?? ""));
+    case "take_screenshot": return str(inp.filename ?? inp.element ?? "");
+    default: return genericDetail(inp);
+  }
+}
+
+/** mcp__<server>__<tool> → tool part, or null if not an MCP tool name. */
+function mcpToolName(name: string): string | null {
+  if (!name.startsWith("mcp__")) return null;
+  const parts = name.split("__");
+  return parts.length >= 3 ? parts[parts.length - 1] : null;
+}
+
+/**
+ * Summarize a tool_use block into { kind, detail, action? }. Pure.
+ * `action` is a semantic key the dashboard localizes; `detail` is data only.
+ */
+function summarizeTool(name: string, input: unknown): ActivityInput {
   const inp = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+
+  // MCP tools (mcp__server__tool) — Playwright browser tools get first-class
+  // treatment (they dominate QA sessions); other MCP tools keep their short name.
+  const mcpTool = mcpToolName(name);
+  if (mcpTool) {
+    if (mcpTool.startsWith("browser_")) {
+      const action = mcpTool.slice("browser_".length);
+      return { kind: "browser", action, detail: browserDetail(action, inp) };
+    }
+    return { kind: "tool", action: mcpTool, detail: genericDetail(inp) };
+  }
+
+  // Native tools with a semantic mapping beyond the basic four kinds
+  switch (name) {
+    case "WebSearch": return { kind: "web", action: "search", detail: str(inp.query) };
+    case "WebFetch": return { kind: "web", action: "fetch", detail: str(inp.url) };
+    case "Agent":
+    case "Task":
+      return {
+        kind: "subagent",
+        action: "delegate",
+        detail: str(inp.description ?? "") || str(inp.prompt ?? "").slice(0, 80),
+      };
+    case "TodoWrite": {
+      const todos = Array.isArray(inp.todos) ? inp.todos : [];
+      const active = todos.find((t: any) => t?.status === "in_progress") ?? todos[0];
+      return { kind: "plan", action: "todo", detail: str(active?.content ?? "") };
+    }
+    case "Skill": return { kind: "tool", action: "skill", detail: str(inp.skill ?? inp.name) };
+  }
+
+  const kind = TOOL_KIND[name] ?? "tool";
   let detail = "";
   if (name === "Bash") {
-    detail = String(inp.command ?? "");
+    detail = str(inp.command);
   } else if (kind === "file_edit" || name === "Read") {
-    detail = String(inp.file_path ?? inp.notebook_path ?? inp.path ?? "");
+    detail = str(inp.file_path ?? inp.notebook_path ?? inp.path ?? "");
   } else if (name === "Grep" || name === "Glob") {
     detail = [inp.pattern, inp.path].filter(Boolean).join(" ");
   } else {
-    detail = String(
-      inp.command ?? inp.file_path ?? inp.path ?? inp.pattern ?? inp.description ?? "",
-    );
-    if (!detail && Object.keys(inp).length > 0) {
-      try { detail = JSON.stringify(inp); } catch { detail = ""; }
-    }
+    // Unknown native tool — keep its name as the action so the UI can label it.
+    return { kind: "tool", action: name, detail: genericDetail(inp) };
   }
   return { kind, detail: detail || name };
 }
@@ -77,8 +171,8 @@ function summarizeTool(name: string, input: unknown): { kind: string; detail: st
  * Returns 0+ events (an assistant turn can carry multiple content blocks).
  * Pure — never throws on malformed input.
  */
-export function parseActivityEvents(line: string): Array<{ kind: string; detail: string }> {
-  const out: Array<{ kind: string; detail: string }> = [];
+export function parseActivityEvents(line: string): ActivityInput[] {
+  const out: ActivityInput[] = [];
   let parsed: any;
   try { parsed = JSON.parse(line); } catch { return out; }
   if (!parsed || typeof parsed !== "object") return out;
@@ -110,8 +204,9 @@ export class AgentActivityRing {
   private _lastEventAt: string | null = null;
 
   /** Append an event, evicting the oldest beyond capacity. Returns the stored event. */
-  push(kind: string, detail: string, ts: string = new Date().toISOString()): ActivityEvent {
-    const ev: ActivityEvent = { ts, kind, detail: truncateDetail(detail) };
+  push(input: ActivityInput, ts: string = new Date().toISOString()): ActivityEvent {
+    const ev: ActivityEvent = { ts, kind: input.kind, detail: truncateDetail(input.detail) };
+    if (input.action) ev.action = input.action;
     this.events.push(ev);
     if (this.events.length > ACTIVITY_RING_SIZE) {
       this.events.splice(0, this.events.length - ACTIVITY_RING_SIZE);
@@ -152,6 +247,8 @@ type Broadcaster = (event: string, data: unknown) => void;
 export class ActivityLogStore {
   private rings = new Map<string, AgentActivityRing>();
   private lastBroadcastAt = new Map<string, number>();
+  private pending = new Map<string, ActivityEvent[]>();
+  private flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private broadcaster: Broadcaster | null = null;
   private readonly throttleMs: number;
 
@@ -170,18 +267,42 @@ export class ActivityLogStore {
     return r;
   }
 
-  /** Record one event; broadcasts `agent:activity` at most once/sec per agent. */
-  record(agentId: string, kind: string, detail: string, ts?: string): ActivityEvent {
-    const ev = this.ring(agentId).push(kind, detail, ts);
-    if (this.broadcaster) {
-      const now = Date.now();
-      const last = this.lastBroadcastAt.get(agentId) ?? 0;
-      if (now - last >= this.throttleMs) {
-        this.lastBroadcastAt.set(agentId, now);
-        this.broadcaster("agent:activity", { agentId, event: ev, lastEventAt: ev.ts });
-      }
+  /**
+   * Record one event. Broadcasts `agent:activity` at most once per throttle
+   * window per agent, but never drops events: within a window they accumulate
+   * and flush as a batch on the trailing edge. Lossless delivery matters —
+   * the dashboard groups the feed by narration events, and a dropped event
+   * would silently corrupt that flow view.
+   */
+  record(agentId: string, input: ActivityInput, ts?: string): ActivityEvent {
+    const ev = this.ring(agentId).push(input, ts);
+    if (!this.broadcaster) return ev;
+    const queue = this.pending.get(agentId) ?? [];
+    queue.push(ev);
+    this.pending.set(agentId, queue);
+    const now = Date.now();
+    const elapsed = now - (this.lastBroadcastAt.get(agentId) ?? 0);
+    if (elapsed >= this.throttleMs) {
+      this.flush(agentId, now);
+    } else if (!this.flushTimers.has(agentId)) {
+      const timer = setTimeout(() => {
+        this.flushTimers.delete(agentId);
+        this.flush(agentId, Date.now());
+      }, this.throttleMs - elapsed);
+      timer.unref?.();
+      this.flushTimers.set(agentId, timer);
     }
     return ev;
+  }
+
+  private flush(agentId: string, now: number): void {
+    const events = this.pending.get(agentId);
+    if (!events?.length || !this.broadcaster) return;
+    this.pending.set(agentId, []);
+    this.lastBroadcastAt.set(agentId, now);
+    const last = events[events.length - 1];
+    // `event` (singular) kept alongside `events` for older dashboard bundles.
+    this.broadcaster("agent:activity", { agentId, events, event: last, lastEventAt: last.ts });
   }
 
   snapshot(agentId: string): ActivitySnapshot {
@@ -190,6 +311,9 @@ export class ActivityLogStore {
 
   reset(agentId: string): void {
     this.rings.get(agentId)?.clear();
+    this.pending.delete(agentId);
+    const timer = this.flushTimers.get(agentId);
+    if (timer) { clearTimeout(timer); this.flushTimers.delete(agentId); }
   }
 }
 

@@ -29,7 +29,7 @@ export function createSessionRoutes(ctx: AppContext): Router {
       SELECT s.id, s.agent_id, s.pid, s.started_at, s.ended_at, s.status,
              s.token_usage, s.cost_usd,
              a.name AS agent_name, a.role AS agent_role, a.status AS agent_status,
-             a.current_activity,
+             a.current_activity, a.current_task_id,
              p.id AS project_id, p.name AS project_name
       FROM sessions s
       JOIN agents a ON s.agent_id = a.id

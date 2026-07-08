@@ -145,7 +145,7 @@ export const api = {
     stats: (id: string) =>
       request<{ taskCount: number; totalTokens: number; totalCostUsd: number }>(`/agents/${id}/stats`),
     activityLog: (id: string) =>
-      request<{ lastEventAt: string | null; events: Array<{ ts: string; kind: string; detail: string }> }>(
+      request<{ lastEventAt: string | null; events: Array<{ ts: string; kind: string; detail: string; action?: string }> }>(
         `/agents/${id}/activity-log`,
       ),
   },
@@ -169,7 +169,7 @@ export const api = {
         `/goals/${goalId}/squash-preview`,
       ),
     squashApprove: (goalId: string) =>
-      request<{ success: boolean; sha?: string; prUrl?: string; error?: string }>(
+      request<{ success: boolean; sha?: string; prUrl?: string; error?: string; resolving?: boolean }>(
         `/goals/${goalId}/squash-approve`, { method: "POST" }
       ),
   },

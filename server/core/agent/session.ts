@@ -178,7 +178,7 @@ export function createSessionManager(db: Database): SessionManager {
         for (const line of complete.split("\n")) {
           if (!line.trim()) continue;
           for (const ev of parseActivityEvents(line)) {
-            agentActivityLog.record(agentId, ev.kind, ev.detail);
+            agentActivityLog.record(agentId, ev);
           }
         }
       });

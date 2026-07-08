@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   AgentActivityRing,
   ActivityLogStore,
@@ -12,7 +12,7 @@ describe('AgentActivityRing — bounded ring buffer', () => {
   it('caps at ACTIVITY_RING_SIZE, evicting oldest first', () => {
     const ring = new AgentActivityRing();
     for (let i = 0; i < ACTIVITY_RING_SIZE + 20; i++) {
-      ring.push('command', `cmd-${i}`, `2026-07-08T00:00:${String(i % 60).padStart(2, '0')}.000Z`);
+      ring.push({ kind: 'command', detail: `cmd-${i}` }, `2026-07-08T00:00:${String(i % 60).padStart(2, '0')}.000Z`);
     }
     const list = ring.list();
     expect(ring.size).toBe(ACTIVITY_RING_SIZE);
@@ -26,15 +26,23 @@ describe('AgentActivityRing — bounded ring buffer', () => {
     const ring = new AgentActivityRing();
     expect(ring.lastEventAt).toBeNull();
     const long = 'x'.repeat(500);
-    const ev = ring.push('text', long, '2026-07-08T01:02:03.000Z');
+    const ev = ring.push({ kind: 'text', detail: long }, '2026-07-08T01:02:03.000Z');
     expect(ev.detail.length).toBe(ACTIVITY_DETAIL_MAX);
     expect(ring.lastEventAt).toBe('2026-07-08T01:02:03.000Z');
   });
 
+  it('preserves the action field when present and omits it when absent', () => {
+    const ring = new AgentActivityRing();
+    const withAction = ring.push({ kind: 'browser', detail: 'a button', action: 'click' });
+    expect(withAction.action).toBe('click');
+    const withoutAction = ring.push({ kind: 'command', detail: 'ls' });
+    expect('action' in withoutAction).toBe(false);
+  });
+
   it('list() preserves chronological order and clear() empties it', () => {
     const ring = new AgentActivityRing();
-    ring.push('command', 'a', '2026-07-08T00:00:01.000Z');
-    ring.push('file_read', 'b', '2026-07-08T00:00:02.000Z');
+    ring.push({ kind: 'command', detail: 'a' }, '2026-07-08T00:00:01.000Z');
+    ring.push({ kind: 'file_read', detail: 'b' }, '2026-07-08T00:00:02.000Z');
     expect(ring.list().map((e) => e.detail)).toEqual(['a', 'b']);
     ring.clear();
     expect(ring.size).toBe(0);
@@ -85,12 +93,61 @@ describe('parseActivityEvents — stream-json line → activity', () => {
     expect(edit).toEqual([{ kind: 'file_edit', detail: '/c/d.ts' }]);
   });
 
-  it('maps unknown tools to "tool" kind with the tool name as fallback detail', () => {
-    const events = parseActivityEvents(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'WebSearch', input: {} }] },
-    }));
-    expect(events).toEqual([{ kind: 'tool', detail: 'WebSearch' }]);
+  const toolLine = (name: string, input: unknown) => JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', name, input }] },
+  });
+
+  it('maps Playwright MCP browser tools to kind=browser with a semantic action + human detail', () => {
+    expect(parseActivityEvents(toolLine('mcp__playwright__browser_click', { element: '슬롯 2 새 게임 버튼', ref: 'e31' })))
+      .toEqual([{ kind: 'browser', action: 'click', detail: '슬롯 2 새 게임 버튼' }]);
+
+    expect(parseActivityEvents(toolLine('mcp__plugin_playwright_playwright__browser_navigate', { url: 'http://localhost:5188/' })))
+      .toEqual([{ kind: 'browser', action: 'navigate', detail: 'http://localhost:5188/' }]);
+
+    expect(parseActivityEvents(toolLine('mcp__playwright__browser_snapshot', {})))
+      .toEqual([{ kind: 'browser', action: 'snapshot', detail: '' }]);
+
+    expect(parseActivityEvents(toolLine('mcp__playwright__browser_console_messages', { level: 'error' })))
+      .toEqual([{ kind: 'browser', action: 'console_messages', detail: 'error' }]);
+
+    expect(parseActivityEvents(toolLine('mcp__playwright__browser_evaluate', { function: '() => {\n const key = 1;\n}' })))
+      .toEqual([{ kind: 'browser', action: 'evaluate', detail: '() => {' }]);
+
+    expect(parseActivityEvents(toolLine('mcp__playwright__browser_type', { element: '이름 입력창', text: 'abc' })))
+      .toEqual([{ kind: 'browser', action: 'type', detail: '이름 입력창 — "abc"' }]);
+  });
+
+  it('maps non-browser MCP tools to kind=tool with the short tool name as action', () => {
+    expect(parseActivityEvents(toolLine('mcp__claude_ai_Notion__notion-search', { query: 'roadmap' })))
+      .toEqual([{ kind: 'tool', action: 'notion-search', detail: 'roadmap' }]);
+  });
+
+  it('maps semantic native tools: WebSearch/WebFetch → web, Task → subagent, TodoWrite → plan', () => {
+    expect(parseActivityEvents(toolLine('WebSearch', { query: 'react 19 changes' })))
+      .toEqual([{ kind: 'web', action: 'search', detail: 'react 19 changes' }]);
+
+    expect(parseActivityEvents(toolLine('WebFetch', { url: 'https://example.com' })))
+      .toEqual([{ kind: 'web', action: 'fetch', detail: 'https://example.com' }]);
+
+    expect(parseActivityEvents(toolLine('Task', { description: 'fix the bug', prompt: 'long prompt...' })))
+      .toEqual([{ kind: 'subagent', action: 'delegate', detail: 'fix the bug' }]);
+
+    expect(parseActivityEvents(toolLine('TodoWrite', {
+      todos: [
+        { content: 'done thing', status: 'completed' },
+        { content: 'current thing', status: 'in_progress' },
+      ],
+    }))).toEqual([{ kind: 'plan', action: 'todo', detail: 'current thing' }]);
+  });
+
+  it('maps unknown native tools to kind=tool, keeping the tool name as action', () => {
+    const events = parseActivityEvents(toolLine('FooBar', { description: 'do something' }));
+    expect(events).toEqual([{ kind: 'tool', action: 'FooBar', detail: 'do something' }]);
+
+    // No usable input → detail stays empty (UI shows the action label alone)
+    expect(parseActivityEvents(toolLine('FooBar', {})))
+      .toEqual([{ kind: 'tool', action: 'FooBar', detail: '' }]);
   });
 
   it('ignores empty/whitespace-only text blocks and malformed JSON', () => {
@@ -109,7 +166,11 @@ describe('parseActivityEvents — stream-json line → activity', () => {
   });
 });
 
-describe('ActivityLogStore — per-agent rings + throttled broadcast', () => {
+describe('ActivityLogStore — per-agent rings + lossless batched broadcast', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('returns an empty snapshot for an unknown agent', () => {
     const store = new ActivityLogStore();
     expect(store.snapshot('nobody')).toEqual({ lastEventAt: null, events: [] });
@@ -117,8 +178,8 @@ describe('ActivityLogStore — per-agent rings + throttled broadcast', () => {
 
   it('records events per agent and reset() clears only that agent', () => {
     const store = new ActivityLogStore();
-    store.record('a1', 'command', 'ls', '2026-07-08T00:00:01.000Z');
-    store.record('a2', 'file_read', '/x', '2026-07-08T00:00:02.000Z');
+    store.record('a1', { kind: 'command', detail: 'ls' }, '2026-07-08T00:00:01.000Z');
+    store.record('a2', { kind: 'file_read', detail: '/x' }, '2026-07-08T00:00:02.000Z');
     expect(store.snapshot('a1').events).toHaveLength(1);
     expect(store.snapshot('a1').lastEventAt).toBe('2026-07-08T00:00:01.000Z');
     store.reset('a1');
@@ -126,24 +187,38 @@ describe('ActivityLogStore — per-agent rings + throttled broadcast', () => {
     expect(store.snapshot('a2').events).toHaveLength(1);
   });
 
-  it('throttles broadcasts to at most one per second per agent', () => {
+  it('batches within the throttle window and flushes the pending batch on the trailing edge', () => {
+    vi.useFakeTimers();
     const spy = vi.fn();
     const store = new ActivityLogStore(); // default 1000ms throttle
     store.setBroadcaster(spy);
-    store.record('a1', 'command', 'one');
-    store.record('a1', 'command', 'two'); // within 1s → throttled
+    store.record('a1', { kind: 'command', detail: 'one' });
+    store.record('a1', { kind: 'command', detail: 'two' }); // within 1s → queued
+    store.record('a1', { kind: 'command', detail: 'three' }); // also queued
+
+    // First event flushed immediately
     expect(spy).toHaveBeenCalledTimes(1);
-    expect(spy).toHaveBeenCalledWith('agent:activity', expect.objectContaining({ agentId: 'a1' }));
-    // Ring still captured both despite the dropped broadcast
-    expect(store.snapshot('a1').events).toHaveLength(2);
+    expect(spy.mock.calls[0][0]).toBe('agent:activity');
+    expect(spy.mock.calls[0][1].events.map((e: any) => e.detail)).toEqual(['one']);
+
+    // Trailing edge delivers the rest as one batch — nothing dropped
+    vi.advanceTimersByTime(1000);
+    expect(spy).toHaveBeenCalledTimes(2);
+    const second = spy.mock.calls[1][1];
+    expect(second.events.map((e: any) => e.detail)).toEqual(['two', 'three']);
+    expect(second.event.detail).toBe('three'); // legacy singular field = last of batch
+    expect(second.lastEventAt).toBe(second.events[1].ts);
+
+    // Ring captured everything regardless of broadcast batching
+    expect(store.snapshot('a1').events).toHaveLength(3);
   });
 
   it('broadcasts every event when throttle window is zero', () => {
     const spy = vi.fn();
     const store = new ActivityLogStore({ throttleMs: 0 });
     store.setBroadcaster(spy);
-    store.record('a1', 'command', 'one');
-    store.record('a1', 'command', 'two');
+    store.record('a1', { kind: 'command', detail: 'one' });
+    store.record('a1', { kind: 'command', detail: 'two' });
     expect(spy).toHaveBeenCalledTimes(2);
   });
 });

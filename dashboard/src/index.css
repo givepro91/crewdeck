@@ -69,3 +69,8 @@ body {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* Live activity — new event slide-in (reuses slideUp keyframes) */
+.animate-activity-in {
+  animation: slideUp 0.25s ease-out;
+}
