@@ -167,7 +167,24 @@ export function parseTeamDesign(raw: string, maxAgents = MAX_AGENTS_DEFAULT): Su
  */
 const DESIGN_CACHE_TTL_MS = 10 * 60_000;
 const designInflight = new Map<string, Promise<SuggestedAgent[]>>();
-const designCache = new Map<string, { agents: SuggestedAgent[]; at: number }>();
+const designCache = new Map<string, { agents: SuggestedAgent[]; at: number; consumed: boolean }>();
+
+/**
+ * 설계 상태 조회 — UI 표면화용.
+ * ready = 캐시가 살아있고 아직 어떤 클라이언트도 결과를 받아가지 않음
+ * (새로고침으로 응답을 놓친 경우 "결과 보기" 칩의 근거가 된다).
+ */
+export function getDesignStatus(projectId: string): { running: boolean; ready: boolean } {
+  const cached = designCache.get(projectId);
+  const fresh = !!cached && Date.now() - cached.at < DESIGN_CACHE_TTL_MS;
+  return { running: designInflight.has(projectId), ready: fresh && !cached!.consumed };
+}
+
+/** 결과가 클라이언트에 전달됐음을 기록 — 이후 "결과 보기" 칩을 숨긴다 */
+export function markDesignConsumed(projectId: string): void {
+  const c = designCache.get(projectId);
+  if (c) c.consumed = true;
+}
 
 export async function designTeamCached(
   projectId: string,
@@ -191,7 +208,7 @@ export async function designTeamCached(
 
   const p = designFn(input)
     .then((agents) => {
-      designCache.set(projectId, { agents, at: Date.now() });
+      designCache.set(projectId, { agents, at: Date.now(), consumed: false });
       return agents;
     })
     .finally(() => {

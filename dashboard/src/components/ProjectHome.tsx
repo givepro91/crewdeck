@@ -552,7 +552,33 @@ export function ProjectHome() {
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<Tab>("overview");
   const [showAddAgent, setShowAddAgent] = useState(false);
+  const [addAgentSmart, setAddAgentSmart] = useState(false);
+  // AI 팀 설계 진행 상태 — 새로고침/모달 이탈 후에도 진행 중·미확인 결과를 칩으로 표시
+  const [teamDesign, setTeamDesign] = useState<"running" | "ready" | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+
+  // AI 팀 설계 상태 복원(새로고침 대비) + 실시간 반영(WS)
+  useEffect(() => {
+    if (!currentProjectId) return;
+    setTeamDesign(null);
+    api.agents.designStatus(currentProjectId)
+      .then((s) => setTeamDesign(s.running ? "running" : s.ready ? "ready" : null))
+      .catch(() => { /* 서버 미지원/오류 시 칩 없음 */ });
+
+    const onDesignStatus = (e: Event) => {
+      const d = (e as CustomEvent).detail as { projectId?: string; state?: string } | undefined;
+      if (!d || d.projectId !== currentProjectId) return;
+      if (d.state === "failed") {
+        setTeamDesign(null);
+        useToast.getState().showToast(t("teamDesignFailed"), "error");
+      } else if (d.state === "running" || d.state === "ready") {
+        setTeamDesign(d.state);
+      }
+    };
+    window.addEventListener("nova:team-design-status", onDesignStatus);
+    return () => window.removeEventListener("nova:team-design-status", onDesignStatus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentProjectId]);
 
   // Header mission inline edit state
   const [editingHeaderMission, setEditingHeaderMission] = useState(false);
@@ -1386,9 +1412,19 @@ export function ProjectHome() {
         <AddAgentDialog
           projectId={currentProjectId}
           mission={project?.mission ?? undefined}
+          initialSmart={addAgentSmart}
           existingAgents={agents}
           onCreated={handleAgentCreated}
-          onClose={() => setShowAddAgent(false)}
+          onClose={() => {
+            setShowAddAgent(false);
+            setAddAgentSmart(false);
+            // 닫은 뒤 칩 상태를 서버 기준으로 동기화 (결과를 확인했으면 칩 제거)
+            if (currentProjectId) {
+              api.agents.designStatus(currentProjectId)
+                .then((s) => setTeamDesign(s.running ? "running" : s.ready ? "ready" : null))
+                .catch(() => {});
+            }
+          }}
         />
       )}
       {selectedAgent && (
@@ -1589,6 +1625,21 @@ export function ProjectHome() {
                             ({t("agentCount", { count: agents.length })})
                           </span>
                         </span>
+                        {!showAddAgent && teamDesign && (
+                          <button
+                            onClick={() => { setAddAgentSmart(true); setShowAddAgent(true); }}
+                            className={`shrink-0 flex items-center gap-1.5 text-[11px] px-2 py-0.5 rounded-lg font-medium transition-colors whitespace-nowrap ${
+                              teamDesign === "running"
+                                ? "bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50"
+                                : "bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/50"
+                            }`}
+                          >
+                            {teamDesign === "running" && (
+                              <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
+                            )}
+                            {teamDesign === "running" ? t("teamDesignRunning") : t("teamDesignReady")}
+                          </button>
+                        )}
                         <button
                           onClick={() => setTab("agents")}
                           className="shrink-0 text-blue-500 hover:text-blue-700 dark:hover:text-blue-300 transition-colors whitespace-nowrap"

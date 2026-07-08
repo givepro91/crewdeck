@@ -123,6 +123,8 @@ export const api = {
       }),
     suggest: (mission: string, projectId?: string, techStack?: any, mode?: "ai" | "quick", refresh?: boolean) =>
       request<any[]>("/agents/suggest", { method: "POST", body: JSON.stringify({ mission, project_id: projectId, techStack, mode, refresh }) }),
+    designStatus: (projectId: string) =>
+      request<{ running: boolean; ready: boolean }>(`/agents/design-status?projectId=${projectId}`),
     suggestAndCreate: (projectId: string, mission: string, techStack?: any) =>
       request<any>("/agents/suggest-and-create", {
         method: "POST",

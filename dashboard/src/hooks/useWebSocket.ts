@@ -66,6 +66,9 @@ export function useWebSocket() {
               useStore.getState().updateTask(msg.payload);
               window.dispatchEvent(new CustomEvent("nova:task-updated-event", { detail: msg.payload }));
               break;
+            case "team_design:status":
+              window.dispatchEvent(new CustomEvent("nova:team-design-status", { detail: msg.payload }));
+              break;
             case "task:started":
               window.dispatchEvent(new CustomEvent("nova:task-started", { detail: msg.payload }));
               window.dispatchEvent(new CustomEvent("nova:refresh", { detail: msg }));

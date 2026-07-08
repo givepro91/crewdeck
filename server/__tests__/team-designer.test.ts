@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { parseTeamDesign, buildTeamDesignPrompt, designTeamCached, clearDesignCache } from '../core/agent/team-designer.js';
+import { parseTeamDesign, buildTeamDesignPrompt, designTeamCached, clearDesignCache, getDesignStatus, markDesignConsumed } from '../core/agent/team-designer.js';
 
 const createdDirs: string[] = [];
 
@@ -172,6 +172,35 @@ describe('designTeamCached — 캐시/인플라이트 공유 (모달 이탈·새
     await designTeamCached('proj-a', input, { designFn });
     await designTeamCached('proj-b', input, { designFn });
     expect(calls).toBe(2);
+  });
+});
+
+describe('getDesignStatus — 설계 상태 표면화 (새로고침 후 칩 복원)', () => {
+  beforeEach(() => clearDesignCache());
+
+  const input = { projectName: 'p', workdir: '/tmp' } as any;
+  const fakeTeam = [{ name: 'A', role: 'cto', systemPrompt: 'x', reason: '', source: 'ai' as const }];
+
+  it('진행 중이면 running, 완료 후 미소비면 ready', async () => {
+    let resolveDesign!: (v: typeof fakeTeam) => void;
+    const designFn = () => new Promise<typeof fakeTeam>((r) => { resolveDesign = r; });
+    const p = designTeamCached('s1', input, { designFn });
+
+    expect(getDesignStatus('s1')).toEqual({ running: true, ready: false });
+    resolveDesign(fakeTeam);
+    await p;
+    expect(getDesignStatus('s1')).toEqual({ running: false, ready: true });
+  });
+
+  it('markDesignConsumed 후에는 ready가 꺼진다 (결과 확인 완료)', async () => {
+    await designTeamCached('s2', input, { designFn: async () => fakeTeam });
+    expect(getDesignStatus('s2').ready).toBe(true);
+    markDesignConsumed('s2');
+    expect(getDesignStatus('s2')).toEqual({ running: false, ready: false });
+  });
+
+  it('기록 없는 프로젝트는 둘 다 false', () => {
+    expect(getDesignStatus('unknown')).toEqual({ running: false, ready: false });
   });
 });
 

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AppContext } from "../../index.js";
 import { getAgentPresets } from "../../core/agent/roles.js";
 import { suggestAgentsFromMission, suggestFromProject, getTeamPresets } from "../../core/agent/suggest.js";
-import { designTeamCached } from "../../core/agent/team-designer.js";
+import { designTeamCached, getDesignStatus, markDesignConsumed } from "../../core/agent/team-designer.js";
 import { resolvePrompt } from "../../core/agent/prompt-resolver.js";
 import { getPreset } from "../../core/agent/roles.js";
 import { VALID_ROLES } from "../../utils/constants.js";
@@ -101,14 +101,21 @@ export function createAgentRoutes(ctx: AppContext): Router {
         // AI 팀 설계 (opt-in) — .claude/agents/ 사용자 정의가 있으면 그쪽이 우선
         if (mode === "ai" && !hasProjectDefs) {
           try {
+            // 진행 상태 broadcast — 새로고침/모달 이탈 후에도 UI가 진행 중임을 표시할 수 있게
+            broadcast("team_design:status", { projectId: project_id, state: "running" });
             const designed = await designTeamCached(project_id, {
               projectName: project.name ?? project_id,
               mission: mission ?? project.mission,
               workdir: project.workdir,
               techStack: project.tech_stack ? JSON.parse(project.tech_stack) : techStack ?? null,
             }, { refresh: refresh === true });
+            broadcast("team_design:status", { projectId: project_id, state: "ready" });
+            // 이 응답이 실제로 클라이언트에 도달하는 경우에만 소비 처리 —
+            // 새로고침으로 연결이 끊긴 요청은 미소비로 남아 "결과 보기" 칩의 근거가 된다
+            if (!req.destroyed) markDesignConsumed(project_id);
             return res.json(designed);
           } catch (err: any) {
+            broadcast("team_design:status", { projectId: project_id, state: "failed" });
             log.warn(`AI team design failed — falling back to rule-based: ${err?.message ?? err}`);
           }
         }
@@ -119,6 +126,13 @@ export function createAgentRoutes(ctx: AppContext): Router {
     // Fallback: keyword-only suggestion
     const suggestions = suggestAgentsFromMission(mission ?? "", techStack);
     res.json(suggestions);
+  });
+
+  // AI 팀 설계 진행 상태 — 새로고침 후 UI 복원용 (running: 설계 중, ready: 미확인 결과 있음)
+  router.get("/design-status", (req, res) => {
+    const projectId = typeof req.query.projectId === "string" ? req.query.projectId : "";
+    if (!projectId) return res.status(400).json({ error: "projectId query param required" });
+    res.json(getDesignStatus(projectId));
   });
 
   // Auto-create suggested agents for a project (with project analysis)

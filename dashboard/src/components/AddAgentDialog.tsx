@@ -34,6 +34,8 @@ interface SuggestedAgent {
 interface AddAgentDialogProps {
   projectId: string;
   mission?: string;
+  /** true면 열리자마자 스마트 팀 구성으로 진입 (진행 중 설계 재합류/캐시 확인용) */
+  initialSmart?: boolean;
   existingAgents?: Array<{ id: string; name: string; role: string }>;
   onCreated: (agent: any) => void;
   onClose: () => void;
@@ -54,6 +56,7 @@ type Mode = "pick" | "smart" | "presets" | "individual";
 type IndividualStep = "select" | "preview";
 
 export function AddAgentDialog({
+  initialSmart,
   projectId,
   mission,
   existingAgents = [],
@@ -147,6 +150,12 @@ export function AddAgentDialog({
       setScanLoading(false);
     }
   };
+
+  // initialSmart: 진행 중 설계 재합류 / 미확인 결과 즉시 확인용 — 열리자마자 스마트 모드 진입
+  useEffect(() => {
+    if (initialSmart) enterSmartMode();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const toggleSmartAgent = (key: string) => {
     setSelectedSmartAgents((prev) => {
