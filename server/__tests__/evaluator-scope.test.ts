@@ -20,4 +20,10 @@ describe("autoDetectScope (conditional depth)", () => {
     expect(autoDetectScope({ title: "메모 정리", description: "", target_files: null })).toBe("lite");
     expect(autoDetectScope({ title: "메모 정리", description: "", target_files: "not-json" })).toBe("lite");
   });
+
+  it("valid JSON but non-array target_files → no throw, safe lite", () => {
+    // '"a.tsx"' → 문자열, '{}' → 객체 — .some 호출 전 Array.isArray 가드로 throw 방지
+    expect(autoDetectScope({ title: "메모", description: "", target_files: '"a.tsx"' })).toBe("lite");
+    expect(autoDetectScope({ title: "메모", description: "", target_files: "{}" })).toBe("lite");
+  });
 });

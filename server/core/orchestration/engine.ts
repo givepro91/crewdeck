@@ -986,18 +986,20 @@ Fix ONLY these issues. Do not modify other code.
           // Update task status based on re-verification result
           const rePass = reVerification.verdict === "pass" || reVerification.verdict === "conditional";
 
-          // 1 self-heal(위 fix) 후에도 fail → cap 기다리지 않고 즉시 완료+goal-QA 이월.
-          // blocked→scheduler cross-cycle 재픽(무한 검토) 루프를 여기서 끊는다.
+          // 1 self-heal(위 fix) 후에도 fail → goal-as-unit은 cap 안 기다리고 즉시 완료+goal-QA 이월
+          // (blocked→scheduler cross-cycle 재픽 무한검토 루프 차단). 비-goal은 이월 대상 QA가 없어 기존대로 blocked.
           if (!rePass) {
             if (isGoalAsUnit) {
               const { dropCheckpoint } = await import("../project/worktree.js");
               dropCheckpoint(effectiveWorkdir, task.id);
+              escalateVerificationCap(db, broadcast, task, reVerification.issues ?? []);
+              if (task.goal_id) {
+                await checkAndTriggerGoalSquash(db, broadcast, sessionManager, task.goal_id, effectiveWorkdir);
+              }
+              return { success: true, verdict: reVerification.verdict };
             }
-            escalateVerificationCap(db, broadcast, task, reVerification.issues ?? []);
-            if (isGoalAsUnit && task.goal_id) {
-              await checkAndTriggerGoalSquash(db, broadcast, sessionManager, task.goal_id, effectiveWorkdir);
-            }
-            return { success: true, verdict: reVerification.verdict };
+            transitionTask(db, broadcast, task, "blocked");
+            return { success: false, verdict: reVerification.verdict };
           }
 
           if (rePass) {
@@ -1027,25 +1029,10 @@ Fix ONLY these issues. Do not modify other code.
               transitionTask(db, broadcast, task, "blocked");
               return { success: false, verdict: "git-error" };
             }
-          } else if (isGoalAsUnit) {
-            // Goal-as-Unit: QG re-verify FAIL → stash 복원 후 blocked.
-            // 복원(폐기) 전에 diff 를 보존한다 — 유효했던 부분 수정까지 증발해
-            // 다음 재시도가 백지에서 재작업하던 실측 사고(07-08)의 방지.
-            saveDiscardedDiff(db, task.id, effectiveWorkdir);
-            try {
-              const { restoreCheckpoint } = await import("../project/worktree.js");
-              const restored = restoreCheckpoint(effectiveWorkdir, task.id);
-              if (!restored) {
-                db.prepare(
-                  "INSERT INTO activities (project_id, agent_id, type, message) VALUES (?, ?, 'autopilot_warning', ?)",
-                ).run(task.project_id, task.assignee_id, `[goal-as-unit] 체크포인트 복원 실패 — 수동 개입 필요: ${task.title}`);
-              }
-            } catch (restoreErr: any) {
-              log.warn(`restoreCheckpoint failed for task ${task.id}: ${restoreErr.message}`);
-            }
           }
 
-          transitionTask(db, broadcast, task, rePass ? "done" : "blocked");
+          // 여기 도달 시 rePass === true — fail은 위 !rePass 분기에서 이미 return됨
+          transitionTask(db, broadcast, task, "done");
 
           return {
             success: reVerification.verdict === "pass",
@@ -1105,18 +1092,20 @@ Fix ONLY these issues. Do not modify other code.
           }
         }
 
-        // verify FAIL (autoFix 미사용 경로): self-heal 없이 바로 goal-QA 이월 —
-        // blocked→cross-cycle 재픽 루프 회피 (작업물은 dropCheckpoint로 보존)
+        // verify FAIL (autoFix 미사용 경로): goal-as-unit은 self-heal 없이 바로 goal-QA 이월
+        // (blocked→cross-cycle 재픽 루프 회피, 작업물은 dropCheckpoint로 보존). 비-goal은 기존대로 blocked.
         if (!passed) {
           if (isGoalAsUnit) {
             const { dropCheckpoint } = await import("../project/worktree.js");
             dropCheckpoint(effectiveWorkdir, task.id);
+            escalateVerificationCap(db, broadcast, task, verification.issues ?? []);
+            if (task.goal_id) {
+              await checkAndTriggerGoalSquash(db, broadcast, sessionManager, task.goal_id, effectiveWorkdir);
+            }
+            return { success: true, verdict: verification.verdict };
           }
-          escalateVerificationCap(db, broadcast, task, verification.issues ?? []);
-          if (isGoalAsUnit && task.goal_id) {
-            await checkAndTriggerGoalSquash(db, broadcast, sessionManager, task.goal_id, effectiveWorkdir);
-          }
-          return { success: true, verdict: verification.verdict };
+          transitionTask(db, broadcast, task, "blocked");
+          return { success: false, verdict: verification.verdict };
         }
 
         transitionTask(db, broadcast, task, "done");

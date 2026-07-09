@@ -151,8 +151,10 @@ export function createQualityGate(
           result = parseVerificationResult(taskId, retryParsed.text, opts.scope, evaluatorId, taskType);
         }
 
-        // 리뷰할 변경이 없으면(git merge/cleanup 등) 막지 않고 통과 — 구 all-zero→conditional 꼼수 대체
-        if (diffSummary.fileCount === 0 && result.verdict === "fail") {
+        // 리뷰할 변경이 없으면(git merge/cleanup 등) 막지 않고 통과 — 구 all-zero→conditional 꼼수 대체.
+        // ⚠ untracked(신규 미추적 파일)도 0이어야 한다 — goal-as-unit은 WIP가 미커밋이고
+        //   신규 파일은 fileCount(=git diff)에 안 잡혀, 이 가드가 없으면 신규파일 태스크가 매번 auto-pass된다.
+        if (diffSummary.fileCount === 0 && diffSummary.untracked.length === 0 && result.verdict === "fail") {
           log.warn(`No reviewable changes for "${task.title}" — auto-pass (nothing to verify)`);
           result.verdict = "pass";
           result.severity = "auto-resolve";
@@ -217,9 +219,9 @@ export function autoDetectScope(
 
   // UI 변경은 정적 리뷰로 못 잡는 결함(soft-lock·상태 꼬임·렌더 불일치)이 많다
   // → full(앱 기동 + 브라우저 재현). 조건부 검증: "항상 경량, UI/위험만 풀"의 UI 축.
-  let targets: string[] = [];
+  let targets: unknown = [];
   try { targets = JSON.parse(task.target_files || "[]"); } catch { /* ignore */ }
-  if (targets.some((f) => /\.(tsx|jsx|vue|svelte|css|scss)$/i.test(f))) return "full";
+  if (Array.isArray(targets) && targets.some((f) => typeof f === "string" && /\.(tsx|jsx|vue|svelte|css|scss)$/i.test(f))) return "full";
 
   // High-risk patterns always escalate (Nova §1: auth/DB/payment → one level up)
   const highRisk = [

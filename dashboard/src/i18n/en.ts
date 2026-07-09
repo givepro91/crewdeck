@@ -631,7 +631,7 @@ const en = {
   guideStep4Title: "Run Tasks",
   guideStep4Detail: "Click 'Run' on a task to start it. Or click 'Auto-run All' to execute all assigned tasks in priority order. Watch real-time progress in the agent output panel.",
   guideStep5Title: "Review & Verify",
-  guideStep5Detail: "Completed tasks go to 'In Review'. Click 'Approve' to accept or 'Reject' with feedback. Nova automatically checks quality across 5 dimensions (Functionality, Data Integrity, Design, Code Quality, Reliability).",
+  guideStep5Detail: "Completed tasks go to 'In Review'. Click 'Approve' to accept or 'Reject' with feedback. Nova verifies quality by actually running and reproducing the work, and reports any problems it finds as issues.",
   guideTipsTitle: "Tips",
   guideTip1: "Press Cmd+K (or Ctrl+K) to open the command palette for quick actions.",
   guideTip2: "Press ? to see all keyboard shortcuts.",
