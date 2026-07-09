@@ -3,6 +3,17 @@
 > 이 파일이 프로젝트의 살아있는 상태 문서다 (구 `NOVA-STATE.md` 대체 — Nova Engineering 방법론 파일은 2026-07-07 폐기).
 > 굵직한 세션을 마칠 때마다 갱신한다.
 
+## 현재 상태 (2026-07-09 · 작업 요약 투명성 — before/after 서사 + 스크린샷)
+
+- **문제**: "에이전트에 다 맡기려니 신뢰가 안 간다 — 특히 비주얼 작업을 어떻게 했고 뭘 바꿨는지 디테일이 부족." 승인창이 파일명 목록 + 커밋 메시지에서 멈춰 사람이 판단할 서사가 없었다.
+- **해결 (goal squash 승인 게이트 중심)**:
+  - **before/after 서사 요약** — goal 완료 시 값싼 모델 **1콜**로 `{before, changed, after, notes}` 생성(`work-report.ts`). **비동기 fire-and-forget**라 큐/게이트를 막지 않고, 완료 시 `goal:work_report` WS로 승인창을 갱신. 실패해도 `summaryStatus='failed'`로 degrade(게이트 논블로킹). 요약 세션은 goal worktree가 아닌 **격리 temp dir**에서 스폰(승인 시 worktree `--force` 제거 창과의 겹침 회피).
+  - **스크린샷 (제로 강제)** — goal 완료 시 워크트리의 `.playwright-mcp`/`.cc-shots`에 **이미 있으면** artifact로 수집(`~/.nova-orbit/artifacts/goals/<id>/`), 인증 라우트(`GET /api/goals/:id/artifacts/:name`)로 서빙, 승인창 썸네일. 없으면 섹션 생략. dev 서버 기동·자동 렌더 안 함.
+  - **태스크 요약** — 뒤 500자 절단을 **마무리 텍스트 문단 경계 보존**(`extractWrapUp`, 추가 콜 0)으로 교체, TaskDetail 노출.
+  - **명시적 범위 밖**: 자동 headless before/after 렌더 · 코드 diff 뷰어 · 스크린샷 의무화 (취약·토큰낭비 대비 신뢰 이득 낮음 — [[feedback_scope_over_engineering]] 판단).
+  - 데이터: `goals.work_report TEXT`(JSON) 컬럼 + `<img>` blob fetch(Bearer 못 실어 인증 fetch→objectURL). 설계·계획: `docs/design/work-summary-transparency.md`, `docs/plans/work-summary-transparency.md`.
+- **검증**: server/dashboard typecheck PASS · vitest **272/272**(신규 12건) · 아티팩트 라우트 실 HTTP 스모크(401/404/200 image/traversal 404) · 독립 code-reviewer(Critical/High 0, Medium 2·Low 2 수정) · **라이브 배포 관통**(drain-safe 재시작, live DB work_report 마이그레이션 적용 확인). 잔여: 실 goal 완주로 승인창 요약+썸네일이 브라우저에 그려지는 장면은 다음 실 goal에서 확인 예정.
+
 ## 현재 상태 (2026-07-08 · 병렬 실행 + 검증 수렴 + 상태 가시화 — 상시 기동 운영 모드)
 
 - **goal 간 병렬 실행** (기본 동시성 2): goal 내부는 순차 1 유지, worktree 격리로 안전. decompose는 lookahead 1개 선행 파이프라인. 큐 재시작 3중 결함(stop 무시·busy wipe 이중 스폰·위임 기아)과 오류 책임 분류(사용량 한도가 재시도 예산을 태우던 것) 근본수정.
@@ -104,6 +115,8 @@
 | AIMD 쿨다운 resume | 장시간 운영 재현 테스트 필요 | Low |
 | branch_pr squash UX | `gh pr create --squash` 미존재 — GitHub UI 선택에 의존 | Low |
 | DAG 100+ 태스크 성능 | 미측정 | Low |
+| work_report 아티팩트 디스크 정리 부재 | `~/.nova-orbit/artifacts/goals/<id>/` 스크린샷이 goal 삭제/merge 후에도 영구 잔존(설계상 "승인 후 되짚기" 의도이나 장기 누적) — goal 삭제 경로에 정리 훅 고려 | Low |
+| 구 포맷 result_summary 표시 | extractWrapUp 이전에 저장된 태스크는 구 500자 mid-sentence 절단본을 TaskDetail이 verbatim 노출 (코스메틱, 회귀 아님) | Low |
 
 ## 부활 로드맵
 
