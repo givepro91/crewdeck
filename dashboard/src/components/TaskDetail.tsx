@@ -359,15 +359,27 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
           {verification && (
             <div className="border border-gray-100 dark:border-gray-700 rounded-lg p-3 bg-gray-50 dark:bg-gray-800/50 space-y-3">
               <div className="flex items-center gap-2">
-                <span
-                  className={`text-xs px-2 py-0.5 rounded-full font-medium ${VERDICT_COLORS[verification.verdict] ?? "bg-gray-100 text-gray-600"}`}
-                >
-                  {verification.verdict === "pass"
-                    ? t("verdictPass")
-                    : verification.verdict === "conditional"
-                      ? t("verdictConditional")
-                      : t("verdictFail")}
-                </span>
+                {(() => {
+                  // done + fail = 미해결 이슈를 최종 QA로 이월(호박색). blocked 등은 실제 실패(빨강).
+                  const isCarried = status === "done" && verification.verdict === "fail";
+                  const cls = isCarried
+                    ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400"
+                    : (VERDICT_COLORS[verification.verdict] ?? "bg-gray-100 text-gray-600");
+                  return (
+                    <span
+                      className={`text-xs px-2 py-0.5 rounded-full font-medium ${cls}`}
+                      title={isCarried ? t("carriedClickDetail") : ""}
+                    >
+                      {isCarried
+                        ? t("verdictCarried")
+                        : verification.verdict === "pass"
+                          ? t("verdictPass")
+                          : verification.verdict === "conditional"
+                            ? t("verdictConditional")
+                            : t("verdictFail")}
+                    </span>
+                  );
+                })()}
                 <span className="text-xs text-gray-400">{verification.scope}</span>
                 <span className="text-xs text-gray-300 dark:text-gray-600 ml-auto">
                   {new Date(verification.created_at).toLocaleString()}

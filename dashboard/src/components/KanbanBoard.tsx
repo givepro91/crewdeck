@@ -101,17 +101,21 @@ function SortableCard({
               {agent.name}
             </span>
           )}
-          {task.verification_verdict ? (
-            <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
-              task.verification_verdict === "pass"
-                ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400"
+          {task.verification_verdict ? (() => {
+            // done + fail = 최종 QA로 이월(호박색). blocked + fail = 실제 막힘(빨강).
+            const isCarried = task.status === "done" && task.verification_verdict === "fail";
+            const cls = task.verification_verdict === "pass"
+              ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400"
+              : isCarried
+                ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400"
                 : task.verification_verdict === "fail"
-                ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400"
-                : "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400"
-            }`}>
-              {task.verification_verdict === "pass" ? t("verdictPass") : task.verification_verdict === "fail" ? t("verdictFail") : t("verdictConditional")}
-            </span>
-          ) : task.verification_id ? (
+                  ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400"
+                  : "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400";
+            const label = isCarried
+              ? t("verdictCarried")
+              : task.verification_verdict === "pass" ? t("verdictPass") : task.verification_verdict === "fail" ? t("verdictFail") : t("verdictConditional");
+            return <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${cls}`} title={isCarried ? t("carriedClickDetail") : ""}>{label}</span>;
+          })() : task.verification_id ? (
             <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400 rounded">
               {t("verified")}
             </span>

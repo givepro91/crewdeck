@@ -326,26 +326,33 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
                 : t("subtaskProgress", { done: childDone, total: childTasks.length })}
             </span>
           )}
-          {task.verification_verdict ? (
-            <span
-              className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium shrink-0 cursor-help ${
-                task.verification_verdict === "pass"
-                  ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400"
-                  : task.verification_verdict === "fail"
+          {task.verification_verdict ? (() => {
+            // done + fail = 미해결 이슈를 최종 QA로 이월한 상태(경보 아님). blocked + fail = 실제 막힘(빨강).
+            const isCarried = task.status === "done" && task.verification_verdict === "fail";
+            const cls = task.verification_verdict === "pass"
+              ? "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400"
+              : isCarried
+                ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400"
+                : task.verification_verdict === "fail"
                   ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400"
-                  : "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400"
-              }`}
-              title={
-                task.verification_verdict === "fail"
-                  ? t("failClickDetail")
-                  : task.verification_verdict === "conditional"
-                    ? t("conditionalClickDetail")
-                    : ""
-              }
-            >
-              {task.verification_verdict.toUpperCase()}
-            </span>
-          ) : task.verification_id ? (
+                  : "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400";
+            return (
+              <span
+                className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium shrink-0 cursor-help ${cls}`}
+                title={
+                  isCarried
+                    ? t("carriedClickDetail")
+                    : task.verification_verdict === "fail"
+                      ? t("failClickDetail")
+                      : task.verification_verdict === "conditional"
+                        ? t("conditionalClickDetail")
+                        : ""
+                }
+              >
+                {isCarried ? t("verdictCarried") : task.verification_verdict.toUpperCase()}
+              </span>
+            );
+          })() : task.verification_id ? (
             <span className="text-[10px] px-1.5 py-0.5 bg-green-100 text-green-600 dark:bg-green-900/40 dark:text-green-400 rounded shrink-0">
               {t("verified")}
             </span>
@@ -585,20 +592,26 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
             const fileRef = top.file
               ? `${String(top.file).split("/").pop()}${top.line != null ? `:${top.line}` : ""} — `
               : "";
+            // done + fail = 최종 QA로 이월된 미해결 이슈(호박색, 경보 아님). 그 외(blocked/재검증)는 실제 실패(빨강).
+            const isCarried = task.status === "done" && task.verification_verdict === "fail";
+            const label = isCarried
+              ? t("carriedIssuesLabel")
+              : task.status === "in_review" ? t("lastFailReasonReverifying") : t("lastFailReason");
+            const labelCls = isCarried ? "text-amber-600/90 dark:text-amber-400 font-medium" : "text-red-600/90 dark:text-red-400 font-medium";
+            const msgCls = isCarried ? "text-amber-600/70 dark:text-amber-400/70" : "text-red-500/80 dark:text-red-400/70";
+            const moreCls = isCarried ? "text-amber-500/60 dark:text-amber-500/50" : "text-red-400/60 dark:text-red-500/50";
             return (
               <div
                 onClick={() => setSelectedTaskId(task.id)}
                 className={`text-[11px] pr-3 pt-0.5 truncate cursor-pointer ${isSubtask ? "pl-15" : "pl-9"}`}
-                title={`${top.message ?? ""}\n\n${t("failClickDetail")}`}
+                title={`${top.message ?? ""}\n\n${isCarried ? t("carriedClickDetail") : t("failClickDetail")}`}
               >
-                <span className="text-red-600/90 dark:text-red-400 font-medium">
-                  {task.status === "in_review" ? t("lastFailReasonReverifying") : t("lastFailReason")}
-                </span>
-                <span className="text-red-500/80 dark:text-red-400/70">
+                <span className={labelCls}>{label}</span>
+                <span className={msgCls}>
                   {" "}{top.severity === "critical" ? "⚠ " : ""}{fileRef}{top.message?.slice(0, 140)}
                 </span>
                 {issues.length > 1 && (
-                  <span className="text-red-400/60 dark:text-red-500/50"> · {t("moreIssues", { count: issues.length - 1 })}</span>
+                  <span className={moreCls}> · {t("moreIssues", { count: issues.length - 1 })}</span>
                 )}
               </div>
             );
