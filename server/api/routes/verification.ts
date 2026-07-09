@@ -84,17 +84,19 @@ export function createVerificationRoutes(ctx: AppContext): Router {
       return res.status(400).json({ error: "task_id and verdict are required" });
     }
 
-    // severity를 CHECK 허용값(auto-resolve/soft-block/hard-block)으로 정규화.
-    // 외부에서 critical/high 등 enum 밖 값이 들어와도 INSERT가 throw되지 않도록.
-    const normSeverity = normalizeSeverity(severity, verdict);
+    // verdict/scope/severity를 CHECK 허용값으로 정규화 — 외부에서 enum 밖 값이 와도
+    // INSERT가 throw되지 않도록(evaluator 경로의 VALID_VERDICTS 가드와 동일 패턴).
+    const normVerdict = ["pass", "conditional", "fail"].includes(verdict) ? verdict : "fail";
+    const normScope = ["lite", "standard", "full"].includes(scope) ? scope : "standard";
+    const normSeverity = normalizeSeverity(severity, normVerdict);
 
     const result = db.prepare(`
       INSERT INTO verifications (task_id, verdict, scope, dimensions, issues, severity, evaluator_session_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       task_id,
-      verdict,
-      scope,
+      normVerdict,
+      normScope,
       JSON.stringify(dimensions ?? {}),
       JSON.stringify(issues),
       normSeverity,
@@ -123,9 +125,9 @@ export function createVerificationRoutes(ctx: AppContext): Router {
         VALUES (?, ?, ?, ?)
       `).run(
         task.project_id,
-        verdict === "pass" ? "verification_pass" : "verification_fail",
-        `Task "${task.title}" verification: ${verdict.toUpperCase()}`,
-        JSON.stringify({ taskId: task_id, verdict, severity: normSeverity }),
+        normVerdict === "pass" ? "verification_pass" : "verification_fail",
+        `Task "${task.title}" verification: ${normVerdict.toUpperCase()}`,
+        JSON.stringify({ taskId: task_id, verdict: normVerdict, severity: normSeverity }),
       );
     }
 
