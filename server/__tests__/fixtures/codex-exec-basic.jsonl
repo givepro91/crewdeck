@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"019f45ac-d922-7b23-a938-a7df3b4f54d6"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Under-development features enabled: remote_plugin."}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"작업을 완료했습니다."}}
+{"type":"turn.completed","usage":{"input_tokens":18041,"cached_input_tokens":4992,"output_tokens":22,"reasoning_output_tokens":15}}
