@@ -38,14 +38,17 @@ export function GoalSquashApprovalDialog({
     return () => window.removeEventListener("keydown", handler);
   }, [isApproving, onCancel]);
 
-  // 스크린샷: <img>가 Bearer를 못 실으므로 인증 fetch → blob objectURL, 언마운트 시 revoke
+  // 스크린샷: <img>가 Bearer를 못 실으므로 인증 fetch → blob objectURL, 언마운트 시 revoke.
+  // deps는 파일셋 시그니처 — 비동기 서사(pending→ready)만 갱신될 땐 재fetch/flicker 없음.
   const [shotUrls, setShotUrls] = useState<Record<string, string>>({});
+  const shotSig = (workReport?.screenshots ?? []).map((s) => s.file).join("|");
   useEffect(() => {
-    if (!workReport?.screenshots?.length) return;
+    const shots = workReport?.screenshots ?? [];
+    if (!shots.length) return;
     const created: string[] = [];
     let alive = true;
     (async () => {
-      for (const s of workReport.screenshots) {
+      for (const s of shots) {
         try {
           const u = await api.goals.fetchArtifact(goal.id, s.file);
           if (!alive) { URL.revokeObjectURL(u); return; }
@@ -55,7 +58,8 @@ export function GoalSquashApprovalDialog({
       }
     })();
     return () => { alive = false; created.forEach(URL.revokeObjectURL); };
-  }, [workReport, goal.id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shotSig, goal.id]);
 
   return (
     <div

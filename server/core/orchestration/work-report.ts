@@ -1,5 +1,6 @@
-import { existsSync, readdirSync, mkdirSync, copyFileSync, statSync } from "node:fs";
-import { join, dirname, basename } from "node:path";
+import { existsSync, readdirSync, mkdirSync, copyFileSync, statSync, mkdtempSync, rmSync } from "node:fs";
+import { join, dirname, basename, relative } from "node:path";
+import { tmpdir } from "node:os";
 import type Database from "better-sqlite3";
 import { parseStreamJson } from "../agent/adapters/stream-parser.js";
 import type { SessionManager } from "../agent/session.js";
@@ -50,6 +51,7 @@ function walkImages(dir: string): string[] {
 /** worktree의 알려진 캡쳐 디렉토리에서 이미지를 모아 destDir로 복사. best-effort, throw 안 함. */
 export function collectScreenshots(worktreePath: string, destDir: string): ScreenshotRef[] {
   const refs: ScreenshotRef[] = [];
+  const used = new Set<string>();
   try {
     for (const dir of CAPTURE_DIRS) {
       const abs = join(worktreePath, dir);
@@ -58,7 +60,16 @@ export function collectScreenshots(worktreePath: string, destDir: string): Scree
         if (refs.length >= MAX_SHOTS) break;
         try {
           if (statSync(src).size > MAX_SHOT_BYTES) continue;
-          const safe = sanitizeName(`${dir.replace(/^\./, "")}-${basename(src)}`);
+          // 서브경로를 파일명에 반영 + 충돌 시 인덱스 suffix — 중첩 동일 basename 덮어쓰기/중복 key 방지
+          const rel = relative(abs, src).replace(/[/\\]/g, "-");
+          let safe = sanitizeName(`${dir.replace(/^\./, "")}-${rel}`);
+          if (used.has(safe)) {
+            const dot = safe.lastIndexOf(".");
+            const stem = dot > 0 ? safe.slice(0, dot) : safe;
+            const ext = dot > 0 ? safe.slice(dot) : "";
+            safe = `${stem}-${refs.length}${ext}`;
+          }
+          used.add(safe);
           mkdirSync(destDir, { recursive: true });
           copyFileSync(src, join(destDir, safe));
           refs.push({ file: safe, label: basename(src), taskId: null });
@@ -127,7 +138,6 @@ export async function synthesizeNarrative(
   db: Database.Database,
   sessionManager: SessionManager,
   goal: { id: string; project_id: string; title?: string | null; description?: string | null },
-  worktreePath: string,
   tasks: { title: string; result_summary: string | null }[],
   filesChanged: string[],
 ): Promise<WorkNarrative | null> {
@@ -139,9 +149,12 @@ export async function synthesizeNarrative(
   ).get(goal.project_id) as { id: string } | undefined;
   if (!agent) return null;
 
+  // 프롬프트에 필요한 맥락이 모두 담겨 있으므로 goal worktree가 아닌 격리 temp dir에서 스폰한다.
+  // (승인 시 worktree가 --force 제거/merge되는 창과, 도구 사용 가능한 서브프로세스가 겹치는 위험을 제거)
   const sessionKey = `summary-${goal.id}`;
+  const cwd = mkdtempSync(join(tmpdir(), "nova-summary-"));
   try {
-    const session = sessionManager.spawnAgent(agent.id, worktreePath, sessionKey);
+    const session = sessionManager.spawnAgent(agent.id, cwd, sessionKey);
     const result = await session.send(buildNarrativePrompt(goal, tasks, filesChanged));
     const parsed = parseStreamJson(result.stdout);
     return parseNarrativeJson(parsed.text ?? "");
@@ -149,6 +162,7 @@ export async function synthesizeNarrative(
     return null;
   } finally {
     try { sessionManager.killSession(sessionKey); } catch { /* ignore */ }
+    try { rmSync(cwd, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
 
@@ -158,14 +172,13 @@ export async function generateGoalWorkReport(
   broadcast: (event: string, data: unknown) => void,
   sessionManager: SessionManager,
   goal: { id: string; project_id: string; title?: string | null; description?: string | null },
-  worktreePath: string,
   tasks: { title: string; result_summary: string | null }[],
   filesChanged: string[],
   screenshots: ScreenshotRef[],
 ): Promise<void> {
   let narrative: WorkNarrative | null = null;
   try {
-    narrative = await synthesizeNarrative(db, sessionManager, goal, worktreePath, tasks, filesChanged);
+    narrative = await synthesizeNarrative(db, sessionManager, goal, tasks, filesChanged);
   } catch { narrative = null; }
 
   const report: WorkReport = narrative

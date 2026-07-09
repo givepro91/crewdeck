@@ -712,6 +712,7 @@ Rules:
 
   // 작업 요약 스크린샷 아티팩트 서빙 — /api 마운트라 Bearer 보호됨 (index.ts authMiddleware)
   router.get("/:goalId/artifacts/:name", (req, res) => {
+    if (!/^[A-Za-z0-9_-]+$/.test(req.params.goalId)) return res.status(404).json({ error: "Not found" });
     const dir = artifactsDirForGoal(db, req.params.goalId);
     const filePath = resolveArtifactPath(dir, req.params.name);
     if (!filePath || !existsSync(filePath)) return res.status(404).json({ error: "Not found" });

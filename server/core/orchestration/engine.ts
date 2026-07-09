@@ -2202,7 +2202,7 @@ async function triggerGoalSquash(
 
   // LLM 서사 요약은 비동기 (큐/게이트 블로킹 금지) — 완료 시 goal:work_report 후속 이벤트
   void generateGoalWorkReport(
-    db, broadcast, sessionManager, goal, worktreePath, doneTasks, filesChanged, workReport.screenshots,
+    db, broadcast, sessionManager, goal, doneTasks, filesChanged, workReport.screenshots,
   ).catch((e) => log.warn(`Work report generation failed for goal ${goal.id}: ${e.message}`));
 
   log.info(`Goal ${goal.id} squash ready — pending_approval`);
