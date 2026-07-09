@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { decideFailover } from "../core/agent/failover.js";
+import { decideFailover, pickCrossProviderForFix } from "../core/agent/failover.js";
 
 const base = {
   triedProviders: ["claude"] as ("claude" | "codex")[],
@@ -36,5 +36,20 @@ describe("decideFailover", () => {
   it("codex가 소진돼도 claude 미시도면 claude로 failover", () => {
     expect(decideFailover({ ...base, triedProviders: ["codex"], failure: "rate_limit", currentProvider: "codex" }))
       .toEqual({ action: "failover", toProvider: "claude" });
+  });
+});
+
+describe("pickCrossProviderForFix — 검증 FAIL 후 교차-provider 자동수정", () => {
+  it("codex 구현 실패 → claude로 수정", () => {
+    expect(pickCrossProviderForFix({ implProvider: "codex", altAvailable: true, failoverEnabled: true })).toBe("claude");
+  });
+  it("claude 구현 실패 → codex로 수정 (codex 가용 시)", () => {
+    expect(pickCrossProviderForFix({ implProvider: "claude", altAvailable: true, failoverEnabled: true })).toBe("codex");
+  });
+  it("failover 꺼짐 → 교차 안 함(null, 같은 provider로 수정)", () => {
+    expect(pickCrossProviderForFix({ implProvider: "codex", altAvailable: true, failoverEnabled: false })).toBeNull();
+  });
+  it("대체 provider 미가용 → 교차 안 함(null)", () => {
+    expect(pickCrossProviderForFix({ implProvider: "claude", altAvailable: false, failoverEnabled: true })).toBeNull();
   });
 });

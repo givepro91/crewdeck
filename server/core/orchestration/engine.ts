@@ -15,6 +15,9 @@ import { appendMemory } from "../agent/memory.js";
 import { createMethodologyEngine } from "../methodology/index.js";
 import { autoDetectScope } from "../quality-gate/evaluator.js";
 import { detectAgentRunFailure, classifyAgentFailure } from "../../utils/errors.js";
+import { getBackend } from "../agent/adapters/backend.js";
+import { loadProviderConfig } from "../agent/provider.js";
+import { pickCrossProviderForFix } from "../agent/failover.js";
 import { shouldEscalateVerifyCap, escalateVerificationCap } from "./verification-policy.js";
 
 const log = createLogger("orchestration");
@@ -936,6 +939,21 @@ ${verification.issues.map((i) => `- [${i.severity}] ${i.file ?? ""}:${i.line ?? 
 
 Fix ONLY these issues. Do not modify other code.
 `;
+          // 교차-provider 자동수정: 구현이 실패한 provider의 반대로 self-heal 을 시도한다.
+          // 같은 모델로 헛돌지 않고 다른 모델(예: codex 실패 → claude)이 실제로 고칠 기회를 준다
+          // ("사용자 개입 없이 결국 해결"). self-heal 1회 상한은 불변이라 무한루프 없음, worktree가 안전 경계.
+          const provCfg = loadProviderConfig();
+          const lastSess = db.prepare(
+            "SELECT provider FROM sessions WHERE agent_id = ? ORDER BY started_at DESC LIMIT 1",
+          ).get(task.assignee_id) as { provider: string | null } | undefined;
+          const implProvider = lastSess?.provider === "codex" ? "codex" : "claude";
+          const altAvailable = implProvider === "claude" ? await getBackend("codex").isAvailable() : true;
+          const crossProvider = pickCrossProviderForFix({ implProvider, altAvailable, failoverEnabled: provCfg.codexFailover });
+          if (crossProvider) {
+            sessionManager.setProviderOverride(task.assignee_id, crossProvider);
+            log.info(`Auto-fix 교차 백엔드: ${implProvider} → ${crossProvider}`);
+          }
+
           // Spawn a NEW session for fix (prevent context pollution — Crewdeck rule)
           // Keep agent in 'working' state during fix to prevent scheduler double-assignment
           db.prepare("UPDATE agents SET status = 'working', current_task_id = ?, current_activity = ? WHERE id = ?")
@@ -974,6 +992,7 @@ Fix ONLY these issues. Do not modify other code.
             }
           } finally {
             sessionManager.killSession(task.assignee_id);
+            sessionManager.clearProviderOverride(task.assignee_id); // 교차-provider override 정리
           }
 
           // Re-verify (worktree 경로 전달)
