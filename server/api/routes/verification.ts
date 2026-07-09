@@ -1,5 +1,6 @@
 import { Router } from "express";
 import type { AppContext } from "../../index.js";
+import { normalizeSeverity } from "../../utils/severity.js";
 
 export function createVerificationRoutes(ctx: AppContext): Router {
   const router = Router();
@@ -83,6 +84,10 @@ export function createVerificationRoutes(ctx: AppContext): Router {
       return res.status(400).json({ error: "task_id and verdict are required" });
     }
 
+    // severity를 CHECK 허용값(auto-resolve/soft-block/hard-block)으로 정규화.
+    // 외부에서 critical/high 등 enum 밖 값이 들어와도 INSERT가 throw되지 않도록.
+    const normSeverity = normalizeSeverity(severity, verdict);
+
     const result = db.prepare(`
       INSERT INTO verifications (task_id, verdict, scope, dimensions, issues, severity, evaluator_session_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -92,7 +97,7 @@ export function createVerificationRoutes(ctx: AppContext): Router {
       scope,
       JSON.stringify(dimensions ?? {}),
       JSON.stringify(issues),
-      severity ?? "auto-resolve",
+      normSeverity,
       evaluator_session_id ?? null,
     );
 
@@ -103,7 +108,7 @@ export function createVerificationRoutes(ctx: AppContext): Router {
       .run(verification.id, task_id);
 
     // If hard-block, set task to blocked + broadcast task status change
-    if (severity === "hard-block") {
+    if (normSeverity === "hard-block") {
       db.prepare("UPDATE tasks SET status = 'blocked', updated_at = datetime('now') WHERE id = ?")
         .run(task_id);
       const blockedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task_id) as any;
@@ -120,7 +125,7 @@ export function createVerificationRoutes(ctx: AppContext): Router {
         task.project_id,
         verdict === "pass" ? "verification_pass" : "verification_fail",
         `Task "${task.title}" verification: ${verdict.toUpperCase()}`,
-        JSON.stringify({ taskId: task_id, verdict, severity }),
+        JSON.stringify({ taskId: task_id, verdict, severity: normSeverity }),
       );
     }
 

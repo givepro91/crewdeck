@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import type { SessionManager } from "../agent/session.js";
 import { parseAgentOutput } from "../agent/adapters/stream-parser.js";
 import { createLogger } from "../../utils/logger.js";
+import { normalizeSeverity } from "../../utils/severity.js";
 import { createMethodologyEngine } from "../methodology/index.js";
 import type { VerificationResult, VerificationScope, Verdict, Severity, Score, VerificationIssue } from "../../../shared/types.js";
 
@@ -175,7 +176,7 @@ export function createQualityGate(
           result.scope,
           JSON.stringify(result.dimensions),
           JSON.stringify(result.issues),
-          result.severity,
+          normalizeSeverity(result.severity, result.verdict),
           evaluatorId,
         ) as { id: string };
 
@@ -1113,7 +1114,7 @@ export function parseVerificationResult(
 
     // Also correct severity based on actual issues
     const hasCritical = issues.some((i: any) => i.severity === "critical");
-    const severity: Severity = hasCritical ? "hard-block" : (parsed.severity ?? "auto-resolve");
+    const severity: Severity = hasCritical ? "hard-block" : normalizeSeverity(parsed.severity, verdict);
 
     return {
       ...defaultResult,
