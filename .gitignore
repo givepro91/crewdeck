@@ -16,3 +16,7 @@ dashboard/dist/
 .playwright-mcp/
 .nova/
 .omc/
+
+# Crewdeck — agent worktrees (do not commit)
+.crewdeck-worktrees/
+.claude/worktrees/
