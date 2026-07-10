@@ -1142,10 +1142,10 @@ export function ProjectHome() {
     setDuplicatingTeam(true);
     try {
       const res = await api.agents.duplicateTeam(currentProjectId);
-      showToast(`${res.team} 생성 — 에이전트 ${res.count}개 복제`, "success");
+      showToast(t("duplicateTeamSuccess", { team: res.team, count: res.count }), "success");
       loadData();
     } catch (err: any) {
-      showToast("팀 복제 실패", "error", err.message);
+      showToast(t("duplicateTeamFailed"), "error", err.message);
     } finally {
       setDuplicatingTeam(false);
     }
@@ -1504,7 +1504,7 @@ export function ProjectHome() {
       )}
       {duplicateTeamConfirm && (
         <ConfirmDialog
-          message={"현재 조직도를 한 벌 더 복제해 다음 팀을 만듭니다. role별 인원이 늘어 goal 병렬 처리량이 올라갑니다 (실효 병렬은 동시성·사용량 한도가 상한)."}
+          message={t("duplicateTeamConfirmMsg")}
           onConfirm={handleDuplicateTeam}
           onCancel={() => setDuplicateTeamConfirm(false)}
         />
@@ -1818,9 +1818,9 @@ export function ProjectHome() {
                       onClick={() => setDuplicateTeamConfirm(true)}
                       disabled={duplicatingTeam}
                       className="shrink-0 text-[11px] text-gray-400 hover:text-blue-600 dark:text-gray-500 dark:hover:text-blue-300 transition-colors whitespace-nowrap disabled:opacity-50"
-                      title="현재 조직도를 한 벌 더 복제해 병렬 처리량을 늘립니다. 실효 병렬은 동시성(CREWDECK_MAX_CONCURRENCY)·사용량 한도가 상한입니다."
+                      title={t("duplicateTeamTip")}
                     >
-                      {duplicatingTeam ? "복제 중…" : "+ 팀 복제"}
+                      {duplicatingTeam ? t("duplicateTeamRunning") : t("duplicateTeam")}
                     </button>
                   )}
                 </div>

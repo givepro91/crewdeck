@@ -177,23 +177,23 @@ function OrgNode({ agent, agents, childrenMap, selectedId, onSelect, onQuickProm
               badgeClass = "text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40";
               dot = "bg-blue-500 animate-pulse";
             } else if (isWorking) {
-              badgeText = "작업 중";
+              badgeText = t("statusWorking");
               badgeClass = "text-green-700 dark:text-green-300 bg-green-100 dark:bg-green-900/40 font-semibold";
               dot = "bg-green-500 animate-pulse";
             } else if (agent.status === "paused") {
-              badgeText = "일시정지";
+              badgeText = t("statusPaused");
               badgeClass = "text-yellow-700 dark:text-yellow-300 bg-yellow-100 dark:bg-yellow-900/40";
               dot = "bg-yellow-500";
             } else if (agent.status === "waiting_approval") {
-              badgeText = "승인 대기";
+              badgeText = t("statusWaitingApproval");
               badgeClass = "text-yellow-700 dark:text-yellow-300 bg-yellow-100 dark:bg-yellow-900/40";
               dot = "bg-yellow-500";
             } else if (agent.status === "terminated") {
-              badgeText = "종료";
+              badgeText = t("statusTerminated");
               badgeClass = "text-red-600 dark:text-red-300 bg-red-100 dark:bg-red-900/40";
               dot = "bg-red-500";
             } else {
-              badgeText = "대기";
+              badgeText = t("statusIdle");
               badgeClass = "text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800";
               dot = "bg-gray-400 dark:bg-gray-500";
             }
@@ -350,6 +350,7 @@ function QuickPromptPopover({
 export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKilled, onDuplicateTeam }: OrgChartProps) {
   const { t } = useTranslation();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detailAgentId, setDetailAgentId] = useState<string | null>(null);
   const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [quickPromptAgent, setQuickPromptAgent] = useState<Agent | null>(null);
@@ -397,6 +398,7 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
   }, [pendingDrop, agents, showToast, t, onAgentDeleted]);
 
   const selectedAgent = agents.find((a) => a.id === selectedId) ?? null;
+  const detailAgent = agents.find((a) => a.id === detailAgentId) ?? null;
 
   // 팀 그룹핑 — cto(조정자)는 상단 단일, 나머지 워커는 name suffix 팀별로 묶는다.
   // 계층(parent_id)은 기능용(decompose 후보=ctoChildren)으로 유지하되, 조직도는
@@ -420,13 +422,14 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
     return { cto, teams };
   }, [agents]);
 
-  const handleClose = () => setSelectedId(null);
   const handleKill = () => {
     onAgentKilled();
+    setDetailAgentId(null);
     setSelectedId(null);
   };
   const handleDeleted = () => {
     onAgentDeleted();
+    setDetailAgentId(null);
     setSelectedId(null);
   };
 
@@ -513,13 +516,13 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
         />
       )}
 
-      {/* AgentDetail slide-over */}
-      {selectedAgent && (
+      {/* AgentDetail slide-over — 우측 패널의 "상세 열기"로 연다 (선택과 분리) */}
+      {detailAgent && (
         <AgentDetail
-          agent={selectedAgent}
+          agent={detailAgent}
           agents={agents}
           tasks={tasks}
-          onClose={handleClose}
+          onClose={() => setDetailAgentId(null)}
           onKill={handleKill}
           onDeleted={handleDeleted}
         />
@@ -539,11 +542,11 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
               {/* 상태 요약 배지 — 한눈에 무엇이 실행 중인지 */}
               <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 font-medium shrink-0">
                 <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                작업 중 {workingCount}
+                {t("statusWorking")} {workingCount}
               </span>
               <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 shrink-0">
                 <span className="w-1.5 h-1.5 rounded-full bg-gray-400" />
-                대기 {idleCount}
+                {t("statusIdle")} {idleCount}
               </span>
               <button
                 onClick={() => setShowWorkflowGuide(true)}
@@ -557,10 +560,10 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
               {onDuplicateTeam && (
                 <button
                   onClick={onDuplicateTeam}
-                  title="현재 조직도를 한 벌 더 복제해 병렬 처리량을 늘립니다"
+                  title={t("duplicateTeamTip")}
                   className="text-xs px-3 py-1.5 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:border-blue-400 hover:text-blue-600 dark:hover:text-blue-300 transition-colors font-medium"
                 >
-                  + 팀 복제
+                  {t("duplicateTeam")}
                 </button>
               )}
               <button
@@ -573,7 +576,7 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
               <div className="relative">
                 <button
                   onClick={() => setShowMenu((v) => !v)}
-                  title="관리"
+                  title={t("orgManage")}
                   className="w-8 h-8 flex items-center justify-center rounded-lg border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors text-base leading-none"
                 >
                   ⋯
@@ -586,7 +589,7 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
                         onClick={() => { setShowMenu(false); setShowDeleteAllConfirm(true); }}
                         className="w-full text-left px-3 py-2 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
                       >
-                        에이전트 {agents.length}명 전체 삭제
+                        {t("orgDeleteAllScoped", { count: agents.length })}
                       </button>
                     </div>
                   </>
@@ -649,18 +652,55 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
           </div>
         </div>
 
-        {/* 우측 상세 패널 — 상시 표시. 카드 선택 시 상세(슬라이드오버)가 열린다. */}
+        {/* 우측 상세 패널 — 상시 표시. 카드 선택 시 요약 갱신, "상세 열기"로 전체 슬라이드오버. */}
         <div className="w-[220px] shrink-0 hidden lg:block">
           <div className="border border-gray-200 dark:border-gray-700 rounded-xl p-4 bg-gray-50/50 dark:bg-white/[0.02]">
-            <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 mb-2">에이전트 상세</p>
-            <p className="text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed">
-              {t("orgChartHint")}
-            </p>
-            <ul className="mt-3 space-y-1 text-[10px] text-gray-500 dark:text-gray-400">
-              <li>· 역할 · 역할 지시사항</li>
-              <li>· 현재 작업 · 세션 로그</li>
-              <li>· 토큰 사용량 · 종료/삭제</li>
-            </ul>
+            <p className="text-xs font-semibold text-gray-700 dark:text-gray-200 mb-3">{t("orgDetailTitle")}</p>
+            {selectedAgent ? (() => {
+              const tok = tasks
+                .filter((tk: any) => tk.assignee_id === selectedAgent.id)
+                .reduce((s: number, tk: any) => s + (tk.token_usage ?? 0), 0);
+              const working = selectedAgent.status === "working";
+              const activity = (selectedAgent as any).current_activity;
+              return (
+                <>
+                  <div className="flex items-start gap-2 mb-3">
+                    <AgentAvatar name={selectedAgent.name} role={selectedAgent.role} size="sm" showBadge={true} />
+                    <div className="min-w-0">
+                      <p className="text-[9px] uppercase tracking-wide text-gray-400 dark:text-gray-500 truncate">{selectedAgent.role}</p>
+                      <p className="text-xs font-semibold text-gray-800 dark:text-gray-100 leading-tight break-words">{selectedAgent.name}</p>
+                    </div>
+                  </div>
+                  <div className="space-y-1.5 text-[11px]">
+                    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full ${working ? "text-green-700 dark:text-green-300 bg-green-100 dark:bg-green-900/40 font-semibold" : "text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-800"}`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${working ? "bg-green-500 animate-pulse" : "bg-gray-400"}`} />
+                      {working ? t("statusWorking") : t("statusIdle")}
+                    </span>
+                    {working && activity && (
+                      <p className="text-indigo-600 dark:text-indigo-300 line-clamp-2 leading-snug">{parseActivity(activity, t)}</p>
+                    )}
+                    {tok > 0 && (
+                      <p className="text-gray-500 dark:text-gray-400">{t("orgAgentTokens", { tokens: tok.toLocaleString() })}</p>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => setDetailAgentId(selectedAgent.id)}
+                    className="mt-3 w-full text-[11px] px-2 py-1.5 bg-gray-900 dark:bg-white text-white dark:text-gray-900 rounded-lg hover:bg-gray-700 dark:hover:bg-gray-100 transition-colors font-medium"
+                  >
+                    {t("orgOpenDetail")}
+                  </button>
+                </>
+              );
+            })() : (
+              <>
+                <p className="text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed">{t("orgChartHint")}</p>
+                <ul className="mt-3 space-y-1 text-[10px] text-gray-500 dark:text-gray-400">
+                  <li>{t("orgDetailEx1")}</li>
+                  <li>{t("orgDetailEx2")}</li>
+                  <li>{t("orgDetailEx3")}</li>
+                </ul>
+              </>
+            )}
           </div>
         </div>
       </div>
