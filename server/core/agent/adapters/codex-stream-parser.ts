@@ -51,6 +51,18 @@ export function parseCodexJson(rawOutput: string): ParsedStreamOutput {
         break;
       }
 
+      // 치명적 실패 이벤트 — item.completed의 error(비치명 경고)와 달리
+      // top-level "error"와 "turn.failed"는 턴 자체가 죽은 것이라 errors에 담아
+      // 소비자가 "no text output" 대신 진짜 원인(예: 모델/버전 불일치 400)을
+      // 사용자에게 노출할 수 있게 한다.
+      case "error":
+        result.errors.push(`Codex error: ${typeof ev.message === "string" ? ev.message : JSON.stringify(ev.message ?? ev)}`);
+        break;
+
+      case "turn.failed":
+        result.errors.push(`Codex turn failed: ${ev.error?.message ?? JSON.stringify(ev.error ?? {})}`);
+        break;
+
       case "turn.completed": {
         const u = ev.usage ?? {};
         result.usage = {

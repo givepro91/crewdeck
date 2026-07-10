@@ -645,7 +645,8 @@ ${focusRules}
         const raw = parsed.text || "";
 
         if (!raw.trim()) {
-          throw new Error("Goal suggestion produced no text output");
+          const cause = parsed.errors.length ? ` — ${parsed.errors.join("; ")}` : "";
+          throw new Error(`Goal suggestion produced no text output${cause}`);
         }
 
         // Parse JSON from response — 모델이 산문(대괄호 평문 포함)을 반환해도

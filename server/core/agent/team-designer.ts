@@ -246,8 +246,12 @@ export async function designTeam(input: TeamDesignInput): Promise<SuggestedAgent
     if (result.exitCode !== 0 && result.stdout.trim() === "") {
       throw new Error(`Claude Code CLI failed (exit ${result.exitCode}): ${result.stderr.slice(0, 300)}`);
     }
-    const text = parseAgentOutput(result.stdout, result.provider).text || "";
-    if (!text.trim()) throw new Error("Team design produced no text output");
+    const parsed = parseAgentOutput(result.stdout, result.provider);
+    const text = parsed.text || "";
+    if (!text.trim()) {
+      const cause = parsed.errors.length ? ` — ${parsed.errors.join("; ")}` : "";
+      throw new Error(`Team design produced no text output${cause}`);
+    }
 
     const agents = parseTeamDesign(text, input.maxAgents);
     log.info(`Designed team of ${agents.length} for "${input.projectName}"`, {

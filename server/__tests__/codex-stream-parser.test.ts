@@ -29,4 +29,23 @@ describe("parseCodexJson", () => {
     expect(parseCodexJson("").text).toBe("");
     expect(parseCodexJson("not json\n{bad").text).toBe("");
   });
+  it("top-level error 이벤트를 errors에 담아 원인을 노출 (모델/버전 불일치 등)", () => {
+    const jsonl = [
+      '{"type":"thread.started","thread_id":"t1"}',
+      '{"type":"error","message":"{\\"type\\":\\"error\\",\\"status\\":400,\\"error\\":{\\"message\\":\\"The \'gpt-5.6-sol\' model requires a newer version of Codex.\\"}}"}',
+    ].join("\n");
+    const r = parseCodexJson(jsonl);
+    expect(r.text).toBe("");
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toContain("requires a newer version of Codex");
+  });
+  it("turn.failed 이벤트를 errors에 담는다", () => {
+    const jsonl = [
+      '{"type":"turn.started"}',
+      '{"type":"turn.failed","error":{"message":"rate limited"}}',
+    ].join("\n");
+    const r = parseCodexJson(jsonl);
+    expect(r.text).toBe("");
+    expect(r.errors.some((e) => e.includes("rate limited"))).toBe(true);
+  });
 });

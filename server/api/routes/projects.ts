@@ -703,7 +703,7 @@ Rules:
         const { parseAgentOutput } = await import("../../core/agent/adapters/stream-parser.js");
         const parsed = parseAgentOutput(result.stdout, result.provider);
         const raw = parsed.text || "";
-        if (!raw.trim()) throw new Error("No text output");
+        if (!raw.trim()) throw new Error(`No text output${parsed.errors.length ? ` — ${parsed.errors.join("; ")}` : ""}`);
 
         const jsonMatch = raw.match(/```json\s*([\s\S]*?)\s*```/) || raw.match(/(\{[\s\S]*\})/);
         const jsonStr = jsonMatch ? jsonMatch[1] : raw;
