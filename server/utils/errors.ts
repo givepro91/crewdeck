@@ -103,7 +103,15 @@ export function classifyAgentFailure(
   const msg = (err.message ?? "").toLowerCase();
   const detail = (err.detail ?? "").toLowerCase();
 
-  if (msg.includes("rate limit") || msg.includes("429") || msg.includes("too many requests")) {
+  // rate limit 신호는 message뿐 아니라 detail(stderr)에도 실린다. adapter가 429를
+  // non-zero 종료 + stderr로 올리고 engine이 이를 CLI_EXIT_NONZERO(message="...exited
+  // with code 1", detail="HTTP 429 ... rate limit exceeded")로 감싸면 message만 봐서는
+  // task_error로 오분류돼 scheduler의 rate_limit failover 분기(관측성 이벤트 포함)를
+  // 타지 못한다. 양쪽 모두 검사한다.
+  const rateLimitSignature = (s: string) =>
+    s.includes("rate limit") || s.includes("429") || s.includes("too many requests");
+
+  if (rateLimitSignature(msg) || rateLimitSignature(detail)) {
     return "rate_limit";
   }
 

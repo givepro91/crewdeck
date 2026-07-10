@@ -281,6 +281,19 @@ const ko = {
   scopeTargetFiles: "수정 대상 파일",
   scopeStackHint: "스택 제약",
 
+  // Provider resolution + failover trace (실행 엔진 해석·자동 전환 관측)
+  providerTraceTitle: "실행 엔진",
+  providerSourceAgent: "에이전트 지정",
+  providerSourceProject: "프로젝트 기본값",
+  providerSourceGlobal: "전역 기본값",
+  failoverTraceTitle: "실행 엔진 자동 전환",
+  failoverReasonRateLimit: "사용량 한도",
+  failoverReasonSessionExhausted: "세션 소진",
+  failoverReasonEnvError: "환경 오류",
+  failoverLoopGuardBlocked: "추가 전환 차단 (왕복 방지)",
+  failoverOriginalSession: "이전 엔진 세션",
+  failoverRedispatchedSession: "재실행 세션",
+
   // Prompt dialogs
   promptProjectName: "프로젝트 이름",
   promptProjectNameHint: "프로젝트 이름을 입력하세요...",

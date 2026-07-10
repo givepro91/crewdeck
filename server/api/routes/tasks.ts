@@ -1,6 +1,114 @@
 import { Router } from "express";
 import type { AppContext } from "../../index.js";
+import { loadProviderConfig } from "../../core/agent/provider.js";
 import { MAX_TITLE_LEN, MAX_DESC_LEN, MAX_TASK_RETRIES, MAX_REASSIGNS } from "../../utils/constants.js";
+import type {
+  AgentProvider,
+  ProviderFailoverReasonCode,
+  ProviderResolutionSource,
+  ProviderTrace,
+} from "../../../shared/types.js";
+
+const PROVIDERS: AgentProvider[] = ["claude", "codex"];
+const RESOLUTION_SOURCES: ProviderResolutionSource[] = ["agent", "project", "global"];
+const FAILOVER_REASONS: ProviderFailoverReasonCode[] = ["rate_limit", "session_exhausted", "env_error"];
+
+function isProvider(value: unknown): value is AgentProvider {
+  return typeof value === "string" && PROVIDERS.includes(value as AgentProvider);
+}
+
+function asProvider(value: unknown, fallback: AgentProvider): AgentProvider {
+  return isProvider(value) ? value : fallback;
+}
+
+function asResolutionSource(value: unknown): ProviderResolutionSource | null {
+  return typeof value === "string" && RESOLUTION_SOURCES.includes(value as ProviderResolutionSource)
+    ? value as ProviderResolutionSource
+    : null;
+}
+
+function asFailoverReason(value: unknown): ProviderFailoverReasonCode | null {
+  return typeof value === "string" && FAILOVER_REASONS.includes(value as ProviderFailoverReasonCode)
+    ? value as ProviderFailoverReasonCode
+    : null;
+}
+
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function asBooleanFlag(value: unknown): boolean {
+  return value === true || value === 1;
+}
+
+function buildProviderTrace(row: Record<string, unknown>, globalDefault: AgentProvider): ProviderTrace {
+  const resolutionSource = asResolutionSource(row.provider_trace_resolution_source)
+    ?? (isProvider(row.agent_provider) ? "agent" : isProvider(row.project_default_provider) ? "project" : "global");
+  const inheritedProvider = resolutionSource === "agent"
+    ? row.agent_provider
+    : resolutionSource === "project"
+      ? row.project_default_provider
+      : globalDefault;
+  const resolvedProvider = asProvider(
+    row.provider_trace_resolved_provider,
+    asProvider(inheritedProvider, globalDefault),
+  );
+
+  return {
+    resolvedProvider,
+    resolutionSource,
+    failover: {
+      reasonCode: asFailoverReason(row.provider_failover_reason_code),
+      userMessage: asNullableString(row.provider_failover_user_message),
+      fromProvider: isProvider(row.provider_failover_from_provider) ? row.provider_failover_from_provider : null,
+      toProvider: isProvider(row.provider_failover_to_provider) ? row.provider_failover_to_provider : null,
+      redispatched: asBooleanFlag(row.provider_failover_redispatched),
+      loopGuardBlocked: asBooleanFlag(row.provider_failover_loop_guard_blocked),
+      originalSessionId: asNullableString(row.provider_failover_original_session_id),
+      redispatchedSessionId: asNullableString(row.provider_failover_redispatched_session_id),
+    },
+  };
+}
+
+export function serializeTask(row: Record<string, unknown>, globalDefault: AgentProvider): Record<string, unknown> {
+  const {
+    agent_provider: _agentProvider,
+    project_default_provider: _projectDefaultProvider,
+    provider_trace_resolved_provider: _providerTraceResolvedProvider,
+    provider_trace_resolution_source: _providerTraceResolutionSource,
+    provider_failover_reason_code: _providerFailoverReasonCode,
+    provider_failover_user_message: _providerFailoverUserMessage,
+    provider_failover_from_provider: _providerFailoverFromProvider,
+    provider_failover_to_provider: _providerFailoverToProvider,
+    provider_failover_redispatched: _providerFailoverRedispatched,
+    provider_failover_loop_guard_blocked: _providerFailoverLoopGuardBlocked,
+    provider_failover_original_session_id: _providerFailoverOriginalSessionId,
+    provider_failover_redispatched_session_id: _providerFailoverRedispatchedSessionId,
+    ...task
+  } = row;
+
+  return {
+    ...task,
+    providerTrace: buildProviderTrace(row, globalDefault),
+  };
+}
+
+export function selectTaskForResponse(db: any, taskId: string): Record<string, unknown> | undefined {
+  return db.prepare(`
+    SELECT t.*,
+           v.verdict        AS verification_verdict,
+           v.severity       AS verification_severity,
+           v.scope          AS verification_scope,
+           v.issues         AS verification_issues,
+           a.provider       AS agent_provider,
+           p.default_provider AS project_default_provider
+    FROM tasks t
+    LEFT JOIN verifications v ON v.id = t.verification_id
+    LEFT JOIN agents a ON a.id = t.assignee_id
+    JOIN projects p ON p.id = t.project_id
+    WHERE t.id = ?
+  `).get(taskId) as Record<string, unknown> | undefined;
+}
 
 export function createTaskRoutes(ctx: AppContext): Router {
   const router = Router();
@@ -24,35 +132,32 @@ export function createTaskRoutes(ctx: AppContext): Router {
              v.verdict        AS verification_verdict,
              v.severity       AS verification_severity,
              v.scope          AS verification_scope,
-             v.issues         AS verification_issues
+             v.issues         AS verification_issues,
+             a.provider       AS agent_provider,
+             p.default_provider AS project_default_provider
       FROM tasks t
       LEFT JOIN verifications v ON v.id = t.verification_id
+      LEFT JOIN agents a ON a.id = t.assignee_id
+      JOIN projects p ON p.id = t.project_id
     `;
 
-    let tasks;
+    let tasks: Record<string, unknown>[];
     if (goalId) {
-      tasks = db.prepare(`${withVerification} WHERE t.goal_id = ? ORDER BY t.created_at DESC LIMIT ?`).all(goalId, limit);
+      tasks = db.prepare(`${withVerification} WHERE t.goal_id = ? ORDER BY t.created_at DESC LIMIT ?`).all(goalId, limit) as Record<string, unknown>[];
     } else if (projectId) {
-      tasks = db.prepare(`${withVerification} WHERE t.project_id = ? ORDER BY CASE t.status WHEN 'in_progress' THEN 0 WHEN 'in_review' THEN 1 WHEN 'todo' THEN 2 WHEN 'pending_approval' THEN 3 WHEN 'blocked' THEN 4 WHEN 'done' THEN 5 ELSE 6 END, t.created_at DESC LIMIT ?`).all(projectId, limit);
+      tasks = db.prepare(`${withVerification} WHERE t.project_id = ? ORDER BY CASE t.status WHEN 'in_progress' THEN 0 WHEN 'in_review' THEN 1 WHEN 'todo' THEN 2 WHEN 'pending_approval' THEN 3 WHEN 'blocked' THEN 4 WHEN 'done' THEN 5 ELSE 6 END, t.created_at DESC LIMIT ?`).all(projectId, limit) as Record<string, unknown>[];
     } else {
       return res.status(400).json({ error: "projectId or goalId query param required" });
     }
-    res.json(tasks);
+    const globalDefault = loadProviderConfig().defaultProvider;
+    res.json(tasks.map((task) => serializeTask(task, globalDefault)));
   });
 
   // Get single task (includes verification badge fields)
   router.get("/:id", (req, res) => {
-    const task = db.prepare(`
-      SELECT t.*,
-             v.verdict        AS verification_verdict,
-             v.severity       AS verification_severity,
-             v.scope          AS verification_scope
-      FROM tasks t
-      LEFT JOIN verifications v ON v.id = t.verification_id
-      WHERE t.id = ?
-    `).get(req.params.id);
+    const task = selectTaskForResponse(db, req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
-    res.json(task);
+    res.json(serializeTask(task, loadProviderConfig().defaultProvider));
   });
 
   // Create task
@@ -94,7 +199,8 @@ export function createTaskRoutes(ctx: AppContext): Router {
         VALUES (?, ?, ?, ?, ?)
       `).run(goal_id, project_id, boundedTitle, boundedDesc, assignee_id ?? null);
 
-      const task = db.prepare("SELECT * FROM tasks WHERE rowid = ?").get(result.lastInsertRowid);
+      const inserted = db.prepare("SELECT id FROM tasks WHERE rowid = ?").get(result.lastInsertRowid) as { id: string };
+      const task = serializeTask(selectTaskForResponse(db, inserted.id)!, loadProviderConfig().defaultProvider);
       broadcast("task:updated", task);
       res.status(201).json(task);
     } catch (err: any) {
@@ -200,12 +306,13 @@ export function createTaskRoutes(ctx: AppContext): Router {
           stackHintValue,
           req.params.id,
         );
-        return db.prepare("SELECT * FROM tasks WHERE id = ?").get(req.params.id);
+        return selectTaskForResponse(db, req.params.id);
       });
 
       const updated = run();
       if (!updated) return res.status(404).json({ error: "Task not found (deleted concurrently)" });
-      broadcast("task:updated", updated);
+      const responseTask = serializeTask(updated as Record<string, unknown>, loadProviderConfig().defaultProvider);
+      broadcast("task:updated", responseTask);
 
       // Update goal progress if task status changed
       if (status) {
@@ -217,7 +324,7 @@ export function createTaskRoutes(ctx: AppContext): Router {
         ensureQueueRunning(existing.project_id);
       }
 
-      res.json(updated);
+      res.json(responseTask);
     } catch (err: any) {
       res.status(400).json({ error: err.message });
     }
@@ -246,7 +353,7 @@ export function createTaskRoutes(ctx: AppContext): Router {
       .run(req.params.id);
     updateGoalProgress(db, task.goal_id);
 
-    const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(req.params.id);
+    const updated = serializeTask(selectTaskForResponse(db, req.params.id)!, loadProviderConfig().defaultProvider);
     broadcast("task:updated", updated);
 
     db.prepare(
@@ -306,7 +413,7 @@ export function createTaskRoutes(ctx: AppContext): Router {
       "UPDATE tasks SET status = 'todo', description = ?, updated_at = datetime('now') WHERE id = ?",
     ).run(newDesc, req.params.id);
 
-    const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(req.params.id);
+    const updated = serializeTask(selectTaskForResponse(db, req.params.id)!, loadProviderConfig().defaultProvider);
     broadcast("task:updated", updated);
 
     // Rejected task goes back to todo — auto-resume queue in autopilot mode

@@ -8,6 +8,8 @@ import { createQualityGate } from "../../core/quality-gate/evaluator.js";
 import { MAX_PROMPT_LEN, MAX_TITLE_LEN, MAX_DESC_LEN } from "../../utils/constants.js";
 import { parseAgentOutput } from "../../core/agent/adapters/stream-parser.js";
 import { createLogger } from "../../utils/logger.js";
+import { loadProviderConfig } from "../../core/agent/provider.js";
+import { serializeTask, selectTaskForResponse } from "./tasks.js";
 
 const log = createLogger("orchestration");
 
@@ -635,7 +637,7 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
     db.prepare("UPDATE tasks SET status = 'todo', updated_at = datetime('now') WHERE id = ?")
       .run(taskId);
 
-    const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
+    const updated = serializeTask(selectTaskForResponse(db, taskId)!, loadProviderConfig().defaultProvider);
     broadcast("task:updated", updated);
     broadcast("project:updated", { projectId });
 
@@ -670,7 +672,7 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
       "UPDATE tasks SET status = 'blocked', description = ?, updated_at = datetime('now') WHERE id = ?",
     ).run(newDesc, taskId);
 
-    const updated = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId);
+    const updated = serializeTask(selectTaskForResponse(db, taskId)!, loadProviderConfig().defaultProvider);
     broadcast("task:updated", updated);
     broadcast("project:updated", { projectId });
 

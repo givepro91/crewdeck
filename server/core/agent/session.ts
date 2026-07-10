@@ -2,7 +2,7 @@ import type { Database } from "better-sqlite3";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getBackend, type AgentSession, type AgentProvider } from "./adapters/backend.js";
-import { resolveProvider, loadProviderConfig } from "./provider.js";
+import { resolveProviderTrace, loadProviderConfig } from "./provider.js";
 import { createLogger } from "../../utils/logger.js";
 import { resolvePrompt } from "./prompt-resolver.js";
 import { loadMemory } from "./memory.js";
@@ -130,7 +130,8 @@ export function createSessionManager(db: Database): SessionManager {
       // failover override(Task 8)가 이 sessionKey에 있으면 최우선.
       const providerCfg = loadProviderConfig();
       const overrideProvider = providerOverrides.get(key);
-      const provider = overrideProvider ?? resolveProvider(agent, project ?? {}, providerCfg);
+      const providerResolution = resolveProviderTrace(agent, project ?? {}, providerCfg);
+      const provider = overrideProvider ?? providerResolution.provider;
       const adapter = getBackend(provider);
 
       // 모델 매핑: agent.model은 Claude 별칭(opus/sonnet). Codex엔 codexModelMap으로 변환(없으면 -m 생략).
@@ -151,8 +152,16 @@ export function createSessionManager(db: Database): SessionManager {
 
       // Track session in DB — use RETURNING to get session row id for PID update
       const sessionRow = db
-        .prepare("INSERT INTO sessions (agent_id, status, provider) VALUES (?, 'active', ?) RETURNING id")
-        .get(agentId, provider) as { id: string };
+        .prepare(`
+          INSERT INTO sessions (
+            agent_id, status, provider,
+            provider_trace_resolved_provider, provider_trace_resolution_source
+          ) VALUES (?, 'active', ?, ?, ?) RETURNING id
+        `)
+        // resolved_provider = 실제로 실행된 provider(failover override 반영). 기본 해석과
+        // override가 갈릴 때 sessions.provider와 provider_trace_resolved_provider가 어긋나지
+        // 않도록 override를 포함한 `provider`를 기록한다.
+        .get(agentId, provider, provider, providerResolution.source) as { id: string };
 
       // Capture PID immediately after spawn (before "working" event)
       session.on("pid", (pid: number) => {
@@ -300,4 +309,3 @@ export function createSessionManager(db: Database): SessionManager {
     },
   };
 }
-

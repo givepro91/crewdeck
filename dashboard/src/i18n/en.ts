@@ -281,6 +281,19 @@ const en = {
   scopeTargetFiles: "Target files",
   scopeStackHint: "Stack constraint",
 
+  // Provider resolution + failover trace (engine auto-switch observability)
+  providerTraceTitle: "Engine",
+  providerSourceAgent: "Agent override",
+  providerSourceProject: "Project default",
+  providerSourceGlobal: "Global default",
+  failoverTraceTitle: "Engine Failover",
+  failoverReasonRateLimit: "Usage limit",
+  failoverReasonSessionExhausted: "Session exhausted",
+  failoverReasonEnvError: "Environment error",
+  failoverLoopGuardBlocked: "Further failover blocked (loop guard)",
+  failoverOriginalSession: "Previous engine session",
+  failoverRedispatchedSession: "Retried session",
+
   // Prompt dialogs
   promptProjectName: "Project Name",
   promptProjectNameHint: "Enter project name...",

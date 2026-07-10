@@ -7,7 +7,15 @@ import { createLogger } from "../../utils/logger.js";
 import { classifyAgentFailure } from "../../utils/errors.js";
 import { getBackend, type AgentProvider } from "../agent/adapters/backend.js";
 import { loadProviderConfig } from "../agent/provider.js";
-import { decideFailover, type FailureClass } from "../agent/failover.js";
+import { decideFailover, triedProvidersFromFailoverTrace, type FailureClass, type FailoverReasonCode } from "../agent/failover.js";
+import { selectTaskForResponse, serializeTask } from "../../api/routes/tasks.js";
+import type {
+  ActivityLogEntry,
+  ProviderFailoverEventPayload,
+  ProviderRedispatchEventPayload,
+  ProviderResolutionSource,
+  ProviderResolvedEventPayload,
+} from "../../../shared/types.js";
 import {
   POLL_INTERVAL_MS, BACKOFF_BASE_MS, BACKOFF_MAX_MS,
   MAX_CONSECUTIVE_RATE_LIMITS, DEFAULT_MAX_CONCURRENCY,
@@ -89,6 +97,207 @@ export function pickParallelGoals(db: Database, projectId: string, maxGoals: num
   return rows.map((r) => r.id);
 }
 
+interface ProviderFailoverDecisionRecord {
+  reasonCode: FailoverReasonCode | null;
+  userMessage: string | null;
+  fromProvider: AgentProvider | null;
+  toProvider: AgentProvider | null;
+  redispatched: boolean;
+  loopGuardBlocked: boolean;
+}
+
+function isAgentProvider(value: unknown): value is AgentProvider {
+  return value === "claude" || value === "codex";
+}
+
+function asAgentProvider(value: unknown, fallback: AgentProvider): AgentProvider {
+  return isAgentProvider(value) ? value : fallback;
+}
+
+function asResolutionSource(value: unknown): ProviderResolutionSource | null {
+  return value === "agent" || value === "project" || value === "global" ? value : null;
+}
+
+function labelProvider(provider: AgentProvider): string {
+  return provider === "claude" ? "Claude" : "Codex";
+}
+
+function labelResolutionSource(source: ProviderResolutionSource): string {
+  switch (source) {
+    case "agent":
+      return "에이전트 설정";
+    case "project":
+      return "프로젝트 설정";
+    case "global":
+      return "전역 기본값";
+  }
+}
+
+function labelFailoverReason(reasonCode: FailoverReasonCode): string {
+  switch (reasonCode) {
+    case "rate_limit":
+      return "사용량 한도";
+    case "session_exhausted":
+      return "세션 소진";
+    case "env_error":
+      return "실행 환경 오류";
+  }
+}
+
+function asFailoverReasonCode(value: unknown): FailoverReasonCode | null {
+  return value === "rate_limit" || value === "session_exhausted" || value === "env_error"
+    ? value
+    : null;
+}
+
+interface ActivityRow {
+  id: number;
+  project_id: string;
+  agent_id: string | null;
+  type: string;
+  message: string;
+  metadata: string | null;
+  created_at: string;
+}
+
+function parseActivityMetadata(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function serializeActivityRow(row: ActivityRow): ActivityLogEntry {
+  return {
+    id: row.id,
+    project_id: row.project_id,
+    projectId: row.project_id,
+    agent_id: row.agent_id,
+    agentId: row.agent_id,
+    type: row.type,
+    message: row.message,
+    metadata: parseActivityMetadata(row.metadata),
+    created_at: row.created_at,
+    createdAt: row.created_at,
+  };
+}
+
+function recordProviderFailoverDecision(
+  db: Database,
+  taskId: string,
+  sessionId: string | null | undefined,
+  decision: ProviderFailoverDecisionRecord,
+): void {
+  db.prepare(
+    `UPDATE tasks SET
+       provider_failover_reason_code =
+         CASE WHEN provider_failover_redispatched = 1 THEN provider_failover_reason_code ELSE ? END,
+       provider_failover_user_message =
+         CASE WHEN provider_failover_redispatched = 1 THEN provider_failover_user_message ELSE ? END,
+       provider_failover_from_provider =
+         CASE WHEN provider_failover_redispatched = 1 THEN provider_failover_from_provider ELSE ? END,
+       provider_failover_to_provider =
+         CASE WHEN provider_failover_redispatched = 1 THEN provider_failover_to_provider ELSE ? END,
+       provider_failover_redispatched =
+         CASE WHEN provider_failover_redispatched = 1 THEN 1 ELSE ? END,
+       provider_failover_loop_guard_blocked = ?,
+       updated_at = datetime('now')
+     WHERE id = ?`,
+  ).run(
+    decision.reasonCode,
+    decision.userMessage,
+    decision.fromProvider,
+    decision.toProvider,
+    decision.redispatched ? 1 : 0,
+    decision.loopGuardBlocked ? 1 : 0,
+    taskId,
+  );
+
+  if (!sessionId) return;
+  db.prepare(
+    `UPDATE sessions SET
+       provider_failover_reason_code = ?,
+       provider_failover_user_message = ?,
+       provider_failover_from_provider = ?,
+       provider_failover_to_provider = ?,
+       provider_failover_redispatched = ?,
+       provider_failover_loop_guard_blocked = ?
+     WHERE id = ?`,
+  ).run(
+    decision.reasonCode,
+    decision.userMessage,
+    decision.fromProvider,
+    decision.toProvider,
+    decision.redispatched ? 1 : 0,
+    decision.loopGuardBlocked ? 1 : 0,
+    sessionId,
+  );
+}
+
+export function markProviderFailoverLoopGuardBlocked(
+  db: Database,
+  taskId: string,
+  sessionId: string | null | undefined,
+  trace?: ProviderFailoverDecisionRecord,
+): void {
+  if (trace) {
+    db.prepare(
+      `UPDATE tasks SET
+         provider_failover_reason_code = COALESCE(provider_failover_reason_code, ?),
+         provider_failover_user_message = COALESCE(provider_failover_user_message, ?),
+         provider_failover_from_provider = COALESCE(provider_failover_from_provider, ?),
+         provider_failover_to_provider = COALESCE(provider_failover_to_provider, ?),
+         provider_failover_redispatched =
+           CASE WHEN provider_failover_redispatched = 1 THEN 1 ELSE ? END,
+         provider_failover_loop_guard_blocked = ?,
+         updated_at = datetime('now')
+       WHERE id = ?`,
+    ).run(
+      trace.reasonCode,
+      trace.userMessage,
+      trace.fromProvider,
+      trace.toProvider,
+      trace.redispatched ? 1 : 0,
+      trace.loopGuardBlocked ? 1 : 0,
+      taskId,
+    );
+  } else {
+    db.prepare(
+      "UPDATE tasks SET provider_failover_loop_guard_blocked = 1, updated_at = datetime('now') WHERE id = ?",
+    ).run(taskId);
+  }
+  if (!sessionId) return;
+  if (trace) {
+    db.prepare(
+      `UPDATE sessions SET
+         provider_failover_reason_code = ?,
+         provider_failover_user_message = ?,
+         provider_failover_from_provider = ?,
+         provider_failover_to_provider = ?,
+         provider_failover_redispatched = ?,
+         provider_failover_loop_guard_blocked = ?
+       WHERE id = ?`,
+    ).run(
+      trace.reasonCode,
+      trace.userMessage,
+      trace.fromProvider,
+      trace.toProvider,
+      trace.redispatched ? 1 : 0,
+      trace.loopGuardBlocked ? 1 : 0,
+      sessionId,
+    );
+    return;
+  }
+  db.prepare(
+    "UPDATE sessions SET provider_failover_loop_guard_blocked = 1 WHERE id = ?",
+  ).run(sessionId);
+}
+
 /**
  * Parallel task scheduler with per-agent concurrency control.
  *
@@ -120,9 +329,194 @@ export function createScheduler(
   // failover: taskId → 이 태스크 시도에서 이미 써본 provider 집합 (claude↔codex 무한왕복 차단)
   const triedProvidersByTask = new Map<string, Set<AgentProvider>>();
 
+  // failover 관측성 브리지: 재디스패치된 taskId → 원본(실패) 세션 id + 기대 provider.
+  // 재실행이 새 세션을 만든 뒤(다음 poll의 executeOne) redispatched_session_id를 backfill한다.
+  const pendingFailoverByTask = new Map<string, {
+    originalSessionId: string;
+    toProvider: AgentProvider;
+  }>();
+
+  const pendingBackfillTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   function getEffectiveConcurrency(projectId: string): number {
     return effectiveConcurrency.get(projectId) ?? DEFAULT_MAX_CONCURRENCY;
   }
+
+  function recordActivity(input: {
+    projectId: string;
+    agentId?: string | null;
+    type: string;
+    message: string;
+    metadata?: Record<string, unknown> | null;
+  }): ActivityLogEntry | null {
+    try {
+      const row = db.prepare(
+        `INSERT INTO activities (project_id, agent_id, type, message, metadata)
+         VALUES (?, ?, ?, ?, ?)
+         RETURNING id, project_id, agent_id, type, message, metadata, created_at`,
+      ).get(
+        input.projectId,
+        input.agentId ?? null,
+        input.type,
+        input.message,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+      ) as ActivityRow;
+      const activity = serializeActivityRow(row);
+      broadcast("activity:created", activity);
+      return activity;
+    } catch (err: any) {
+      log.warn(`Failed to record activity ${input.type}: ${err?.message ?? err}`);
+      return null;
+    }
+  }
+
+  function readProviderResolution(task: any): {
+    resolvedProvider: AgentProvider;
+    resolutionSource: ProviderResolutionSource;
+    failoverOverride: boolean;
+  } {
+    const cfg = loadProviderConfig();
+    const pendingFailover = getPendingFailover(task.id);
+    const row = db.prepare(
+      `SELECT t.provider_trace_resolved_provider, t.provider_trace_resolution_source,
+              a.provider AS agent_provider, p.default_provider AS project_default_provider
+       FROM tasks t
+       LEFT JOIN agents a ON a.id = t.assignee_id
+       JOIN projects p ON p.id = t.project_id
+       WHERE t.id = ?`,
+    ).get(task.id) as {
+      provider_trace_resolved_provider: string | null;
+      provider_trace_resolution_source: string | null;
+      agent_provider: string | null;
+      project_default_provider: string | null;
+    } | undefined;
+
+    const resolutionSource = asResolutionSource(row?.provider_trace_resolution_source)
+      ?? (isAgentProvider(row?.agent_provider) ? "agent" : isAgentProvider(row?.project_default_provider) ? "project" : "global");
+    const inheritedProvider = resolutionSource === "agent"
+      ? row?.agent_provider
+      : resolutionSource === "project"
+        ? row?.project_default_provider
+        : cfg.defaultProvider;
+    const baseProvider = asAgentProvider(
+      row?.provider_trace_resolved_provider,
+      asAgentProvider(inheritedProvider, cfg.defaultProvider),
+    );
+
+    return {
+      resolvedProvider: pendingFailover?.toProvider ?? baseProvider,
+      resolutionSource,
+      failoverOverride: pendingFailover !== undefined,
+    };
+  }
+
+  function recordProviderResolved(task: any): void {
+    try {
+      const trace = readProviderResolution(task);
+      db.prepare(
+        `UPDATE tasks SET
+           provider_trace_resolved_provider = ?,
+           provider_trace_resolution_source = ?,
+           updated_at = datetime('now')
+         WHERE id = ?`,
+      ).run(trace.resolvedProvider, trace.resolutionSource, task.id);
+
+      const sourceText = trace.failoverOverride
+        ? "자동 전환"
+        : labelResolutionSource(trace.resolutionSource);
+      const taskTitle = String(task.title ?? "");
+      const userMessage = `실행 엔진 선택: ${labelProvider(trace.resolvedProvider)} (${sourceText}) — "${taskTitle.slice(0, 80)}"`;
+      const payload: ProviderResolvedEventPayload = {
+        projectId: task.project_id ?? task.projectId ?? "",
+        taskId: task.id,
+        agentId: task.assignee_id ?? null,
+        taskTitle,
+        resolvedProvider: trace.resolvedProvider,
+        resolutionSource: trace.resolutionSource,
+        failoverOverride: trace.failoverOverride,
+        userMessage,
+      };
+
+      recordActivity({
+        projectId: payload.projectId,
+        agentId: payload.agentId,
+        type: "provider_resolved",
+        message: userMessage,
+        metadata: { event: "provider:resolved", ...payload },
+      });
+      broadcast("provider:resolved", payload);
+    } catch (err: any) {
+      log.warn(`Failed to record provider resolution for task ${task.id}: ${err?.message ?? err}`);
+    }
+  }
+
+  function recordFailoverDecisionActivity(
+    projectId: string,
+    task: any,
+    sessionId: string | null,
+    decision: ProviderFailoverDecisionRecord,
+  ): void {
+    if (!decision.reasonCode || !decision.fromProvider || !decision.toProvider) return;
+
+    const reasonLabel = labelFailoverReason(decision.reasonCode);
+    const userMessage = decision.userMessage
+      ?? `${labelProvider(decision.fromProvider)} ${reasonLabel}로 자동 전환 판단을 완료했습니다.`;
+    const statusText = decision.redispatched
+      ? "대체 엔진으로 재실행합니다"
+      : decision.loopGuardBlocked
+        ? "왕복 방지를 위해 추가 전환을 차단했습니다"
+        : "쿨다운 후 재시도합니다";
+    const message = `${reasonLabel}(reasonCode=${decision.reasonCode}): ${userMessage} ${statusText}.`;
+    const payload: ProviderFailoverEventPayload = {
+      projectId,
+      taskId: task.id,
+      agentId: task.assignee_id ?? null,
+      taskTitle: String(task.title ?? ""),
+      sessionId,
+      reasonCode: decision.reasonCode,
+      userMessage,
+      fromProvider: decision.fromProvider,
+      toProvider: decision.toProvider,
+      redispatched: decision.redispatched,
+      loopGuardBlocked: decision.loopGuardBlocked,
+    };
+
+    recordActivity({
+      projectId,
+      agentId: payload.agentId,
+      type: "provider_failover_decision",
+      message,
+      metadata: { event: "provider:failover", ...payload },
+    });
+    broadcast("provider:failover", payload);
+    if (decision.reasonCode === "rate_limit") {
+      broadcast("system:error", {
+        projectId,
+        agentId: payload.agentId,
+        taskId: payload.taskId,
+        error: {
+          code: "provider_rate_limit",
+          reasonCode: decision.reasonCode,
+          message,
+          recovery: decision.redispatched
+            ? `${labelProvider(decision.toProvider)}로 자동 재실행합니다.`
+            : "쿨다운 후 자동 재시도합니다.",
+        },
+      });
+    }
+  }
+
+  function recordRedispatchActivity(payload: ProviderRedispatchEventPayload): void {
+    recordActivity({
+      projectId: payload.projectId,
+      agentId: payload.agentId,
+      type: "provider_redispatch_result",
+      message: payload.userMessage,
+      metadata: { event: "provider:redispatched", ...payload },
+    });
+    broadcast("provider:redispatched", payload);
+  }
+
   /**
    * Prevent duplicate pipeline work. Two disjoint key namespaces share this
    * Set intentionally:
@@ -713,13 +1107,6 @@ export function createScheduler(
       broadcast("project:updated", { projectId });
     }
 
-    // Step 1: goal 간 병렬 — 이번 라운드에 태스크를 뽑을 goal 들을 고른다.
-    // in-flight 태스크가 있는 goal 은 "goal 내부 순차 1" 원칙상 이미 슬롯을
-    // 점유 중이라 제외되고, 남은 goal 중 ready 태스크가 있는 것을 우선순위
-    // 순으로 최대 maxSlots 개. goal 간에는 worktree 격리로 병렬이 안전하다.
-    const activeGoalIds = pickParallelGoals(db, projectId, maxSlots);
-    if (activeGoalIds.length === 0) return [];
-
     // Reviewer/QA tasks should wait until all other tasks in the same goal are done
     const reviewerAgentIds = new Set(
       (db.prepare(
@@ -729,6 +1116,41 @@ export function createScheduler(
 
     const picked: any[] = [];
     const usedAgents = new Set(busy);
+
+    // Failover redispatch는 같은 태스크가 같은 agent에서 즉시 재실행되어야
+    // original_session_id ↔ redispatched_session_id 연결이 정확하다. 일반 goal
+    // 우선순위보다 먼저 집어, 같은 agent의 다른 태스크 세션이 사이에 끼는 것을 막는다.
+    const pendingRedispatches = db.prepare(`
+      SELECT t.* FROM tasks t
+      WHERE t.project_id = ?
+        AND t.status = 'todo'
+        AND t.assignee_id IS NOT NULL
+        AND t.provider_failover_redispatched = 1
+        AND t.provider_failover_original_session_id IS NOT NULL
+        AND t.provider_failover_redispatched_session_id IS NULL
+        AND t.provider_failover_to_provider IN ('claude', 'codex')
+      ORDER BY t.updated_at DESC, t.created_at ASC
+    `).all(projectId) as any[];
+    const pendingRedispatchAgentIds = new Set(
+      pendingRedispatches
+        .map((task) => task.assignee_id)
+        .filter((agentId: unknown): agentId is string => typeof agentId === "string"),
+    );
+    for (const task of pendingRedispatches) {
+      if (picked.length >= maxSlots) break;
+      if (usedAgents.has(task.assignee_id)) continue;
+      picked.push(task);
+      usedAgents.add(task.assignee_id);
+    }
+
+    // Step 1: goal 간 병렬 — 이번 라운드에 태스크를 뽑을 goal 들을 고른다.
+    // in-flight 태스크가 있는 goal 은 "goal 내부 순차 1" 원칙상 이미 슬롯을
+    // 점유 중이라 제외되고, 남은 goal 중 ready 태스크가 있는 것을 우선순위
+    // 순으로 최대 maxSlots 개. goal 간에는 worktree 격리로 병렬이 안전하다.
+    const pickedGoalIds = new Set(picked.map((task) => task.goal_id));
+    const activeGoalIds = pickParallelGoals(db, projectId, maxSlots)
+      .filter((goalId) => !pickedGoalIds.has(goalId));
+    if (activeGoalIds.length === 0) return picked;
 
     // Step 2: goal 마다 실행 가능한 첫 태스크 1개만 뽑는다 (goal 내부 순차 1)
     for (const activeGoalId of activeGoalIds) {
@@ -760,6 +1182,7 @@ export function createScheduler(
 
       for (const task of candidates) {
         if (usedAgents.has(task.assignee_id)) continue; // agent already occupied
+        if (pendingRedispatchAgentIds.has(task.assignee_id)) continue; // failover 재연결 전까지 같은 agent의 다른 세션 차단
 
         // Gate: reviewer tasks wait until all sibling tasks in the same goal are
         // done. Permanently-blocked siblings (retry + reassign both exhausted)
@@ -1217,6 +1640,196 @@ export function createScheduler(
     pauseState.delete(projectId);
   }
 
+  /**
+   * failover로 재디스패치된 태스크의 redispatched_session_id를 backfill한다.
+   * 재실행(executeTask)이 새 세션을 생성한 뒤에만 유효하므로 executeOne finally에서 호출된다.
+   * 원본(실패) 세션과 아직 같은 세션이면(= 새 세션 미생성) no-op으로 다음 실행을 기다린다.
+   */
+  function getPendingFailover(taskId: string): {
+    originalSessionId: string;
+    toProvider: AgentProvider;
+  } | undefined {
+    const inMemory = pendingFailoverByTask.get(taskId);
+    if (inMemory) return inMemory;
+
+    const row = db.prepare(
+      `SELECT provider_failover_original_session_id, provider_failover_to_provider
+       FROM tasks
+       WHERE id = ?
+         AND provider_failover_redispatched = 1
+         AND provider_failover_original_session_id IS NOT NULL
+         AND provider_failover_redispatched_session_id IS NULL`,
+    ).get(taskId) as {
+      provider_failover_original_session_id: string | null;
+      provider_failover_to_provider: string | null;
+    } | undefined;
+    if (!row?.provider_failover_original_session_id || !isAgentProvider(row.provider_failover_to_provider)) {
+      return undefined;
+    }
+
+    const recovered = {
+      originalSessionId: row.provider_failover_original_session_id,
+      toProvider: row.provider_failover_to_provider,
+    };
+    pendingFailoverByTask.set(taskId, recovered);
+    return recovered;
+  }
+
+  /**
+   * DB에 영속된 failover 트레이스에서 이 태스크가 이미 시도한 provider를 복원한다.
+   * triedProvidersByTask(인메모리)는 서버 재시작으로 비므로, 실제 재디스패치가
+   * 일어난(redispatched=1) 트레이스의 from/to provider를 loop guard 입력에 되살려
+   * claude↔codex 무한 왕복을 재시작 이후에도 차단한다. redispatched=0(쿨다운만)이면
+   * to provider가 실제로 실행된 적이 없으므로 복원하지 않는다(불필요한 loop guard 방지).
+   */
+  function readTriedProvidersFromDb(taskId: string): AgentProvider[] {
+    const row = db.prepare(
+      `SELECT provider_failover_from_provider, provider_failover_to_provider, provider_failover_redispatched
+       FROM tasks WHERE id = ?`,
+    ).get(taskId) as {
+      provider_failover_from_provider: string | null;
+      provider_failover_to_provider: string | null;
+      provider_failover_redispatched: number | null;
+    } | undefined;
+    if (!row) return [];
+    return triedProvidersFromFailoverTrace({
+      fromProvider: isAgentProvider(row.provider_failover_from_provider) ? row.provider_failover_from_provider : null,
+      toProvider: isAgentProvider(row.provider_failover_to_provider) ? row.provider_failover_to_provider : null,
+      redispatched: row.provider_failover_redispatched === 1,
+    });
+  }
+
+  function broadcastTaskSnapshot(taskId: string): void {
+    const serialized = selectTaskForResponse(db, taskId);
+    if (serialized) {
+      broadcast("task:updated", serializeTask(serialized, loadProviderConfig().defaultProvider));
+    }
+  }
+
+  function scheduleRedispatchBackfill(taskId: string, attempt = 0): void {
+    if (pendingBackfillTimers.has(taskId) || !getPendingFailover(taskId)) return;
+    const handle = setTimeout(() => {
+      pendingBackfillTimers.delete(taskId);
+      if (backfillRedispatchSession(taskId)) {
+        broadcastTaskSnapshot(taskId);
+        return;
+      }
+      if (attempt < 40 && getPendingFailover(taskId)) {
+        scheduleRedispatchBackfill(taskId, attempt + 1);
+      }
+    }, 250);
+    pendingBackfillTimers.set(taskId, handle);
+  }
+
+  function backfillRedispatchSession(taskId: string): boolean {
+    const pending = getPendingFailover(taskId);
+    if (pending === undefined) return false;
+    const row = db.prepare("SELECT project_id, assignee_id, title FROM tasks WHERE id = ?").get(taskId) as
+      | { project_id: string; assignee_id: string | null; title: string | null }
+      | undefined;
+    if (!row?.assignee_id) {
+      pendingFailoverByTask.delete(taskId);
+      return false;
+    }
+    // status로 재디스패치 세션 생성 여부를 판정하지 않는다. 재디스패치 세션이 생겼다가
+    // 즉시 실패하면(env_error 등) engine이 태스크를 다시 todo로 되돌리는데, 이때 status
+    // 가드로 막으면 이미 생성된 세션의 링크를 영영 backfill하지 못한다. 세션 존재 여부는
+    // 아래 newest 쿼리(원본 이후 생성된 toProvider 세션)가 단독으로 판정한다 — 없으면
+    // false를 반환하므로 생성 전 조기 backfill도 자연히 방지된다.
+    const newest = db.prepare(
+      `SELECT id FROM sessions
+       WHERE agent_id = ?
+         AND provider = ?
+         AND rowid > COALESCE((SELECT rowid FROM sessions WHERE id = ?), -1)
+       ORDER BY rowid ASC
+       LIMIT 1`,
+    ).get(row.assignee_id, pending.toProvider, pending.originalSessionId) as { id: string } | undefined;
+    if (!newest || newest.id === pending.originalSessionId) return false; // 재디스패치 세션 아직 미생성
+
+    const originalTrace = db.prepare(
+      `SELECT provider_failover_reason_code, provider_failover_user_message,
+              provider_failover_from_provider, provider_failover_to_provider,
+              provider_failover_redispatched
+       FROM sessions WHERE id = ?`,
+    ).get(pending.originalSessionId) as {
+      provider_failover_reason_code: string | null;
+      provider_failover_user_message: string | null;
+      provider_failover_from_provider: string | null;
+      provider_failover_to_provider: string | null;
+      provider_failover_redispatched: number;
+    } | undefined;
+
+    db.prepare(
+      `UPDATE tasks SET
+         provider_failover_redispatched_session_id = ?,
+         updated_at = datetime('now')
+       WHERE id = ?`,
+    )
+      .run(newest.id, taskId);
+    db.prepare(
+      `UPDATE sessions SET
+         provider_failover_original_session_id = COALESCE(provider_failover_original_session_id, ?),
+         provider_failover_redispatched_session_id = ?
+       WHERE id = ?`,
+    ).run(pending.originalSessionId, newest.id, pending.originalSessionId);
+    db.prepare(
+      `UPDATE sessions SET
+         provider_failover_reason_code = COALESCE(provider_failover_reason_code, ?),
+         provider_failover_user_message = COALESCE(provider_failover_user_message, ?),
+         provider_failover_from_provider = COALESCE(provider_failover_from_provider, ?),
+         provider_failover_to_provider = COALESCE(provider_failover_to_provider, ?),
+         provider_failover_redispatched =
+           CASE WHEN provider_failover_redispatched = 1 THEN 1 ELSE ? END,
+         provider_failover_original_session_id = ?,
+         provider_failover_redispatched_session_id = ?
+       WHERE id = ?`,
+    ).run(
+      originalTrace?.provider_failover_reason_code ?? null,
+      originalTrace?.provider_failover_user_message ?? null,
+      originalTrace?.provider_failover_from_provider ?? null,
+      originalTrace?.provider_failover_to_provider ?? null,
+      1,
+      pending.originalSessionId,
+      newest.id,
+      newest.id,
+    );
+    pendingFailoverByTask.delete(taskId);
+    const timer = pendingBackfillTimers.get(taskId);
+    if (timer) clearTimeout(timer);
+    pendingBackfillTimers.delete(taskId);
+    recordRedispatchActivity({
+      projectId: row.project_id,
+      taskId,
+      agentId: row.assignee_id,
+      taskTitle: row.title ?? "",
+      reasonCode: asFailoverReasonCode(originalTrace?.provider_failover_reason_code),
+      fromProvider: isAgentProvider(originalTrace?.provider_failover_from_provider)
+        ? originalTrace.provider_failover_from_provider
+        : null,
+      toProvider: pending.toProvider,
+      redispatched: true,
+      originalSessionId: pending.originalSessionId,
+      redispatchedSessionId: newest.id,
+      userMessage: `재디스패치 시작: ${labelProvider(pending.toProvider)} 실행 세션이 연결되었습니다 — "${(row.title ?? "").slice(0, 80)}"`,
+    });
+    return true;
+  }
+
+  function sweepPendingRedispatchBackfills(projectId: string): void {
+    const rows = db.prepare(
+      `SELECT id FROM tasks
+       WHERE project_id = ?
+         AND provider_failover_redispatched = 1
+         AND provider_failover_original_session_id IS NOT NULL
+         AND provider_failover_redispatched_session_id IS NULL`,
+    ).all(projectId) as { id: string }[];
+    for (const row of rows) {
+      if (backfillRedispatchSession(row.id)) {
+        broadcastTaskSnapshot(row.id);
+      }
+    }
+  }
+
   /** Execute a single task, handling completion and delegation. */
   async function executeOne(projectId: string, task: any): Promise<void> {
     const busy = getBusyAgents(projectId);
@@ -1226,6 +1839,7 @@ export function createScheduler(
     log.info(`Scheduler: executing "${task.title}" via agent ${task.assignee_id}`);
 
     try {
+      recordProviderResolved(task);
       const result = await engine.executeTask(task.id);
       broadcast("task:updated", { taskId: task.id, ...result });
 
@@ -1260,8 +1874,8 @@ export function createScheduler(
       // 방금 실패한 세션이 실제 돈 provider (sessions.provider) — 분류·failover 공용.
       // codex 세션의 "빈 stderr non-zero"를 claude 세션소진으로 오분류하지 않도록 provider를 넘긴다.
       const lastSess = db.prepare(
-        "SELECT provider FROM sessions WHERE agent_id = ? ORDER BY started_at DESC LIMIT 1",
-      ).get(task.assignee_id) as { provider: string | null } | undefined;
+        "SELECT id, provider FROM sessions WHERE agent_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
+      ).get(task.assignee_id) as { id: string; provider: string | null } | undefined;
       const currentProvider: AgentProvider = lastSess?.provider === "codex" ? "codex" : "claude";
 
       const failureClass = classifyAgentFailure(err, { provider: currentProvider });
@@ -1270,6 +1884,9 @@ export function createScheduler(
       if (failureClass === "rate_limit" || failureClass === "session_exhausted" || failureClass === "env_error") {
         const provCfg = loadProviderConfig();
         const tried = triedProvidersByTask.get(task.id) ?? new Set<AgentProvider>();
+        // 재시작으로 인메모리 Map이 비어도 왕복 재디스패치를 막으려면 DB에 남은
+        // failover 트레이스에서 이미 시도한 provider를 복원한다 (loop guard 내구성).
+        for (const p of readTriedProvidersFromDb(task.id)) tried.add(p);
         tried.add(currentProvider);
         triedProvidersByTask.set(task.id, tried);
         const codexAvailable = await getBackend("codex").isAvailable();
@@ -1281,17 +1898,55 @@ export function createScheduler(
           claudeAvailable: true,
           failoverEnabled: provCfg.codexFailover,
         });
+        recordProviderFailoverDecision(db, task.id, lastSess?.id, decision);
+        recordFailoverDecisionActivity(projectId, task, lastSess?.id ?? null, decision);
         if (decision.action === "failover") {
           tried.add(decision.toProvider);
           sessionManager.setProviderOverride(task.assignee_id, decision.toProvider);
+          // failover 관측성 기록 — 사유/전환 provider/원본(실패) 세션 id를 태스크와 원본 세션 양쪽에 남긴다.
+          // redispatched_session_id는 재실행이 새 세션을 만든 뒤 finally의 backfillRedispatchSession에서 채운다.
+          const originalSessionId = lastSess?.id ?? null;
           // 태스크를 todo로 되돌려 즉시 재픽 (retry 예산 미소모·쿨다운 없음)
           db.prepare(
-            "UPDATE tasks SET status = 'todo', updated_at = datetime('now') WHERE id = ?",
-          ).run(task.id);
-          broadcast("task:updated", { taskId: task.id, status: "todo" });
+            `UPDATE tasks SET
+               status = 'todo',
+               provider_failover_original_session_id = ?,
+               updated_at = datetime('now')
+             WHERE id = ?`,
+          ).run(originalSessionId, task.id);
+          if (originalSessionId) {
+            db.prepare(
+              `UPDATE sessions SET
+                 provider_failover_original_session_id = ?
+               WHERE id = ?`,
+            ).run(originalSessionId, originalSessionId);
+            pendingFailoverByTask.set(task.id, {
+              originalSessionId,
+              toProvider: decision.toProvider,
+            });
+          }
+          // 방금 기록한 failover trace가 담긴 완전한 task를 broadcast한다. 부분 페이로드
+          // ({taskId, status})만 보내면 dashboard store가 providerTrace.failover를 merge하지
+          // 못해 refetch 전까지 화면이 갱신되지 않는다.
+          const serialized = selectTaskForResponse(db, task.id);
+          broadcast(
+            "task:updated",
+            serialized ? serializeTask(serialized, provCfg.defaultProvider) : { taskId: task.id, status: "todo" },
+          );
+          recordRedispatchActivity({
+            projectId,
+            taskId: task.id,
+            agentId: task.assignee_id ?? null,
+            taskTitle: String(task.title ?? ""),
+            reasonCode: decision.reasonCode,
+            fromProvider: decision.fromProvider,
+            toProvider: decision.toProvider,
+            redispatched: true,
+            originalSessionId,
+            redispatchedSessionId: null,
+            userMessage: `재디스패치 예약: ${labelProvider(decision.toProvider)}로 다시 실행합니다 — "${String(task.title ?? "").slice(0, 80)}"`,
+          });
           log.warn(`Failover ${currentProvider}→${decision.toProvider} for task "${task.title}" (${failureClass})`);
-          busy.delete(task.assignee_id);
-          if (timers.has(projectId)) poll(projectId); // 즉시 재폴링 → 대체 백엔드로 실행
           return;
         }
       }
@@ -1341,6 +1996,10 @@ export function createScheduler(
         }
       }
     } finally {
+      // failover 재디스패치가 새 세션을 만들었으면 redispatched_session_id를 backfill (no-op if none pending)
+      if (backfillRedispatchSession(task.id)) {
+        broadcastTaskSnapshot(task.id);
+      }
       busy.delete(task.assignee_id);
       // Trigger next poll to fill the freed slot — cancel existing timer to avoid double-poll
       if (timers.has(projectId) && !getPauseState(projectId).paused) {
@@ -1353,6 +2012,8 @@ export function createScheduler(
 
   async function poll(projectId: string): Promise<void> {
     if (!timers.has(projectId)) return;
+
+    sweepPendingRedispatchBackfills(projectId);
 
     const state = getPauseState(projectId);
     if (state.paused) {
@@ -1457,7 +2118,12 @@ export function createScheduler(
 
     // Launch all picked tasks in parallel (fire-and-forget, each manages its own lifecycle)
     for (const task of tasks) {
+      const pendingFailover = getPendingFailover(task.id);
+      if (pendingFailover) {
+        sessionManager.setProviderOverride(task.assignee_id, pendingFailover.toProvider);
+      }
       executeOne(projectId, task); // intentionally not awaited
+      scheduleRedispatchBackfill(task.id);
     }
 
     // Schedule next poll to check for more tasks
@@ -1490,6 +2156,7 @@ export function createScheduler(
       // 리셋하면 이중 스폰 → 기존 세션 SIGTERM 살해 (processNextGoal 꼬리와 동일 함정)
       if (!busyAgents.has(projectId)) busyAgents.set(projectId, new Set());
       pauseState.delete(projectId);
+      sweepPendingRedispatchBackfills(projectId);
       timers.set(projectId, setTimeout(() => poll(projectId), 0));
     },
 

@@ -11,8 +11,38 @@ import type { AgentProvider } from "./adapters/backend.js";
 
 const VALID: AgentProvider[] = ["claude", "codex"];
 
+export type ProviderResolutionSource = "agent" | "project" | "global";
+
+export interface ProviderResolution {
+  provider: AgentProvider;
+  source: ProviderResolutionSource;
+}
+
 function coerce(v: unknown, fallback: AgentProvider): AgentProvider {
   return VALID.includes(v as AgentProvider) ? (v as AgentProvider) : fallback;
+}
+
+function isValidProvider(v: unknown): v is AgentProvider {
+  return VALID.includes(v as AgentProvider);
+}
+
+export function resolveProviderTrace(
+  agent: { provider?: string | null },
+  project: { default_provider?: string | null },
+  config: { defaultProvider?: string },
+): ProviderResolution {
+  const globalDefault = coerce(config.defaultProvider, "claude");
+  if (agent?.provider) {
+    return isValidProvider(agent.provider)
+      ? { provider: agent.provider, source: "agent" }
+      : { provider: globalDefault, source: "global" };
+  }
+  if (project?.default_provider) {
+    return isValidProvider(project.default_provider)
+      ? { provider: project.default_provider, source: "project" }
+      : { provider: globalDefault, source: "global" };
+  }
+  return { provider: globalDefault, source: "global" };
 }
 
 export function resolveProvider(
@@ -20,10 +50,7 @@ export function resolveProvider(
   project: { default_provider?: string | null },
   config: { defaultProvider?: string },
 ): AgentProvider {
-  const globalDefault = coerce(config.defaultProvider, "claude");
-  if (agent?.provider) return coerce(agent.provider, globalDefault);
-  if (project?.default_provider) return coerce(project.default_provider, globalDefault);
-  return globalDefault;
+  return resolveProviderTrace(agent, project, config).provider;
 }
 
 export interface ProviderConfig {

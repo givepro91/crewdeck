@@ -1,6 +1,8 @@
 import { Router } from "express";
 import type { AppContext } from "../../index.js";
 import { normalizeSeverity } from "../../utils/severity.js";
+import { loadProviderConfig } from "../../core/agent/provider.js";
+import { serializeTask, selectTaskForResponse } from "./tasks.js";
 
 export function createVerificationRoutes(ctx: AppContext): Router {
   const router = Router();
@@ -178,7 +180,8 @@ export function createVerificationRoutes(ctx: AppContext): Router {
       VALUES (?, ?, ?, ?, ?, 'todo')
     `).run(task.goal_id, task.project_id, title, description, task.assignee_id ?? null);
 
-    const newTask = db.prepare("SELECT * FROM tasks WHERE rowid = ?").get(result.lastInsertRowid) as any;
+    const inserted = db.prepare("SELECT id FROM tasks WHERE rowid = ?").get(result.lastInsertRowid) as { id: string };
+    const newTask = serializeTask(selectTaskForResponse(db, inserted.id)!, loadProviderConfig().defaultProvider);
 
     broadcast("task:updated", { ...newTask, action: "created" });
 

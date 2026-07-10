@@ -150,6 +150,20 @@ describe("classifyAgentFailure", () => {
     expect(classifyAgentFailure(err, { provider: "codex" })).toBe("rate_limit");
   });
 
+  it("rate limit 신호가 detail(stderr)에만 있어도 rate_limit — CLI_EXIT_NONZERO로 감싸진 429 회귀", () => {
+    // adapter가 429를 non-zero 종료 + stderr로 올리고 engine이 CLI_EXIT_NONZERO
+    // (message는 종료코드만, detail은 stderr)로 감싸는 실제 경로. message만 보면
+    // task_error로 새어 scheduler의 rate_limit failover/관측성 분기를 못 탄다.
+    const err = new AgentError({
+      code: "CLI_EXIT_NONZERO",
+      message: "Agent CLI exited with code 1",
+      detail: "HTTP 429 Too Many Requests: rate limit exceeded",
+    });
+    expect(classifyAgentFailure(err)).toBe("rate_limit");
+    expect(classifyAgentFailure(err, { provider: "codex" })).toBe("rate_limit");
+    expect(classifyAgentFailure(err, { provider: "claude" })).toBe("rate_limit");
+  });
+
   it("CLI exit non-zero인데 stderr에 내용이 있으면 → task_error", () => {
     const err = new AgentError({
       code: "CLI_EXIT_NONZERO",

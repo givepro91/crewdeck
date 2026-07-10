@@ -24,6 +24,38 @@ const STATUS_CHIP_CLASS: Record<string, string> = {
   blocked: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300",
 };
 
+type ProviderName = "claude" | "codex";
+type ProviderResolutionSource = "agent" | "project" | "global";
+
+// 서버 serializeTask가 붙여주는 provider 해석 + failover 관측 트레이스 (shared/types ProviderTrace).
+// 스토어 Task 타입엔 선언돼 있지 않으므로 옵셔널로 받고 런타임에 방어적으로 읽는다.
+interface ProviderFailoverTrace {
+  reasonCode: "rate_limit" | "session_exhausted" | "env_error" | null;
+  userMessage: string | null;
+  fromProvider: ProviderName | null;
+  toProvider: ProviderName | null;
+  redispatched: boolean;
+  loopGuardBlocked: boolean;
+  originalSessionId: string | null;
+  redispatchedSessionId: string | null;
+}
+
+interface ProviderTrace {
+  resolvedProvider: ProviderName | null;
+  resolutionSource: ProviderResolutionSource | null;
+  failover?: ProviderFailoverTrace;
+}
+
+const PROVIDER_SOURCE_LABEL_KEYS: Record<ProviderResolutionSource, string> = {
+  agent: "providerSourceAgent",
+  project: "providerSourceProject",
+  global: "providerSourceGlobal",
+};
+
+function providerEngineName(p: ProviderName | null): string {
+  return p === "claude" ? "Claude" : p === "codex" ? "Codex" : "—";
+}
+
 interface Task {
   id: string;
   title: string;
@@ -35,6 +67,7 @@ interface Task {
   target_files?: string | null; // JSON array string
   stack_hint?: string | null;
   result_summary?: string | null;
+  providerTrace?: ProviderTrace;
 }
 
 interface Agent {
@@ -303,7 +336,71 @@ export function TaskDetail({ task, agents, onClose, onUpdate }: TaskDetailProps)
                 ))}
               </select>
             </div>
+
+            {task.providerTrace?.resolvedProvider && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-gray-400">{t("providerTraceTitle")}:</span>
+                <span className="text-xs text-gray-700 dark:text-gray-300">
+                  {providerEngineName(task.providerTrace.resolvedProvider)}
+                </span>
+                {task.providerTrace.resolutionSource && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+                    {t(PROVIDER_SOURCE_LABEL_KEYS[task.providerTrace.resolutionSource])}
+                  </span>
+                )}
+              </div>
+            )}
           </div>
+
+          {/* Provider failover trace — 실행 엔진 자동 전환 관측 (사유·전/후 엔진·세션 링크) */}
+          {(() => {
+            const fo = task.providerTrace?.failover;
+            if (!fo || (!fo.redispatched && !fo.loopGuardBlocked && !fo.reasonCode)) return null;
+            const REASON_KEYS: Record<string, string> = {
+              rate_limit: "failoverReasonRateLimit",
+              session_exhausted: "failoverReasonSessionExhausted",
+              env_error: "failoverReasonEnvError",
+            };
+            return (
+              <div className="border border-orange-100 dark:border-orange-900/40 bg-orange-50/50 dark:bg-orange-900/10 rounded-lg p-3">
+                <h4 className="text-[10px] uppercase tracking-wider text-orange-700 dark:text-orange-400 font-semibold mb-2">
+                  {t("failoverTraceTitle")}
+                </h4>
+                <div className="flex flex-wrap items-center gap-2 mb-2">
+                  <span className="text-xs font-medium text-gray-700 dark:text-gray-300">
+                    {providerEngineName(fo.fromProvider)} → {providerEngineName(fo.toProvider)}
+                  </span>
+                  {fo.reasonCode && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300">
+                      {t(REASON_KEYS[fo.reasonCode] ?? fo.reasonCode)}
+                    </span>
+                  )}
+                  {fo.loopGuardBlocked && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+                      {t("failoverLoopGuardBlocked")}
+                    </span>
+                  )}
+                </div>
+                {fo.userMessage && (
+                  <p className="text-xs text-gray-600 dark:text-gray-400 mb-2 leading-relaxed">{fo.userMessage}</p>
+                )}
+                <dl className="space-y-1.5">
+                  <div>
+                    <dt className="text-[10px] text-gray-500 dark:text-gray-400 mb-0.5">{t("failoverOriginalSession")}</dt>
+                    <dd className="text-[10px] font-mono text-gray-700 dark:text-gray-300 break-all">
+                      {fo.originalSessionId ?? "—"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-[10px] text-gray-500 dark:text-gray-400 mb-0.5">{t("failoverRedispatchedSession")}</dt>
+                    <dd className="text-[10px] font-mono text-gray-700 dark:text-gray-300 break-all">
+                      {fo.redispatchedSessionId ?? "—"}
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+            );
+          })()}
 
           {/* Approval Gate — pending_approval 상태일 때만 표시 */}
           {task.status === "pending_approval" && (

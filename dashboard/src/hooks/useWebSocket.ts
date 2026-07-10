@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useStore } from "../stores/useStore";
 import { useToast } from "../stores/useToast";
+import { useActivityStore } from "../stores/activityStore";
 import { getApiKey } from "../lib/api";
 
 /** Send a message through the active WebSocket connection. */
@@ -65,6 +66,15 @@ export function useWebSocket() {
             case "task:updated":
               useStore.getState().updateTask(msg.payload);
               window.dispatchEvent(new CustomEvent("crewdeck:task-updated-event", { detail: msg.payload }));
+              break;
+            case "activity:created":
+            case "provider:resolved":
+            case "provider:failover":
+            case "provider:redispatched":
+              // 실행 엔진 해석·자동 전환·재디스패치 관측 이벤트를 활동 피드에 즉시 반영.
+              // activity:created(범용 recordActivity 싱크)와 provider:*(typed)를 모두 넘기되,
+              // 중복은 activityStore에서 걸러진다(provider:*가 provider 항목을 소유).
+              useActivityStore.getState().ingestWsEvent(msg.type, msg.payload);
               break;
             case "team_design:status":
               window.dispatchEvent(new CustomEvent("crewdeck:team-design-status", { detail: msg.payload }));

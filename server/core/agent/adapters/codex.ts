@@ -151,9 +151,10 @@ export function createCodexAdapter(): AgentBackend {
             session.status = code === 0 ? "completed" : "failed";
             session.emit("status", session.status);
 
-            // rate-limit은 즉시 surface (내부 대기 없음 — failover가 scheduler에서 처리)
+            // rate-limit은 즉시 surface (내부 대기 없음 — failover가 scheduler에서 처리).
+            // failover 관측성: 트리거가 어느 백엔드(codex)에서 났는지 페이로드에 태깅한다.
             if (code !== 0 && isCodexRateLimit(stderr)) {
-              session.emit("rate-limit", { stderr: stderr.slice(0, 200) });
+              session.emit("rate-limit", { stderr: stderr.slice(0, 200), provider: "codex" });
             }
 
             if (code === 0) {

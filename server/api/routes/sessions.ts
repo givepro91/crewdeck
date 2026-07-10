@@ -1,8 +1,98 @@
 import { Router } from "express";
 import type { AppContext } from "../../index.js";
+import { loadProviderConfig } from "../../core/agent/provider.js";
 import { createLogger } from "../../utils/logger.js";
+import type {
+  AgentProvider,
+  ProviderFailoverReasonCode,
+  ProviderResolutionSource,
+  ProviderTrace,
+} from "../../../shared/types.js";
 
 const log = createLogger("sessions-api");
+const PROVIDERS: AgentProvider[] = ["claude", "codex"];
+const RESOLUTION_SOURCES: ProviderResolutionSource[] = ["agent", "project", "global"];
+const FAILOVER_REASONS: ProviderFailoverReasonCode[] = ["rate_limit", "session_exhausted", "env_error"];
+
+function isProvider(value: unknown): value is AgentProvider {
+  return typeof value === "string" && PROVIDERS.includes(value as AgentProvider);
+}
+
+function asProvider(value: unknown, fallback: AgentProvider): AgentProvider {
+  return isProvider(value) ? value : fallback;
+}
+
+function asResolutionSource(value: unknown): ProviderResolutionSource | null {
+  return typeof value === "string" && RESOLUTION_SOURCES.includes(value as ProviderResolutionSource)
+    ? value as ProviderResolutionSource
+    : null;
+}
+
+function asFailoverReason(value: unknown): ProviderFailoverReasonCode | null {
+  return typeof value === "string" && FAILOVER_REASONS.includes(value as ProviderFailoverReasonCode)
+    ? value as ProviderFailoverReasonCode
+    : null;
+}
+
+function asNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function asBooleanFlag(value: unknown): boolean {
+  return value === true || value === 1;
+}
+
+function buildProviderTrace(row: Record<string, unknown>, globalDefault: AgentProvider): ProviderTrace {
+  const resolutionSource = asResolutionSource(row.provider_trace_resolution_source)
+    ?? (isProvider(row.agent_provider) ? "agent" : isProvider(row.project_default_provider) ? "project" : "global");
+  const inheritedProvider = resolutionSource === "agent"
+    ? row.agent_provider
+    : resolutionSource === "project"
+      ? row.project_default_provider
+      : globalDefault;
+  const resolvedProvider = asProvider(
+    row.provider_trace_resolved_provider ?? row.provider,
+    asProvider(inheritedProvider, globalDefault),
+  );
+
+  return {
+    resolvedProvider,
+    resolutionSource,
+    failover: {
+      reasonCode: asFailoverReason(row.provider_failover_reason_code),
+      userMessage: asNullableString(row.provider_failover_user_message),
+      fromProvider: isProvider(row.provider_failover_from_provider) ? row.provider_failover_from_provider : null,
+      toProvider: isProvider(row.provider_failover_to_provider) ? row.provider_failover_to_provider : null,
+      redispatched: asBooleanFlag(row.provider_failover_redispatched),
+      loopGuardBlocked: asBooleanFlag(row.provider_failover_loop_guard_blocked),
+      originalSessionId: asNullableString(row.provider_failover_original_session_id),
+      redispatchedSessionId: asNullableString(row.provider_failover_redispatched_session_id),
+    },
+  };
+}
+
+function serializeSession(row: Record<string, unknown>, globalDefault: AgentProvider): Record<string, unknown> {
+  const {
+    agent_provider: _agentProvider,
+    project_default_provider: _projectDefaultProvider,
+    provider_trace_resolved_provider: _providerTraceResolvedProvider,
+    provider_trace_resolution_source: _providerTraceResolutionSource,
+    provider_failover_reason_code: _providerFailoverReasonCode,
+    provider_failover_user_message: _providerFailoverUserMessage,
+    provider_failover_from_provider: _providerFailoverFromProvider,
+    provider_failover_to_provider: _providerFailoverToProvider,
+    provider_failover_redispatched: _providerFailoverRedispatched,
+    provider_failover_loop_guard_blocked: _providerFailoverLoopGuardBlocked,
+    provider_failover_original_session_id: _providerFailoverOriginalSessionId,
+    provider_failover_redispatched_session_id: _providerFailoverRedispatchedSessionId,
+    ...session
+  } = row;
+
+  return {
+    ...session,
+    providerTrace: buildProviderTrace(row, globalDefault),
+  };
+}
 
 export function createSessionRoutes(ctx: AppContext): Router {
   const router = Router();
@@ -25,12 +115,18 @@ export function createSessionRoutes(ctx: AppContext): Router {
       params.push(projectId);
     }
 
-    const sessions = db.prepare(`
+    const globalDefault = loadProviderConfig().defaultProvider;
+    const rows = db.prepare(`
       SELECT s.id, s.agent_id, s.pid, s.started_at, s.ended_at, s.status,
-             s.token_usage, s.cost_usd,
+             s.token_usage, s.cost_usd, s.provider,
+             s.provider_trace_resolved_provider, s.provider_trace_resolution_source,
+             s.provider_failover_reason_code, s.provider_failover_user_message,
+             s.provider_failover_from_provider, s.provider_failover_to_provider,
+             s.provider_failover_redispatched, s.provider_failover_loop_guard_blocked,
+             s.provider_failover_original_session_id, s.provider_failover_redispatched_session_id,
              a.name AS agent_name, a.role AS agent_role, a.status AS agent_status,
-             a.current_activity, a.current_task_id,
-             p.id AS project_id, p.name AS project_name
+             a.current_activity, a.current_task_id, a.provider AS agent_provider,
+             p.id AS project_id, p.name AS project_name, p.default_provider AS project_default_provider
       FROM sessions s
       JOIN agents a ON s.agent_id = a.id
       JOIN projects p ON a.project_id = p.id
@@ -39,7 +135,7 @@ export function createSessionRoutes(ctx: AppContext): Router {
       LIMIT 200
     `).all(...params);
 
-    res.json(sessions);
+    res.json(rows.map((row) => serializeSession(row as Record<string, unknown>, globalDefault)));
   });
 
   // Get session stats summary (optionally scoped to a project)

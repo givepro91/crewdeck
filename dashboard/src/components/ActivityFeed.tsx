@@ -1,14 +1,7 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
-
-interface Activity {
-  id: number;
-  type: string;
-  message: string;
-  agent_id: string | null;
-  created_at: string;
-}
+import { getProviderActivityDetails, useActivityStore } from "../stores/activityStore";
+import { REASON_LABEL_KEYS, providerEngineName } from "../lib/providerActivity";
 
 interface ActivityFeedProps {
   projectId: string;
@@ -95,59 +88,38 @@ function formatWsMessage(
 
 export function ActivityFeed({ projectId }: ActivityFeedProps) {
   const { t } = useTranslation();
-  const [activities, setActivities] = useState<Activity[]>([]);
-  const [loading, setLoading] = useState(true);
+  // 활동 피드는 공유 activityStore를 단일 출처로 사용한다. provider 관측 이벤트
+  // (activity:created·provider:*)는 useWebSocket이 직접 store에 ingest하므로
+  // 여기서는 초기 로드와 그 외 실시간 이벤트만 store에 반영한다.
+  const activities = useActivityStore((s) => s.activities);
+  const loading = useActivityStore((s) => s.loading);
 
-  const wsIdRef = useRef(0);
-  const buildWsActivity = useCallback(
-    (detail: { type: string; payload?: unknown }): Activity => ({
-      id: -(++wsIdRef.current),
-      type: detail.type,
-      message: formatWsMessage(detail.type, detail.payload, t),
-      agent_id: (detail.payload as Record<string, string> | null)?.agent_id ?? null,
-      created_at: new Date().toISOString(),
-    }),
-    [t],
-  );
-
-  // Initial load from REST API
+  // Initial load from REST API via the shared store
   useEffect(() => {
     if (!projectId) return;
-    setLoading(true);
-    api.activities
-      .list(projectId)
-      .then((data) => {
-        setActivities(data);
-      })
-      .catch(() => {
-        setActivities([]);
-      })
-      .finally(() => {
-        setLoading(false);
-      });
+    useActivityStore.getState().loadActivities(projectId);
   }, [projectId]);
 
-  // Prepend real-time WebSocket events
+  // Prepend real-time WebSocket events into the shared store.
+  // id는 store가 부여(중복 없는 음수) — 이벤트 payload에 id를 싣지 않는다.
   useEffect(() => {
+    const prepend = (type: string, payload: unknown) => {
+      useActivityStore.getState().prependActivity({
+        type,
+        message: formatWsMessage(type, payload, t),
+        agent_id: (payload as Record<string, string> | null)?.agent_id ?? null,
+        created_at: new Date().toISOString(),
+        projectId,
+      });
+    };
+
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       if (!detail?.type) return;
-      setActivities((prev) => [buildWsActivity(detail), ...prev].slice(0, 50));
+      prepend(detail.type, detail.payload);
     };
-
-    const errorHandler = (e: Event) => {
-      const payload = (e as CustomEvent).detail;
-      setActivities((prev) =>
-        [buildWsActivity({ type: "system:error", payload }), ...prev].slice(0, 50),
-      );
-    };
-
-    const gitHandler = (e: Event) => {
-      const payload = (e as CustomEvent).detail;
-      setActivities((prev) =>
-        [buildWsActivity({ type: "task:git", payload }), ...prev].slice(0, 50),
-      );
-    };
+    const errorHandler = (e: Event) => prepend("system:error", (e as CustomEvent).detail);
+    const gitHandler = (e: Event) => prepend("task:git", (e as CustomEvent).detail);
 
     window.addEventListener("crewdeck:refresh", handler);
     window.addEventListener("crewdeck:system-error", errorHandler);
@@ -157,7 +129,7 @@ export function ActivityFeed({ projectId }: ActivityFeedProps) {
       window.removeEventListener("crewdeck:system-error", errorHandler);
       window.removeEventListener("crewdeck:task-git", gitHandler);
     };
-  }, [buildWsActivity]);
+  }, [t, projectId]);
 
   if (loading) {
     return <p className="text-xs text-gray-400 italic">{t("loadingActivity")}</p>;
@@ -173,21 +145,45 @@ export function ActivityFeed({ projectId }: ActivityFeedProps) {
 
   return (
     <div className="space-y-1.5 px-3 py-2">
-      {activities.map((a) => (
-        <div key={a.id} className="flex items-start gap-2 text-xs">
-          <span className={`shrink-0 w-4 text-center ${a.type === "system:error" ? "text-red-500" : ""}`}>
-            {TYPE_ICONS[a.type] ?? "•"}
-          </span>
-          <div className="min-w-0 flex-1">
-            <span className={`break-words ${a.type === "system:error" ? "text-red-600 dark:text-red-400" : "text-gray-700 dark:text-gray-300"}`}>
-              {humanizeMessage(a.message)}
+      {activities.map((a) => {
+        const providerDetails = getProviderActivityDetails(a);
+        const isProviderTransition =
+          providerDetails?.event === "provider:failover" || providerDetails?.event === "provider:redispatched";
+        return (
+          <div key={a.id} className="flex items-start gap-2 text-xs">
+            <span className={`shrink-0 w-4 text-center ${a.type === "system:error" ? "text-red-500" : ""}`}>
+              {TYPE_ICONS[a.type] ?? "•"}
+            </span>
+            <div className="min-w-0 flex-1 space-y-1">
+              {providerDetails && isProviderTransition && (
+                <div className="flex flex-wrap items-center gap-1">
+                  {(providerDetails.fromProvider || providerDetails.toProvider) && (
+                    <span className="rounded-full bg-orange-100 px-1.5 py-0.5 text-[10px] font-medium text-orange-700 dark:bg-orange-900/40 dark:text-orange-300">
+                      {providerEngineName(providerDetails.fromProvider)} → {providerEngineName(providerDetails.toProvider)}
+                    </span>
+                  )}
+                  {providerDetails.reasonCode && (
+                    <span className="rounded-full bg-orange-100 px-1.5 py-0.5 text-[10px] font-medium text-orange-700 dark:bg-orange-900/40 dark:text-orange-300">
+                      {t(REASON_LABEL_KEYS[providerDetails.reasonCode])} · reasonCode={providerDetails.reasonCode}
+                    </span>
+                  )}
+                  {providerDetails.loopGuardBlocked && (
+                    <span className="rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+                      {t("failoverLoopGuardBlocked")}
+                    </span>
+                  )}
+                </div>
+              )}
+              <span className={`break-words ${a.type === "system:error" ? "text-red-600 dark:text-red-400" : "text-gray-700 dark:text-gray-300"}`}>
+                {humanizeMessage(a.message)}
+              </span>
+            </div>
+            <span className="shrink-0 text-gray-300 dark:text-gray-600 tabular-nums">
+              {formatTime(a.created_at)}
             </span>
           </div>
-          <span className="shrink-0 text-gray-300 dark:text-gray-600 tabular-nums">
-            {formatTime(a.created_at)}
-          </span>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

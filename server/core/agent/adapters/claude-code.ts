@@ -331,7 +331,9 @@ export function createClaudeCodeAdapter() {
         if (result.exitCode !== 0 && isRateLimitError(result.stderr)) {
           const waitMs = RATE_LIMIT_WAIT_MS;
           const agentError = makeRateLimitError(result.stderr.slice(0, 200));
-          session.emit("rate-limit", { waitMs, stderr: result.stderr.slice(0, 200) });
+          // failover 관측성: rate-limit은 failover의 트리거다. 어느 백엔드가 한도에 걸렸는지
+          // 페이로드에 태깅해 다운스트림이 전환 사유를 provider별로 귀속할 수 있게 한다.
+          session.emit("rate-limit", { waitMs, stderr: result.stderr.slice(0, 200), provider: "claude" });
           session.emit("crewdeck:error", agentError.toJSON());
           // failover 활성 시 내부 대기 없이 즉시 surface → scheduler가 대체 백엔드(Codex)로 전환.
           // (Claude 재개를 기다리지 않는다 — 사용자 요구: 한도 걸리면 기다리지 말고 Codex로.)

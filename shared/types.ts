@@ -76,6 +76,81 @@ export interface AgentConfig {
   sessionBehavior: "resume-or-new" | "new";
 }
 
+export type AgentProvider = "claude" | "codex";
+export type ProviderResolutionSource = "agent" | "project" | "global";
+export type ProviderFailoverReasonCode = "rate_limit" | "session_exhausted" | "env_error";
+
+export interface ProviderFailoverTrace {
+  reasonCode: ProviderFailoverReasonCode | null;
+  userMessage: string | null;
+  fromProvider: AgentProvider | null;
+  toProvider: AgentProvider | null;
+  redispatched: boolean;
+  loopGuardBlocked: boolean;
+  originalSessionId: string | null;
+  redispatchedSessionId: string | null;
+}
+
+export interface ProviderTrace {
+  resolvedProvider: AgentProvider;
+  resolutionSource: ProviderResolutionSource;
+  failover: ProviderFailoverTrace;
+}
+
+export type ProviderActivityResolutionSource = ProviderResolutionSource | "failover";
+
+export interface ProviderResolvedEventPayload {
+  projectId: string;
+  taskId: string;
+  agentId: string | null;
+  taskTitle: string;
+  resolvedProvider: AgentProvider;
+  resolutionSource: ProviderResolutionSource;
+  failoverOverride: boolean;
+  userMessage: string;
+}
+
+export interface ProviderFailoverEventPayload {
+  projectId: string;
+  taskId: string;
+  agentId: string | null;
+  taskTitle: string;
+  sessionId: string | null;
+  reasonCode: ProviderFailoverReasonCode;
+  userMessage: string;
+  fromProvider: AgentProvider;
+  toProvider: AgentProvider;
+  redispatched: boolean;
+  loopGuardBlocked: boolean;
+}
+
+export interface ProviderRedispatchEventPayload {
+  projectId: string;
+  taskId: string;
+  agentId: string | null;
+  taskTitle: string;
+  reasonCode: ProviderFailoverReasonCode | null;
+  fromProvider: AgentProvider | null;
+  toProvider: AgentProvider;
+  redispatched: boolean;
+  originalSessionId: string | null;
+  redispatchedSessionId: string | null;
+  userMessage: string;
+}
+
+export interface ActivityLogEntry {
+  id: number;
+  project_id: string;
+  projectId: string;
+  agent_id: string | null;
+  agentId: string | null;
+  type: string;
+  message: string;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+  createdAt: string;
+}
+
 // ─── Goal & Task ───────────────────────────────────────
 
 export type Priority = "critical" | "high" | "medium" | "low";
@@ -119,6 +194,7 @@ export interface Task {
   taskType: TaskType;
   /** DAG 의존성 — 이 태스크 시작 전 완료되어야 하는 task ID 배열. 빈 배열이면 제약 없음. */
   dependsOn: string[];
+  providerTrace: ProviderTrace;
   createdAt: string;
   updatedAt: string;
 }
@@ -209,6 +285,10 @@ export type WSEventType =
   | "queue:stopped"
   | "system:rate-limit"
   | "system:error"
+  | "activity:created"
+  | "provider:resolved"
+  | "provider:failover"
+  | "provider:redispatched"
   | "autopilot:mode-changed"
   | "autopilot:full-completed";
 

@@ -69,6 +69,16 @@ export function migrate(db: Database.Database): void {
       priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('critical', 'high', 'medium', 'low')),
       sort_order INTEGER NOT NULL DEFAULT 0,
       verification_id TEXT,
+      provider_trace_resolved_provider TEXT,
+      provider_trace_resolution_source TEXT,
+      provider_failover_reason_code TEXT,
+      provider_failover_user_message TEXT,
+      provider_failover_from_provider TEXT,
+      provider_failover_to_provider TEXT,
+      provider_failover_redispatched INTEGER NOT NULL DEFAULT 0,
+      provider_failover_loop_guard_blocked INTEGER NOT NULL DEFAULT 0,
+      provider_failover_original_session_id TEXT,
+      provider_failover_redispatched_session_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -94,6 +104,17 @@ export function migrate(db: Database.Database): void {
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       ended_at TEXT,
       status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'failed', 'killed')),
+      provider TEXT,
+      provider_trace_resolved_provider TEXT,
+      provider_trace_resolution_source TEXT,
+      provider_failover_reason_code TEXT,
+      provider_failover_user_message TEXT,
+      provider_failover_from_provider TEXT,
+      provider_failover_to_provider TEXT,
+      provider_failover_redispatched INTEGER NOT NULL DEFAULT 0,
+      provider_failover_loop_guard_blocked INTEGER NOT NULL DEFAULT 0,
+      provider_failover_original_session_id TEXT,
+      provider_failover_redispatched_session_id TEXT,
       token_usage INTEGER DEFAULT 0,
       cost_usd REAL DEFAULT 0,
       last_output TEXT      -- Last output snippet for display
@@ -386,6 +407,23 @@ export function migrate(db: Database.Database): void {
   if (!sessionColsProv.some((c) => c.name === "provider")) {
     db.exec("ALTER TABLE sessions ADD COLUMN provider TEXT");
   }
+  const sessionProviderTraceColumns = [
+    ["provider_trace_resolved_provider", "ALTER TABLE sessions ADD COLUMN provider_trace_resolved_provider TEXT"],
+    ["provider_trace_resolution_source", "ALTER TABLE sessions ADD COLUMN provider_trace_resolution_source TEXT"],
+    ["provider_failover_reason_code", "ALTER TABLE sessions ADD COLUMN provider_failover_reason_code TEXT"],
+    ["provider_failover_user_message", "ALTER TABLE sessions ADD COLUMN provider_failover_user_message TEXT"],
+    ["provider_failover_from_provider", "ALTER TABLE sessions ADD COLUMN provider_failover_from_provider TEXT"],
+    ["provider_failover_to_provider", "ALTER TABLE sessions ADD COLUMN provider_failover_to_provider TEXT"],
+    ["provider_failover_redispatched", "ALTER TABLE sessions ADD COLUMN provider_failover_redispatched INTEGER NOT NULL DEFAULT 0"],
+    ["provider_failover_loop_guard_blocked", "ALTER TABLE sessions ADD COLUMN provider_failover_loop_guard_blocked INTEGER NOT NULL DEFAULT 0"],
+    ["provider_failover_original_session_id", "ALTER TABLE sessions ADD COLUMN provider_failover_original_session_id TEXT"],
+    ["provider_failover_redispatched_session_id", "ALTER TABLE sessions ADD COLUMN provider_failover_redispatched_session_id TEXT"],
+  ];
+  for (const [name, sql] of sessionProviderTraceColumns) {
+    if (!sessionColsProv.some((c) => c.name === name)) {
+      db.exec(sql);
+    }
+  }
 
   // target_files + stack_hint on tasks — scope anchoring (Pulsar scope-drift fix)
   // When set, the Generator prompt includes "Primary target: <paths>" and
@@ -411,6 +449,25 @@ export function migrate(db: Database.Database): void {
   // 기존 태스크는 '[]'이므로 동작 변화 없음
   if (!taskColsLate.some((c) => c.name === "depends_on")) {
     db.exec("ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'");
+  }
+
+  // Provider trace on tasks — API contract for resolved backend + failover observability.
+  const taskProviderTraceColumns = [
+    ["provider_trace_resolved_provider", "ALTER TABLE tasks ADD COLUMN provider_trace_resolved_provider TEXT"],
+    ["provider_trace_resolution_source", "ALTER TABLE tasks ADD COLUMN provider_trace_resolution_source TEXT"],
+    ["provider_failover_reason_code", "ALTER TABLE tasks ADD COLUMN provider_failover_reason_code TEXT"],
+    ["provider_failover_user_message", "ALTER TABLE tasks ADD COLUMN provider_failover_user_message TEXT"],
+    ["provider_failover_from_provider", "ALTER TABLE tasks ADD COLUMN provider_failover_from_provider TEXT"],
+    ["provider_failover_to_provider", "ALTER TABLE tasks ADD COLUMN provider_failover_to_provider TEXT"],
+    ["provider_failover_redispatched", "ALTER TABLE tasks ADD COLUMN provider_failover_redispatched INTEGER NOT NULL DEFAULT 0"],
+    ["provider_failover_loop_guard_blocked", "ALTER TABLE tasks ADD COLUMN provider_failover_loop_guard_blocked INTEGER NOT NULL DEFAULT 0"],
+    ["provider_failover_original_session_id", "ALTER TABLE tasks ADD COLUMN provider_failover_original_session_id TEXT"],
+    ["provider_failover_redispatched_session_id", "ALTER TABLE tasks ADD COLUMN provider_failover_redispatched_session_id TEXT"],
+  ];
+  for (const [name, sql] of taskProviderTraceColumns) {
+    if (!taskColsLate.some((c) => c.name === name)) {
+      db.exec(sql);
+    }
   }
 
   // Goal-as-Unit: acceptance_script on tasks — Task 수준 acceptance gate

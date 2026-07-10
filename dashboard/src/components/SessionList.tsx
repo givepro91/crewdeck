@@ -3,6 +3,40 @@ import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { ConfirmDialog } from "./ConfirmDialog";
 
+type ProviderName = "claude" | "codex";
+type ProviderResolutionSource = "agent" | "project" | "global";
+
+// 서버 serializeSession이 붙여주는 provider 해석 + failover 관측 트레이스 (shared/types ProviderTrace).
+interface ProviderFailoverTrace {
+  reasonCode: "rate_limit" | "session_exhausted" | "env_error" | null;
+  fromProvider: ProviderName | null;
+  toProvider: ProviderName | null;
+  redispatched: boolean;
+  loopGuardBlocked: boolean;
+}
+
+interface ProviderTrace {
+  resolvedProvider: ProviderName | null;
+  resolutionSource: ProviderResolutionSource | null;
+  failover?: ProviderFailoverTrace;
+}
+
+const PROVIDER_SOURCE_LABEL_KEYS: Record<ProviderResolutionSource, string> = {
+  agent: "providerSourceAgent",
+  project: "providerSourceProject",
+  global: "providerSourceGlobal",
+};
+
+const FAILOVER_REASON_LABEL_KEYS: Record<string, string> = {
+  rate_limit: "failoverReasonRateLimit",
+  session_exhausted: "failoverReasonSessionExhausted",
+  env_error: "failoverReasonEnvError",
+};
+
+function providerEngineName(p: ProviderName | null): string {
+  return p === "claude" ? "Claude" : p === "codex" ? "Codex" : "—";
+}
+
 interface Session {
   id: string;
   agent_id: string;
@@ -18,6 +52,7 @@ interface Session {
   current_activity: string | null;
   project_id: string;
   project_name: string;
+  providerTrace?: ProviderTrace;
 }
 
 interface Stats {
@@ -197,6 +232,7 @@ export function SessionList({ projectId }: { projectId?: string }) {
                 <th className="py-2 pr-3 font-medium">{t("sessionColAgent")}</th>
                 {!projectId && <th className="py-2 pr-3 font-medium">{t("sessionColProject")}</th>}
                 <th className="py-2 pr-3 font-medium">{t("sessionColStatus")}</th>
+                <th className="py-2 pr-3 font-medium">{t("providerTraceTitle")}</th>
                 <th className="py-2 pr-3 font-medium">{t("sessionColStarted")}</th>
                 <th className="py-2 pr-3 font-medium">{t("sessionColDuration")}</th>
                 <th className="py-2 pr-3 font-medium">{t("sessionColTokens")}</th>
@@ -223,6 +259,47 @@ export function SessionList({ projectId }: { projectId?: string }) {
                     <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${STATUS_BADGE[s.status] ?? STATUS_BADGE.killed}`}>
                       {s.status}
                     </span>
+                  </td>
+                  <td className="py-2 pr-3">
+                    {s.providerTrace?.resolvedProvider ? (
+                      <div className="flex flex-col gap-0.5">
+                        <div className="flex items-center gap-1 flex-wrap">
+                          <span className="text-gray-600 dark:text-gray-300">
+                            {providerEngineName(s.providerTrace.resolvedProvider)}
+                          </span>
+                          {s.providerTrace.resolutionSource && (
+                            <span className="text-[9px] px-1 py-0.5 rounded-full bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400">
+                              {t(PROVIDER_SOURCE_LABEL_KEYS[s.providerTrace.resolutionSource])}
+                            </span>
+                          )}
+                        </div>
+                        {(() => {
+                          const fo = s.providerTrace?.failover;
+                          if (!fo || (!fo.redispatched && !fo.loopGuardBlocked && !fo.reasonCode)) return null;
+                          return (
+                            <div className="flex items-center gap-1 flex-wrap">
+                              {fo.redispatched && (
+                                <span className="text-[9px] px-1 py-0.5 rounded-full bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300">
+                                  {providerEngineName(fo.fromProvider)} → {providerEngineName(fo.toProvider)}
+                                </span>
+                              )}
+                              {fo.reasonCode && (
+                                <span className="text-[9px] px-1 py-0.5 rounded-full bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300">
+                                  {t(FAILOVER_REASON_LABEL_KEYS[fo.reasonCode] ?? fo.reasonCode)}
+                                </span>
+                              )}
+                              {fo.loopGuardBlocked && (
+                                <span className="text-[9px] px-1 py-0.5 rounded-full bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300">
+                                  {t("failoverLoopGuardBlocked")}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })()}
+                      </div>
+                    ) : (
+                      <span className="text-gray-300 dark:text-gray-600">—</span>
+                    )}
                   </td>
                   <td className="py-2 pr-3 text-gray-500 dark:text-gray-400">
                     {formatTime(s.started_at)}
