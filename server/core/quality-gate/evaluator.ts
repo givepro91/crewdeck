@@ -850,14 +850,19 @@ All three were marked "100% complete" at task time. Do not repeat.\n`
   let scopeAnchorSection = "";
   if (targetFiles.length > 0 || stackHint) {
     const targetBlock = targetFiles.length > 0
-      ? `**Expected target files** (the task says these should be modified):
+      ? `**Expected target files** (a *best-effort guess* made by the planner
+BEFORE implementation — NOT a contract):
 ${targetFiles.map((f) => `- \`${f}\``).join("\n")}
 
-**REQUIRED CHECK**: cross-reference this list with the Git Diff above. If
-ANY expected file is missing from the diff, OR if the diff contains files in
-a completely different tree (e.g., expected \`web/src/app/page.tsx\` but
-diff shows \`dashboard/app.js\`), return \`fail\` with a clear
-"scope mismatch" issue message.`
+**SCOPE CHECK**: these paths were guessed up front, so the real architecture
+may legitimately place the same logic elsewhere (e.g. the planner guessed
+\`server/x/parser.ts\` but the code correctly lives in
+\`server/x/adapters/parser.ts\`). A **different path for the same
+functionality is CORRECT** — do NOT fail on path drift alone, and do NOT
+fail just because an expected file is absent from the diff. Only return
+\`fail\` with a "scope mismatch" issue if the diff implements a
+**completely different feature or wrong stack** than the task asked for
+(e.g. task wants a stream parser but the diff only touches unrelated UI).`
       : "";
     const stackBlock = stackHint
       ? `**Stack constraint**: ${stackHint}

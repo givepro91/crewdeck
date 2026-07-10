@@ -752,11 +752,13 @@ export function createOrchestrationEngine(
         const scopeAnchor = targetFiles.length > 0 || stackHint
           ? `
 ## Primary Target — Stay Within Scope
-${targetFiles.length > 0 ? `**Modify ONLY these files** (create them if they don't exist yet):
+${targetFiles.length > 0 ? `**Expected files** (a planning-time *guess* — follow the real architecture if it differs):
 ${targetFiles.map((f) => `- \`${f}\``).join("\n")}
 
-If you find yourself about to create a file outside this list, STOP and ask:
-"Does the task really require a new file elsewhere, or am I drifting?"` : ""}
+If the real structure places this logic elsewhere (e.g. an \`adapters/\`
+subdir, a different but equivalent module), use the CORRECT path — do NOT
+create a wrong-place file just to match this list. Only avoid drifting into
+*unrelated* features.` : ""}
 ${stackHint ? `\n**Stack constraint:** ${stackHint}
 
 Match the conventions of the nearest existing code in the same stack. Do NOT
@@ -1386,9 +1388,11 @@ Rules:
   - "review": QA execution / smoke test / integration test (execution-based pass/fail only)
 
 ## Required fields per task
-- \`target_files\`: array of file paths this task will touch (e.g.
-  \`["web/src/app/page.tsx"]\`). Use the project stack above. Empty \`[]\`
-  only if you genuinely cannot guess. Evaluator rejects diff/scope drift.
+- \`target_files\`: best-effort guess of file paths this task will touch (e.g.
+  \`["web/src/app/page.tsx"]\`). Use the project stack above. Prefer paths of
+  files that ALREADY exist. Empty \`[]\` if you cannot guess confidently — a
+  wrong guess is worse than none, since it misleads the implementer and the
+  Evaluator treats a different-but-correct path as fine, not a failure.
 - \`stack_hint\`: short framework constraint (e.g. "Next.js 16 App Router",
   "FastAPI router"). Empty string if none. Prevents wrong-stack impls.
 - \`type\`: one of "code" | "content" | "config" | "review". Default "code".
