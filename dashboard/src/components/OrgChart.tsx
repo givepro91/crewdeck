@@ -58,6 +58,12 @@ function getDescendantIds(agents: Agent[], agentId: string): Set<string> {
   return ids;
 }
 
+/** name suffix "· N팀"으로 소속 팀 판별. suffix 없으면 기본 "1팀" (원본 로스터). */
+function teamOf(name: string): string {
+  const m = /·\s*([^·]+?)팀\s*$/.exec(name ?? "");
+  return m ? `${m[1].trim()}팀` : "1팀";
+}
+
 interface Agent {
   id: string;
   name: string;
@@ -380,18 +386,27 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
 
   const selectedAgent = agents.find((a) => a.id === selectedId) ?? null;
 
-  // useMemo로 parentId → children[] 맵 1회 생성
-  const childrenMap = useMemo(() => {
-    return agents.reduce<Record<string, Agent[]>>((acc, a) => {
-      const key = a.parent_id ?? "__root__";
-      if (!acc[key]) acc[key] = [];
-      acc[key].push(a);
-      return acc;
-    }, {});
+  // 팀 그룹핑 — cto(조정자)는 상단 단일, 나머지 워커는 name suffix 팀별로 묶는다.
+  // 계층(parent_id)은 기능용(decompose 후보=ctoChildren)으로 유지하되, 조직도는
+  // 팀 단위 박스로 표시해 1팀/2팀을 명확히 구분한다.
+  const teamData = useMemo(() => {
+    const cto = agents.find((a) => a.role === "cto") ?? null;
+    const workers = agents.filter((a) => a.id !== cto?.id);
+    const groups = new Map<string, Agent[]>();
+    for (const a of workers) {
+      const label = teamOf(a.name);
+      if (!groups.has(label)) groups.set(label, []);
+      groups.get(label)!.push(a);
+    }
+    const teams = [...groups.entries()].sort(([a], [b]) => {
+      const na = parseInt(a, 10), nb = parseInt(b, 10);
+      if (!isNaN(na) && !isNaN(nb)) return na - nb;
+      if (!isNaN(na)) return -1;
+      if (!isNaN(nb)) return 1;
+      return a.localeCompare(b);
+    });
+    return { cto, teams };
   }, [agents]);
-
-  // parent_id가 null인 루트 노드들
-  const roots = childrenMap["__root__"] ?? [];
 
   const handleClose = () => setSelectedId(null);
   const handleKill = () => {
@@ -530,15 +545,15 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
             </div>
           </div>
 
-          {/* Tree — 가로 스크롤 없이 너비에 맞춰 wrap */}
-          <div className="pb-4">
-            <div className="flex flex-wrap gap-x-8 gap-y-8 items-start justify-center px-4">
-              {roots.map((root) => (
+          {/* Team-grouped org — cto 상단, 팀별 박스. 가로 스크롤 없이 팀이 wrap된다.
+              카드는 기존 OrgNode를 리프(childrenMap={{}})로 재사용. */}
+          <div className="pb-4 flex flex-col items-center">
+            {teamData.cto && (
+              <>
                 <OrgNode
-                  key={root.id}
-                  agent={root}
+                  agent={teamData.cto}
                   agents={agents}
-                  childrenMap={childrenMap}
+                  childrenMap={{}}
                   selectedId={selectedId}
                   onSelect={setSelectedId}
                   onQuickPrompt={setQuickPromptAgent}
@@ -548,6 +563,37 @@ export function OrgChart({ agents, tasks, onAddAgent, onAgentDeleted, onAgentKil
                   depth={0}
                   isLast={true}
                 />
+                {teamData.teams.length > 0 && <div className="w-px h-6 bg-gray-200 dark:bg-gray-700" />}
+              </>
+            )}
+            <div className="flex flex-wrap gap-4 items-start justify-center w-full">
+              {teamData.teams.map(([label, members]) => (
+                <div
+                  key={label}
+                  className="border border-gray-200 dark:border-gray-700 rounded-2xl p-3 bg-gray-50/40 dark:bg-white/[0.02]"
+                >
+                  <div className="text-[11px] font-semibold text-gray-600 dark:text-gray-300 mb-2 px-1">
+                    {label} <span className="text-gray-400 dark:text-gray-500 font-normal">· {members.length}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 items-start justify-center max-w-[540px]">
+                    {members.map((m) => (
+                      <OrgNode
+                        key={m.id}
+                        agent={m}
+                        agents={agents}
+                        childrenMap={{}}
+                        selectedId={selectedId}
+                        onSelect={setSelectedId}
+                        onQuickPrompt={setQuickPromptAgent}
+                        onDrop={handleDrop}
+                        dragOverId={dragOverId}
+                        onDragOverChange={setDragOverId}
+                        depth={1}
+                        isLast={true}
+                      />
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
           </div>
