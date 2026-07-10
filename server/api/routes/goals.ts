@@ -256,7 +256,7 @@ export function createGoalRoutes(ctx: AppContext): Router {
 
   // Create goal — triggers autopilot if enabled
   router.post("/", (req, res) => {
-    const { project_id, title, description, priority = "medium", references, skip_adversarial, acceptance_script } = req.body;
+    const { project_id, title, description, priority = "medium", references, skip_adversarial, acceptance_script, source_material } = req.body;
     // Input validation: type + length (prevents oversized payloads DoS)
     if (typeof project_id !== "string" || project_id.length === 0) {
       return res.status(400).json({ error: "project_id (string) is required" });
@@ -292,10 +292,12 @@ export function createGoalRoutes(ctx: AppContext): Router {
 
       const skipAdversarialVal = typeof skip_adversarial === "boolean" ? (skip_adversarial ? 1 : 0) : 0;
       const acceptanceVal = typeof acceptance_script === "string" ? (acceptance_script.trim().slice(0, 500) || null) : null;
+      // 사용자 원본 자료(MD) — 기획서 생성 근거. 과대 payload 방지로 상한.
+      const sourceMaterialVal = typeof source_material === "string" ? (source_material.slice(0, 20000) || null) : null;
 
       const result = db.prepare(
-        "INSERT INTO goals (project_id, title, description, priority, \"references\", sort_order, skip_adversarial, acceptance_script) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(project_id, goalTitle, goalDescription, priority, goalRefs, sortOrder, skipAdversarialVal, acceptanceVal);
+        "INSERT INTO goals (project_id, title, description, priority, \"references\", sort_order, skip_adversarial, acceptance_script, source_material) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run(project_id, goalTitle, goalDescription, priority, goalRefs, sortOrder, skipAdversarialVal, acceptanceVal, sourceMaterialVal);
 
       const goal = db.prepare("SELECT * FROM goals WHERE rowid = ?").get(result.lastInsertRowid) as any;
       broadcast("project:updated", { projectId: project_id });
@@ -405,9 +407,11 @@ export function createGoalRoutes(ctx: AppContext): Router {
     // Extend timeout for AI response (up to 5 min)
     req.setTimeout(300000);
     res.setTimeout(300000);
-    const { project_id, count: rawCount, language } = req.body;
+    const { project_id, count: rawCount, language, sourceMaterial } = req.body;
     if (!project_id) return res.status(400).json({ error: "project_id required" });
     const count = Math.max(1, Math.min(10, Number(rawCount) || 3));
+    // 사용자가 붙여넣은 원본 자료(MD) — 있으면 이걸 1차 근거로 목표를 "분해"한다.
+    const material = typeof sourceMaterial === "string" ? sourceMaterial.slice(0, 20000).trim() : "";
 
     const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(project_id) as any;
     if (!project) return res.status(404).json({ error: "Project not found" });
@@ -450,10 +454,20 @@ export function createGoalRoutes(ctx: AppContext): Router {
       }
     }
 
-    const prompt = `You are a senior product strategist. Analyze this project and suggest exactly ${count} actionable goals.
+    const materialContext = material
+      ? `\n\nSOURCE MATERIAL (the user's prepared document — the PRIMARY basis for the goals):\n"""\n${material}\n"""`
+      : "";
+    const taskLine = material
+      ? `Analyze the SOURCE MATERIAL below and decompose it into the natural set of actionable goals it implies — as many as the document genuinely contains (typically 1 to ${count}). Do NOT pad to reach a number; if it describes a single deliverable, return exactly 1.`
+      : `Analyze this project and suggest exactly ${count} actionable goals.`;
+    const focusRules = material
+      ? `- Ground every goal strictly in the SOURCE MATERIAL — titles/descriptions must reflect what the document actually asks for, not generic best practices\n- Split by the document's own natural units (features / sections / milestones); preserve its intent and terminology`
+      : `- Focus on what would deliver the most value for this specific project\n- Consider the existing goals and suggest complementary ones`;
+
+    const prompt = `You are a senior product strategist. ${taskLine}
 
 Project: ${project.name}
-Mission: ${project.mission || "(not set)"}${techInfo}${existingContext}${docsContext}
+Mission: ${project.mission || "(not set)"}${techInfo}${existingContext}${docsContext}${materialContext}
 
 Respond in this EXACT JSON format (no markdown, just raw JSON):
 [
@@ -467,8 +481,7 @@ Respond in this EXACT JSON format (no markdown, just raw JSON):
 
 Rules:
 - Each goal should be concrete and actionable, not vague
-- Focus on what would deliver the most value for this specific project
-- Consider the existing goals and suggest complementary ones
+${focusRules}
 - ${promptLanguageRule(language, "Respond in the same language as the project mission/name (Korean if Korean, English if English)")}`;
 
     try {

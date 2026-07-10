@@ -178,8 +178,8 @@ export const api = {
       request<any>(`/goals/${goalId}/generate-spec`, { method: "POST" }),
     refineSpec: (goalId: string, prompt: string) =>
       request<any>(`/goals/${goalId}/refine-spec`, { method: "POST", body: JSON.stringify({ prompt }) }),
-    suggest: (projectId: string, count?: number) =>
-      request<Array<{ title: string; description: string; priority: string; reason: string }>>("/goals/suggest", { method: "POST", body: JSON.stringify({ project_id: projectId, count, language: uiLang() }) }),
+    suggest: (projectId: string, count?: number, sourceMaterial?: string) =>
+      request<Array<{ title: string; description: string; priority: string; reason: string }>>("/goals/suggest", { method: "POST", body: JSON.stringify({ project_id: projectId, count, language: uiLang(), ...(sourceMaterial ? { sourceMaterial } : {}) }) }),
     squashPreview: (goalId: string) =>
       request<{ goalId: string; squashStatus: string; commitMessage: string; filesChanged: string[]; acceptanceScript: string | null; workReport: WorkReport | null }>(
         `/goals/${goalId}/squash-preview`,

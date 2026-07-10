@@ -38,20 +38,21 @@ function AddGoalDialog({
   onStartSuggest,
   onDismissSuggestions,
 }: {
-  onCreateDirect: (title: string, description: string, acceptanceScript?: string, skipAdversarial?: boolean) => void;
+  onCreateDirect: (title: string, description: string, acceptanceScript?: string, skipAdversarial?: boolean, sourceMaterial?: string) => void;
   onCreateWithSpec: (title: string, description: string, acceptanceScript?: string, skipAdversarial?: boolean) => void;
   onCancel: () => void;
   suggestions: Suggestion[];
   suggestLoading: boolean;
   suggestError: string;
   suggestErrorDetail: string;
-  onStartSuggest: (count?: number) => void;
+  onStartSuggest: (count?: number, material?: string) => void;
   onDismissSuggestions: () => void;
 }) {
   const { t } = useTranslation();
   // Auto-select mode based on whether we have suggestion results
   const hasSuggestState = suggestLoading || suggestError || suggestions.length > 0;
-  const [mode, setMode] = useState<"input" | "suggest">(hasSuggestState ? "suggest" : "input");
+  const [mode, setMode] = useState<"material" | "input" | "suggest">(hasSuggestState ? "suggest" : "material");
+  const [sourceMaterial, setSourceMaterial] = useState("");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [acceptanceScript, setAcceptanceScript] = useState("");
@@ -85,6 +86,13 @@ function AddGoalDialog({
     onStartSuggest(suggestCount);
   };
 
+  const handleAnalyzeMaterial = () => {
+    if (!sourceMaterial.trim() || submitting) return;
+    setMode("suggest");
+    // 자료 기반: AI가 문서 규모에 따라 1~N개로 분해 (최대 6개 상한 힌트)
+    onStartSuggest(6, sourceMaterial.trim());
+  };
+
   const toggleSelect = (idx: number) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -102,7 +110,7 @@ function AddGoalDialog({
     // Always use direct creation — autopilot scheduler handles spec→decompose
     // sequentially in priority/sort_order. No need for client-side spec trigger.
     for (const goal of selectedGoals) {
-      await onCreateDirect(goal.title, goal.description, script, skipAdversarial || undefined);
+      await onCreateDirect(goal.title, goal.description, script, skipAdversarial || undefined, sourceMaterial.trim() || undefined);
     }
   };
 
@@ -120,7 +128,38 @@ function AddGoalDialog({
             {t("addGoalTitle")}
           </h3>
 
-          {mode === "input" ? (
+          {mode !== "suggest" && (
+            <div className="flex gap-1 p-0.5 bg-gray-100 dark:bg-gray-800 rounded-lg">
+              <button
+                onClick={() => setMode("material")}
+                className={`flex-1 text-[11px] py-1.5 rounded-md transition-colors ${mode === "material" ? "bg-white dark:bg-[#25253d] text-gray-800 dark:text-gray-200 font-medium shadow-sm" : "text-gray-500 dark:text-gray-400"}`}
+              >
+                {t("addGoalModeMaterial")}
+              </button>
+              <button
+                onClick={() => setMode("input")}
+                className={`flex-1 text-[11px] py-1.5 rounded-md transition-colors ${mode === "input" ? "bg-white dark:bg-[#25253d] text-gray-800 dark:text-gray-200 font-medium shadow-sm" : "text-gray-500 dark:text-gray-400"}`}
+              >
+                {t("addGoalModeManual")}
+              </button>
+            </div>
+          )}
+
+          {mode === "material" ? (
+            <div className="space-y-2">
+              <p className="text-[11px] text-gray-500 dark:text-gray-400">{t("addGoalMaterialHelp")}</p>
+              <textarea
+                autoFocus
+                value={sourceMaterial}
+                onChange={(e) => setSourceMaterial(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Escape") onCancel(); }}
+                placeholder={t("addGoalMaterialPlaceholder")}
+                disabled={submitting}
+                rows={12}
+                className="w-full px-3 py-2 text-xs border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-[#1a1a2e] text-gray-800 dark:text-gray-200 focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-400 disabled:opacity-50 resize-y font-mono leading-relaxed"
+              />
+            </div>
+          ) : mode === "input" ? (
             <>
               <input
                 ref={inputRef}
@@ -268,7 +307,18 @@ function AddGoalDialog({
         </div>
 
         <div className="px-5 py-3 border-t border-gray-100 dark:border-gray-700 flex flex-col gap-2">
-          {mode === "input" ? (
+          {mode === "material" ? (
+            <button
+              onClick={handleAnalyzeMaterial}
+              disabled={!sourceMaterial.trim() || submitting}
+              className="w-full text-xs px-4 py-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40 transition-colors font-semibold flex items-center justify-center gap-1.5"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+              </svg>
+              {t("addGoalMaterialAnalyze")}
+            </button>
+          ) : mode === "input" ? (
             <>
               <button
                 onClick={() => handleSubmit("direct")}
@@ -620,14 +670,14 @@ export function ProjectHome() {
   const [aiSuggestError, setAiSuggestError] = useState("");
   const [aiSuggestErrorDetail, setAiSuggestErrorDetail] = useState("");
 
-  const startAiSuggest = useCallback(async (count?: number) => {
+  const startAiSuggest = useCallback(async (count?: number, material?: string) => {
     if (!currentProjectId || aiSuggestLoading) return;
     setAiSuggestLoading(true);
     setAiSuggestError("");
     setAiSuggestErrorDetail("");
     setAiSuggestions([]);
     try {
-      const result = await api.goals.suggest(currentProjectId, count);
+      const result = await api.goals.suggest(currentProjectId, count, material);
       if (result.length === 0) {
         setAiSuggestError(t("addGoalAiSuggestEmpty"));
       } else {
@@ -1089,7 +1139,7 @@ export function ProjectHome() {
     specPollRefs.current.set(goalId, timer);
   };
 
-  const handleAddGoalDirect = async (title: string, description: string, acceptanceScript?: string, skipAdversarial?: boolean) => {
+  const handleAddGoalDirect = async (title: string, description: string, acceptanceScript?: string, skipAdversarial?: boolean, sourceMaterial?: string) => {
     setShowDialog(null);
     dismissAiSuggestions();
     if (!currentProjectId) return;
@@ -1100,6 +1150,7 @@ export function ProjectHome() {
         description,
         ...(acceptanceScript ? { acceptance_script: acceptanceScript } : {}),
         ...(skipAdversarial ? { skip_adversarial: true } : {}),
+        ...(sourceMaterial ? { source_material: sourceMaterial } : {}),
       });
       setGoals([...goals, goal]);
       showToast(t("addGoalSuccess"), "success");

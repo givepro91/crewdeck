@@ -802,13 +802,18 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
       }
     }
 
+    // 사용자가 붙여넣은 원본 자료 — 있으면 기획서의 1차 근거(authoritative)로 삼는다.
+    const sourceMaterialContext = goal.source_material
+      ? `\n\n## User-Provided Source Material (AUTHORITATIVE — base the spec primarily on this)\n"""\n${String(goal.source_material).slice(0, 12000)}\n"""`
+      : "";
+
     const specPrompt = `
 # Structured Spec Generation
 
 You are a senior product manager. Generate a structured specification for this goal.
 
 **Project**: ${project?.name || "Unknown"}${techInfo}
-**Goal**: ${goal.title ? `"${goal.title}"` : `"${goal.description}"`}${goal.title && goal.description ? `\n**Details**: ${goal.description}` : ""}${projectDocsContext}
+**Goal**: ${goal.title ? `"${goal.title}"` : `"${goal.description}"`}${goal.title && goal.description ? `\n**Details**: ${goal.description}` : ""}${projectDocsContext}${sourceMaterialContext}
 
 Generate a comprehensive spec in this EXACT JSON format:
 \`\`\`json
@@ -846,7 +851,7 @@ Generate a comprehensive spec in this EXACT JSON format:
 
 Rules:
 - Be specific to this project and goal, not generic
-- Feature priority: "must" (essential), "should" (important), "could" (nice to have)
+${goal.source_material ? "- The Source Material above is the user's prepared brief — treat it as the primary source of truth. Derive prd_summary, features, user flow and acceptance criteria from it (preserve its intent, scope and terminology); do not invent scope it doesn't imply.\n" : ""}- Feature priority: "must" (essential), "should" (important), "could" (nice to have)
 - Acceptance criteria in Given/When/Then format
 - Tech considerations should reference the actual tech stack
 - Keep it concise but comprehensive (3-7 features, 5-10 flow steps)

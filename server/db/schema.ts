@@ -512,6 +512,12 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE goals ADD COLUMN work_report TEXT");
   }
 
+  // source_material on goals — 사용자가 붙여넣은 원본 자료(MD). 있으면 기획서 생성의
+  // 1차 근거로 쓴다 (사용자가 미리 준비한 자료 기반 목표+기획서 생성 경로).
+  if (!goalColsLate.some((c) => c.name === "source_material")) {
+    db.exec("ALTER TABLE goals ADD COLUMN source_material TEXT");
+  }
+
   // base_branch on projects — 기본값 'main', develop/master 등 지원
   const projectColsLate = db.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
   if (!projectColsLate.some((c) => c.name === "base_branch")) {
