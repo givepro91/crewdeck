@@ -56,3 +56,26 @@ test: 테스트
 ## Instruction Placement
 
 지침의 위치는 `.claude/rules/instruction-placement.md` 계약을 따른다. 요약: always-on 사실/빌드/위험 경계 → `AGENTS.md`·`CLAUDE.md`, 경로 한정 규칙 → `.claude/rules/`, 강제 차단 → `.claude/settings.json`·hooks, 현재 상태·로드맵 → `docs/ROADMAP.md`, 긴 참고 문서 → `docs/**`.
+
+<!-- CC-RULES:START -->
+<!-- Managed by /claude-md. Edits inside this block are overwritten on regen; put custom rules outside it. -->
+
+## Working Discipline
+- **불확실하면 묻기.** 가정·트레이드오프를 먼저 드러내고, 요청을 푸는 최소 코드만 작성한다. 미요청 기능·추상화·설정화 금지. (상세: 유저 global `~/.claude/CLAUDE.md` §AI Coding Discipline)
+- **Surgical.** 요청과 직접 연결된 라인만 건드리고, 주변 리팩터/포맷 정리는 하지 않는다. 기존 스타일을 그대로 따른다.
+
+## Verification
+- 구현 후 반드시 실행 검증한다 — `npm run typecheck`·`npm test`(vitest)·curl·Playwright 스크린샷 중 하나로 관통. 테스트 GREEN이 아니라 **실제 진입점 동작**을 확인한다(테스트가 다른 함수만 검사하는 갭 주의).
+- 정직 보고: 실패는 출력과 함께 밝히고, 미검증은 "미검증"으로 표시한다. 완료로 포장하지 않는다.
+
+## Parallel Git Workflow
+<!-- variant: CUSTOM (crewdeck 실측 — main 직접커밋 로컬 개인 도구) -->
+- **기본 브랜치 = `main`, 여기에 직접 커밋**한다(로컬 개인 운영 도구, PR 워크플로 없음). 커밋/푸시는 **사용자 명시 요청 시에만**.
+- goal 격리 worktree(`.crewdeck-worktrees/`)는 **앱이 goal 단위로 자동 생성·squash·정리**한다 — 사람이 브랜치를 파는 모델이 아니다.
+- typecheck PASS 없이 커밋 금지(pre-commit hook 강제). 커밋 컨벤션 = 영문 prefix + 한국어 본문(`feat:`/`fix:`/`update:`/`docs:`/`refactor:`/`chore:`/`test:`).
+- 라이브 서비스 재시작은 drain 절차(큐 정지 → activeTasks=0 대기 → build → restart → 큐 재가동)를 반드시 따른다.
+
+## Self-Learning Rules
+<!-- Append one concise rule per correction. `/learn` writes here automatically; newest first. -->
+<!-- LEARN:ANCHOR -->
+<!-- CC-RULES:END -->
