@@ -66,4 +66,8 @@ export const MAX_VERIFY_FAIL_ROUNDS = parseInt(process.env.CREWDECK_MAX_VERIFY_F
 // 완료가 목적: 넉넉히 돌린다. scope-creep(인시던트 근본원인)은 verdict 범위 정책 + 실패이력
 // 주입으로 이미 차단돼 라운드를 늘려도 스핀이 아니라 수렴. 라운드마다 provider 교차(codex↔claude).
 export const MAX_FIX_ROUNDS = parseInt(process.env.CREWDECK_MAX_FIX_ROUNDS ?? "6", 10);
+// auto-fix 스톨 상한 — fix→재검증에서 이슈 셋(severity|file|line)이 연속 N라운드 동일하면
+// (= fix 가 그 이슈를 못 없앰: 외부 blocker·수렴 불가) MAX_FIX_ROUNDS 다 돌기 전 조기 종료 후 escalate.
+// 이슈가 라운드마다 옮겨다니면(진짜 진전) 카운터가 리셋돼 안 걸린다 → false-bail 0. 0/1 이면 사실상 비활성.
+export const MAX_NO_PROGRESS_ROUNDS = parseInt(process.env.CREWDECK_MAX_NO_PROGRESS_ROUNDS ?? "2", 10);
 export const BLOCKED_RETRY_DELAY_MS = parseInt(process.env.CREWDECK_BLOCKED_RETRY_DELAY_MS ?? "10000", 10); // 10s cooldown

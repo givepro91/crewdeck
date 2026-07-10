@@ -9,7 +9,7 @@ import { artifactsDirForGoal, collectScreenshots, initialWorkReport, generateGoa
 import { executeGitWorkflow, getDefaultBranch, squashMergeGoal, type GitHubConfig, type GitMode, type GitWorkflowResult } from "../project/git-workflow.js";
 import type { WorktreeInfo } from "../project/worktree.js";
 import { createLogger } from "../../utils/logger.js";
-import { MAX_TITLE_LEN, MAX_DESC_LEN, MAX_SUMMARY_LEN, MAX_TASKS_PER_GOAL, MAX_TASK_RETRIES, MAX_REASSIGNS, MAX_FIX_ROUNDS } from "../../utils/constants.js";
+import { MAX_TITLE_LEN, MAX_DESC_LEN, MAX_SUMMARY_LEN, MAX_TASKS_PER_GOAL, MAX_TASK_RETRIES, MAX_REASSIGNS, MAX_FIX_ROUNDS, MAX_NO_PROGRESS_ROUNDS } from "../../utils/constants.js";
 import type { VerificationScope } from "../../../shared/types.js";
 import { appendMemory } from "../agent/memory.js";
 import { createMethodologyEngine } from "../methodology/index.js";
@@ -17,7 +17,7 @@ import { autoDetectScope } from "../quality-gate/evaluator.js";
 import { detectAgentRunFailure, classifyAgentFailure } from "../../utils/errors.js";
 import { getBackend } from "../agent/adapters/backend.js";
 import { loadProviderConfig } from "../agent/provider.js";
-import { escalateVerificationCap } from "./verification-policy.js";
+import { escalateVerificationCap, issueSetSignature } from "./verification-policy.js";
 
 const log = createLogger("orchestration");
 
@@ -975,6 +975,9 @@ When complete, provide a summary of changes made.
           const codexAvailable = await getBackend("codex").isAvailable();
 
           let round = 0;
+          // 스톨 감지: 이슈 셋 지문이 연속 동일하면 = fix 가 못 없앰(수렴 실패/외부 blocker) → 조기 escalate
+          let prevIssueSig = issueSetSignature(verification.issues);
+          let noProgressRounds = 0;
           while (reVerification.verdict === "fail" && round < MAX_FIX_ROUNDS) {
             round++;
             log.info(`Verification FAIL — auto-fix round ${round}/${MAX_FIX_ROUNDS}`);
@@ -1040,6 +1043,23 @@ Fix ONLY these issues. Do not modify other code.
               workdir: effectiveWorkdir,
             });
             broadcast("verification:result", reVerification);
+
+            // 스톨(비수렴) 조기 종료 — 이슈 셋(severity|file|line)이 직전 라운드와 동일하면
+            // fix 가 그 이슈를 못 없앤 것(외부 blocker·수렴 불가). MAX_NO_PROGRESS_ROUNDS 연속
+            // 동일하면 남은 라운드를 건너뛰고 escalate(아래 !rePass 경로). 이슈가 옮겨가면 리셋.
+            if (reVerification.verdict === "fail") {
+              const sig = issueSetSignature(reVerification.issues);
+              if (sig && sig === prevIssueSig) {
+                noProgressRounds++;
+                if (noProgressRounds >= MAX_NO_PROGRESS_ROUNDS) {
+                  log.warn(`Auto-fix 스톨 감지 — 이슈 셋이 ${noProgressRounds + 1}라운드 연속 동일(비수렴), round ${round}/${MAX_FIX_ROUNDS} 에서 조기 escalate: ${task.title}`);
+                  break;
+                }
+              } else {
+                noProgressRounds = 0;
+              }
+              prevIssueSig = sig;
+            }
           }
         }
 

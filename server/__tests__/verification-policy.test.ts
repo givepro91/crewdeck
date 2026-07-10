@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { createDatabase, migrate } from "../db/schema.js";
-import { countFailRounds, shouldEscalateVerifyCap, escalateVerificationCap } from "../core/orchestration/verification-policy.js";
+import { countFailRounds, shouldEscalateVerifyCap, escalateVerificationCap, issueSetSignature } from "../core/orchestration/verification-policy.js";
 import { buildReverifyContext } from "../core/quality-gate/evaluator.js";
 import type Database from "better-sqlite3";
 
@@ -149,5 +149,54 @@ describe("buildReverifyContext — 재검증 프롬프트 정책", () => {
   it("깨진 JSON 이슈도 안전하게 폴백한다", () => {
     const ctx = buildReverifyContext([{ issues: "not-json{", created_at: "2026-07-08" }]);
     expect(ctx).toContain("not-json{");
+  });
+});
+
+/**
+ * auto-fix 스톨 감지 지문 (issueSetSignature).
+ *
+ * 계약: 라운드 간 이슈 셋 지문이 같으면 = fix 가 같은 위치·등급 이슈를 못 없앰(비수렴).
+ * severity|file|line 만 반영 — 메시지 워딩은 무시(같은 이슈의 재서술을 같게 취급),
+ * 파일/라인이 옮겨가면(진짜 진전) 지문이 달라져 스톨로 안 잡힌다(false-bail 0).
+ */
+describe("issueSetSignature — auto-fix 스톨 감지 지문", () => {
+  const iss = (severity: string, file?: string, line?: number, message = "x") =>
+    ({ id: "i", severity, file, line, message });
+
+  it("순서 무관 — 같은 이슈 셋이면 순서가 달라도 동일 지문", () => {
+    const a = [iss("high", "f.py", 10), iss("critical", "g.ts", 20)];
+    const b = [iss("critical", "g.ts", 20), iss("high", "f.py", 10)];
+    expect(issueSetSignature(a)).toBe(issueSetSignature(b));
+  });
+
+  it("메시지 워딩 무시 — 같은 위치·등급이면 서술이 달라도 동일 지문", () => {
+    const a = [iss("high", "f.py", 10, "에러 A 발생")];
+    const b = [iss("high", "f.py", 10, "완전히 다른 문장으로 같은 문제를 서술")];
+    expect(issueSetSignature(a)).toBe(issueSetSignature(b));
+  });
+
+  it("다른 파일/라인이면 지문이 달라진다 (= 진전으로 간주 → 스톨 아님)", () => {
+    expect(issueSetSignature([iss("high", "f.py", 10)])).not.toBe(issueSetSignature([iss("high", "f.py", 11)]));
+    expect(issueSetSignature([iss("high", "f.py", 10)])).not.toBe(issueSetSignature([iss("high", "g.py", 10)]));
+  });
+
+  it("file/line 없음(널)과 빈 배열을 안전 처리", () => {
+    expect(issueSetSignature([iss("high")])).toBe("high||");
+    expect(issueSetSignature([])).toBe("");
+    expect(issueSetSignature(undefined as any)).toBe("");
+  });
+
+  it("실측 시나리오: 이슈가 옮겨가면 리셋, 같은 위치 지속이면 동일 (b69516b8 밤샘 라운드)", () => {
+    const round = (lines: number[]) => issueSetSignature(lines.map((l) => iss("high", "automation_metadata.py", l)));
+    const r4 = round([320, 40]);
+    const r5 = round([320, 40]); // 동일 → 스톨 누적
+    const r6 = round([320, 43]); // :43 로 옮김 → 진전으로 간주(리셋)
+    expect(r5).toBe(r4);
+    expect(r6).not.toBe(r5);
+  });
+
+  it("외부 blocker: 매 라운드 완전히 동일한 이슈 → 항상 같은 지문 (조기 escalate 대상)", () => {
+    const stuck = [iss("critical", "api/routes/resources.py", 159, "nextActions 계약 부재")];
+    expect(issueSetSignature(stuck)).toBe(issueSetSignature([...stuck]));
   });
 });

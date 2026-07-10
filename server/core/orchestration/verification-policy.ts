@@ -38,6 +38,21 @@ export function shouldEscalateVerifyCap(db: Database, taskId: string): boolean {
 }
 
 /**
+ * 이슈 셋의 구조적 지문 — severity|file|line 만으로 (메시지 워딩 무시, 순서 무관).
+ *
+ * auto-fix 스톨 감지용. 라운드 간 지문이 같으면 = fix 가 같은 위치의 같은 등급 이슈를
+ * 못 없앴다(수렴 실패·외부 blocker). 이슈가 다른 파일/라인으로 옮겨가면(진짜 진전) 지문이
+ * 바뀌어 스톨로 안 잡힌다. 메시지를 뺀 이유: Evaluator(LLM)가 같은 이슈를 매 라운드 다르게
+ * 서술해도 같은 이슈로 취급하기 위함.
+ */
+export function issueSetSignature(issues: EscalationIssue[]): string {
+  return (issues ?? [])
+    .map((i) => `${i.severity ?? "?"}|${i.file ?? ""}|${i.line ?? ""}`)
+    .sort()
+    .join("\n");
+}
+
+/**
  * 상한 도달 태스크를 완료 처리하고 미해결 이슈를 goal 의 QA 태스크로 이월한다.
  * 산출물은 폐기하지 않는다 (부분 유효 작업 보존은 호출자 책임 — dropCheckpoint).
  */
