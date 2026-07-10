@@ -3,6 +3,7 @@ import { existsSync, readFileSync, appendFileSync, writeFileSync } from "node:fs
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createLogger } from "../../utils/logger.js";
+import { ensureGitIdentity } from "./git-workflow.js";
 
 const log = createLogger("worktree");
 
@@ -264,6 +265,9 @@ export function createGoalWorktree(
     return null;
   }
 
+  // 커밋 identity 폴백 보장 — worktree는 메인 repo config를 공유하므로,
+  // 에이전트/crewdeck의 git commit이 identity 미설정으로 실패하지 않게 한다.
+  ensureGitIdentity(projectWorkdir);
   ensureGitignoreHasWorktreeExcludes(projectWorkdir);
 
   const headCheck = spawnSync("git", ["rev-parse", "HEAD"], {
