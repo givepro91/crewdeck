@@ -13,6 +13,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { promptLanguageRule } from "../../utils/language.js";
 import { join } from "node:path";
 import { createLogger } from "../../utils/logger.js";
+import { extractJsonArray } from "../../utils/llm-json.js";
 import { getPreset, getAgentPresets } from "./roles.js";
 import { createClaudeCodeAdapter } from "./adapters/claude-code.js";
 import { parseAgentOutput } from "./adapters/stream-parser.js";
@@ -101,15 +102,13 @@ Rules:
 
 /** LLM 응답 파싱 + 검증 — 순수 함수. 깨진 응답은 throw (호출부가 fallback). */
 export function parseTeamDesign(raw: string, maxAgents = MAX_AGENTS_DEFAULT): SuggestedAgent[] {
-  const jsonMatch = raw.match(/```json\s*([\s\S]*?)\s*```/) || raw.match(/(\[[\s\S]*\])/);
-  const jsonStr = jsonMatch ? jsonMatch[1] : raw;
-  const parsed = JSON.parse(jsonStr);
-  if (!Array.isArray(parsed) || parsed.length === 0) {
+  const parsed = extractJsonArray(raw);
+  if (!parsed || parsed.length === 0) {
     throw new Error("Team design must be a non-empty array");
   }
 
   const agents: SuggestedAgent[] = [];
-  for (const item of parsed.slice(0, maxAgents)) {
+  for (const item of parsed.slice(0, maxAgents) as any[]) {
     const name = String(item?.name ?? "").trim().slice(0, 50);
     const systemPrompt = String(item?.system_prompt ?? "").trim().slice(0, 4000);
     if (!name || !systemPrompt) continue; // 필수 필드 없는 항목은 버림

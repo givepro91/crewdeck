@@ -7,6 +7,7 @@ import { artifactsDirForGoal } from "../../core/orchestration/work-report.js";
 import { createLogger } from "../../utils/logger.js";
 import { promptLanguageRule } from "../../utils/language.js";
 import { parseAgentOutput } from "../../core/agent/adapters/stream-parser.js";
+import { extractJsonArray } from "../../utils/llm-json.js";
 import {
   squashMergeGoal,
   getDefaultBranch,
@@ -492,12 +493,12 @@ Rules:
           throw new Error("Goal suggestion produced no text output");
         }
 
-        // Parse JSON from response
-        const jsonMatch = raw.match(/```json\s*([\s\S]*?)\s*```/) || raw.match(/(\[[\s\S]*\])/);
-        const jsonStr = jsonMatch ? jsonMatch[1] : raw;
-        const suggestions = JSON.parse(jsonStr);
-
-        if (!Array.isArray(suggestions)) throw new Error("Expected array");
+        // Parse JSON from response — 모델이 산문(대괄호 평문 포함)을 반환해도
+        // greedy 정규식처럼 크래시하지 않고 깨끗한 에러로 degrade한다.
+        const suggestions = extractJsonArray(raw);
+        if (!suggestions) {
+          throw new Error("Goal suggestion did not return a valid JSON array");
+        }
 
         res.json(suggestions.slice(0, count).map((s: any) => ({
           title: String(s.title || "").slice(0, 100),
