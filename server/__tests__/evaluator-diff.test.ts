@@ -22,6 +22,10 @@ beforeEach(() => {
   git(repo, 'init', '-b', 'main');
   git(repo, 'config', 'user.email', 'test@crewdeck.local');
   git(repo, 'config', 'user.name', 'crewdeck-test');
+  // 실행 환경의 global gitignore(~/.gitignore_global 에 .omc/.playwright-mcp 등이
+  // 있으면 `git add .omc` 가 거부되고 untracked 시뮬레이션도 안 잡힌다)를 차단해
+  // 테스트를 환경 독립적으로 만든다 — collectDiffSummary 의 exclude 로직 자체를 검증.
+  git(repo, 'config', 'core.excludesFile', '/dev/null');
   writeFileSync(join(repo, 'a.txt'), 'base\n');
   git(repo, 'add', 'a.txt');
   git(repo, 'commit', '-m', 'base');
