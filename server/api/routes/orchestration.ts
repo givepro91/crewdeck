@@ -10,6 +10,8 @@ import { parseAgentOutput } from "../../core/agent/adapters/stream-parser.js";
 import { createLogger } from "../../utils/logger.js";
 import { loadProviderConfig } from "../../core/agent/provider.js";
 import { serializeTask, selectTaskForResponse } from "./tasks.js";
+import { resolveChatSession, chatSessionKey } from "../../core/agent/chat-session.js";
+import { ChatEventAssembler } from "../../core/agent/adapters/chat-events.js";
 
 const log = createLogger("orchestration");
 
@@ -417,6 +419,49 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
         broadcast("agent:status", { id: agentId, name: agent.name, status: "idle" });
       }
     })();
+  });
+
+  // 대화형 채팅 — 세션을 죽이지 않고(keep-alive) 멀티턴 resume. 구조화 이벤트 broadcast.
+  router.post("/agents/:agentId/chat", async (req, res) => {
+    const { agentId } = req.params;
+    const message: string = (req.body?.message ?? "").toString();
+    if (!message.trim()) return res.status(400).json({ error: "message is required" });
+    if (message.length > MAX_PROMPT_LEN) {
+      return res.status(400).json({ error: `message too long (max ${MAX_PROMPT_LEN})` });
+    }
+    if (!ctx.sessionManager) return res.status(503).json({ error: "Session manager not ready" });
+
+    const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as any;
+    if (!agent) return res.status(404).json({ error: "Agent not found" });
+    const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(agent.project_id) as any;
+    const workdir = project?.workdir || process.cwd();
+
+    const resolved = resolveChatSession(ctx.sessionManager, agentId, workdir);
+    if ("busy" in resolved) return res.status(409).json({ status: "busy" });
+
+    const session = ctx.sessionManager.getSession(chatSessionKey(agentId))!;
+    // 이 세션에 실제로 해석된 provider(claude/codex). SessionManager가 spawn 시 sessions row에
+    // 기록하고 getSessionRecord로 노출한다(session.ts SessionRecord.provider). AgentSession 자체엔
+    // provider 필드가 없으므로 record에서 읽는다. 없으면 claude 폴백.
+    const provider = ctx.sessionManager.getSessionRecord(chatSessionKey(agentId))?.provider ?? "claude";
+    const assembler = new ChatEventAssembler(provider);
+    let seq = 0;
+
+    const onOutput = (text: string) => {
+      for (const event of assembler.push(text)) {
+        broadcast("chat:event", { agentId, sessionKey: chatSessionKey(agentId), seq: seq++, event });
+      }
+    };
+    session.on("output", onOutput);
+
+    try {
+      await session.send(message.trim());
+      res.json({ status: "done", agentId });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || "chat failed" });
+    } finally {
+      session.off("output", onOutput); // ⚠ killSession 하지 않음 — keep-alive
+    }
   });
 
   // Send a prompt to multiple agents sequentially
