@@ -20,7 +20,8 @@
     "start": "node dist/bin/crewdeck.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build && npm test"
+    "verify:startup": "node scripts/verify-startup.mjs",
+    "prepublishOnly": "npm run build && npm test && npm run verify:startup"
   },
   "keywords": [
     "ai",

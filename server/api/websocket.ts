@@ -1,7 +1,11 @@
 import type { IncomingMessage } from "node:http";
 import type { WebSocketServer, WebSocket } from "ws";
 
-export function createWSHandler(wss: WebSocketServer, apiKey: string): void {
+export function createWSHandler(
+  wss: WebSocketServer,
+  apiKey: string,
+  onAuthenticated?: () => void,
+): void {
   // Prevent server crash on WebSocket errors
   wss.on("error", (err) => {
     console.error("[WS Server] Error:", err.message);
@@ -50,6 +54,7 @@ export function createWSHandler(wss: WebSocketServer, apiKey: string): void {
                 timestamp: new Date().toISOString(),
               }));
             } catch { /* ignore */ }
+            onAuthenticated?.();
           } else {
             try { ws.send(JSON.stringify({ type: "error", payload: { code: "unauthorized" } })); } catch { /* ignore */ }
             try { ws.close(4001, "Unauthorized"); } catch { /* already closed */ }
@@ -88,6 +93,7 @@ export function createWSHandler(wss: WebSocketServer, apiKey: string): void {
       } catch {
         // Client may have disconnected immediately
       }
+      onAuthenticated?.();
     }
   });
 }

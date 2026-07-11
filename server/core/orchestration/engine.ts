@@ -63,6 +63,216 @@ interface AgentRow {
   parent_id: string | null;
 }
 
+interface VerificationIssueRow {
+  id: string;
+  dimension: string;
+  severity: "critical" | "high" | "warning" | "info";
+  evidence: string;
+  repro_command: string;
+  expected_result: string;
+  actual_result: string;
+  fix_instruction: string;
+  assignee_id: string;
+}
+
+export interface CreatedFixTask {
+  issueId: string;
+  taskId: string;
+  title: string;
+  description: string;
+  assigneeId: string | null;
+  status: string;
+  created: boolean;
+}
+
+export interface FixTaskConversionResult {
+  fixTasks: CreatedFixTask[];
+  manualApprovalRequired: boolean;
+}
+
+const FIX_TASK_PRIORITY: Record<VerificationIssueRow["severity"], "critical" | "high" | "medium" | "low"> = {
+  critical: "critical",
+  high: "high",
+  warning: "medium",
+  info: "low",
+};
+
+function buildFixTaskDescription(
+  sourceTaskId: string,
+  verificationId: string,
+  issue: VerificationIssueRow,
+): string {
+  return [
+    "# Quality Gate Fix",
+    "",
+    `source_task_id: ${sourceTaskId}`,
+    `source_verification_id: ${verificationId}`,
+    `issue_id: ${issue.id}`,
+    `dimension: ${issue.dimension}`,
+    `severity: ${issue.severity}`,
+    `evidence: ${issue.evidence}`,
+    `repro_command: ${issue.repro_command}`,
+    `expected_result: ${issue.expected_result}`,
+    `actual_result: ${issue.actual_result}`,
+    `fix_instruction: ${issue.fix_instruction}`,
+    "",
+    "Fix ONLY this issue. Run the repro_command and confirm the expected_result before completing.",
+  ].join("\n");
+}
+
+/**
+ * 실패 verification의 normalized issue를 issue별 fix task로 변환한다.
+ * task 생성과 issue↔task link 저장은 한 transaction으로 처리하며, 기존 link가
+ * 있으면 해당 task를 재사용한다. 유효한 project assignee가 없으면 승인 대기
+ * task를 만들고 호출자가 manual_approval 상태를 노출할 수 있게 알린다.
+ */
+export function createFixTasksFromVerification(
+  db: Database,
+  verificationId: string,
+): FixTaskConversionResult {
+  const source = db.prepare(`
+    SELECT v.id AS verification_id, v.verdict, t.id AS task_id, t.goal_id,
+           t.project_id, t.title, t.assignee_id, t.task_type
+    FROM verifications v
+    JOIN tasks t ON t.id = v.task_id
+    WHERE v.id = ?
+  `).get(verificationId) as {
+    verification_id: string;
+    verdict: string;
+    task_id: string;
+    goal_id: string;
+    project_id: string;
+    title: string;
+    assignee_id: string | null;
+    task_type: string;
+  } | undefined;
+  if (!source) throw new Error(`Verification ${verificationId} not found`);
+  if (source.verdict !== "fail") throw new Error(`Verification ${verificationId} is not failed`);
+
+  const issues = db.prepare(`
+    SELECT id, dimension, severity, evidence, repro_command, expected_result,
+           actual_result, fix_instruction, assignee_id
+    FROM verification_issues
+    WHERE verification_id = ?
+    ORDER BY rowid ASC
+  `).all(verificationId) as VerificationIssueRow[];
+
+  const convert = db.transaction((): FixTaskConversionResult => {
+    const fixTasks: CreatedFixTask[] = [];
+    let nextOrder = ((db.prepare(
+      "SELECT MAX(sort_order) AS max_order FROM tasks WHERE goal_id = ?",
+    ).get(source.goal_id) as { max_order: number | null }).max_order ?? 0) + 1;
+
+    const findAgent = db.prepare("SELECT id FROM agents WHERE id = ? AND project_id = ?");
+    const findLinkedTask = db.prepare(`
+      SELECT t.id, t.title, t.description, t.assignee_id, t.status
+      FROM verification_issue_tasks vit
+      JOIN tasks t ON t.id = vit.task_id
+      WHERE vit.issue_id = ? AND vit.relation = 'fix'
+      ORDER BY t.created_at ASC, t.rowid ASC
+      LIMIT 1
+    `);
+    const insertTask = db.prepare(`
+      INSERT INTO tasks (
+        goal_id, project_id, title, description, assignee_id, status,
+        priority, sort_order, task_type
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id
+    `);
+    const insertLink = db.prepare(`
+      INSERT INTO verification_issue_tasks (issue_id, task_id, relation)
+      VALUES (?, ?, 'fix')
+    `);
+    const updateLinkedTask = db.prepare(`
+      UPDATE tasks
+      SET assignee_id = ?, status = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `);
+    const insertActivity = db.prepare(`
+      INSERT INTO activities (project_id, agent_id, type, message, metadata)
+      VALUES (?, ?, 'task_created', ?, ?)
+    `);
+
+    for (const issue of issues) {
+      const issueAgent = findAgent.get(issue.assignee_id, source.project_id) as { id: string } | undefined;
+      const sourceAgent = source.assignee_id
+        ? findAgent.get(source.assignee_id, source.project_id) as { id: string } | undefined
+        : undefined;
+      const resolvedAssigneeId = issueAgent?.id ?? sourceAgent?.id ?? null;
+      const linked = findLinkedTask.get(issue.id) as {
+        id: string;
+        title: string;
+        description: string;
+        assignee_id: string | null;
+        status: string;
+      } | undefined;
+      if (linked) {
+        let assigneeId = linked.assignee_id;
+        let status = linked.status;
+        if (!assigneeId && status !== "done") {
+          assigneeId = resolvedAssigneeId;
+          status = assigneeId && status === "pending_approval" ? "todo" : assigneeId ? status : "pending_approval";
+          updateLinkedTask.run(assigneeId, status, linked.id);
+        }
+        fixTasks.push({
+          issueId: issue.id,
+          taskId: linked.id,
+          title: linked.title,
+          description: linked.description,
+          assigneeId,
+          status,
+          created: false,
+        });
+        continue;
+      }
+
+      const assigneeId = resolvedAssigneeId;
+      const status = assigneeId ? "todo" : "pending_approval";
+      const title = `[Fix][${issue.dimension}] ${issue.evidence}`.slice(0, MAX_TITLE_LEN);
+      const description = buildFixTaskDescription(source.task_id, verificationId, issue);
+      const inserted = insertTask.get(
+        source.goal_id,
+        source.project_id,
+        title,
+        description,
+        assigneeId,
+        status,
+        FIX_TASK_PRIORITY[issue.severity],
+        nextOrder++,
+        source.task_type,
+      ) as { id: string };
+      insertLink.run(issue.id, inserted.id);
+      insertActivity.run(
+        source.project_id,
+        assigneeId,
+        `Fix task created: "${title}"`,
+        JSON.stringify({
+          sourceVerificationId: verificationId,
+          sourceTaskId: source.task_id,
+          issueId: issue.id,
+          manualApprovalRequired: assigneeId === null,
+        }),
+      );
+      fixTasks.push({
+        issueId: issue.id,
+        taskId: inserted.id,
+        title,
+        description,
+        assigneeId,
+        status,
+        created: true,
+      });
+    }
+
+    return {
+      fixTasks,
+      manualApprovalRequired: fixTasks.some((task) => task.assigneeId === null),
+    };
+  });
+
+  return convert();
+}
+
 export type TaskExecutionStatus = "todo" | "pending_approval" | "in_progress" | "in_review" | "done" | "blocked";
 
 export type TaskExecutionClaim =
@@ -84,7 +294,7 @@ export interface OrchestrationConfig {
 const DEFAULT_CONFIG: OrchestrationConfig = {
   verificationScope: "standard",
   autoFix: true,
-  maxFixRetries: 1,
+  maxFixRetries: 2,
 };
 
 /**
@@ -1144,15 +1354,48 @@ When complete, provide a summary of changes made.
           workdir: effectiveWorkdir,
         });
 
-        broadcast("verification:result", verification);
+        const stopForEvaluatorError = async (result: typeof verification): Promise<boolean> => {
+          if (result.terminationReason !== "evaluator_error") return false;
+          if (isGoalAsUnit) {
+            const { dropCheckpoint } = await import("../project/worktree.js");
+            dropCheckpoint(effectiveWorkdir, task.id);
+          }
+          transitionTask(db, broadcast, task, "blocked");
+          db.prepare(`
+            INSERT INTO activities (project_id, agent_id, type, message, metadata)
+            VALUES (?, ?, 'verification_stopped', ?, ?)
+          `).run(
+            task.project_id,
+            task.assignee_id,
+            `Evaluator error stopped verification: ${task.title}`,
+            JSON.stringify({
+              taskId,
+              sourceVerificationId: result.id,
+              status: "stopped",
+              reason: "evaluator_error",
+            }),
+          );
+          return true;
+        };
 
-        // Phase 5: Auto-fix loop — 통과할 때까지 fix→재검증을 반복(최대 MAX_FIX_ROUNDS).
+        if (await stopForEvaluatorError(verification)) {
+          return { success: false, verdict: verification.verdict };
+        }
+
+        // Phase 5: Auto-fix loop — 통과할 때까지 fix→재검증을 반복(최대 min(opts.maxFixRetries, MAX_FIX_ROUNDS)).
         // 완료가 목적. 인시던트(무한 검토)의 근본원인 scope-creep 은 verdict 범위 정책 + 실패이력
         // 주입으로 이미 차단됐으므로, 라운드를 늘려도 스핀이 아니라 수렴한다. 라운드마다 provider
         // 교차(codex↔claude)로 한 모델이 못 고치면 다른 모델이 시도. 이 루프를 다 쓰고도 실패한
-        // 극소수만 이월(정직 표시 + '다시 해결'). buildFailureHistoryContext 로 누적 피드백 주입.
+        // 극소수는 goal-as-unit이면 pending_approval(사람 승인)로, 아니면 blocked로 넘긴다.
         let reVerification = verification;
-        if (verification.verdict === "fail" && opts.autoFix && opts.maxFixRetries > 0) {
+        // evaluator_error(파싱 실패/세션 재사용 위반)는 Generator 코드 결함이 아니라
+        // Evaluator 자체의 구조화 출력 실패다 — fix task로 정규화할 필드가 없으므로
+        // 이 루프에 넣지 않는다(넣으면 fixTask 0개인 채 generic 프롬프트만 소모).
+        const effectiveMaxRounds = Math.min(opts.maxFixRetries, MAX_FIX_ROUNDS);
+        const autoFixEligible = verification.verdict === "fail"
+          && verification.terminationReason !== "evaluator_error"
+          && opts.autoFix && opts.maxFixRetries > 0;
+        if (autoFixEligible) {
           const provCfg = loadProviderConfig();
           const lastSess = db.prepare(
             "SELECT provider FROM sessions WHERE agent_id = ? ORDER BY started_at DESC LIMIT 1",
@@ -1164,7 +1407,7 @@ When complete, provide a summary of changes made.
           // 스톨 감지: 이슈 셋 지문이 연속 동일하면 = fix 가 못 없앰(수렴 실패/외부 blocker) → 조기 escalate
           let prevIssueSig = issueSetSignature(verification.issues);
           let noProgressRounds = 0;
-          while (reVerification.verdict === "fail" && round < MAX_FIX_ROUNDS) {
+          while (reVerification.verdict === "fail" && round < effectiveMaxRounds) {
             // Goal DELETE can terminate the evaluator/fix subprocess while its
             // send Promise is settling. Never spawn the next auto-fix session
             // or re-verifier after the task has been CASCADE-deleted.
@@ -1173,16 +1416,81 @@ When complete, provide a summary of changes made.
               return { success: false, verdict: "aborted" };
             }
             round++;
-            log.info(`Verification FAIL — auto-fix round ${round}/${MAX_FIX_ROUNDS}`);
+            const sourceVerificationId = reVerification.id;
+            log.info(`Verification FAIL — auto-fix round ${round}/${effectiveMaxRounds}`);
+            db.prepare(`
+              INSERT INTO activities (project_id, agent_id, type, message, metadata)
+              VALUES (?, ?, 'verification_fixing', ?, ?)
+            `).run(
+              task.project_id,
+              task.assignee_id,
+              `Auto-fix round ${round}/${effectiveMaxRounds}: ${task.title}`,
+              JSON.stringify({
+                taskId,
+                sourceVerificationId,
+                status: "fixing",
+                reason: "auto_fix_in_progress",
+                round,
+                maxRounds: effectiveMaxRounds,
+              }),
+            );
+
+            const conversion = createFixTasksFromVerification(db, sourceVerificationId);
+            for (const fixTask of conversion.fixTasks) {
+              if (fixTask.created) {
+                broadcast("task:updated", {
+                  id: fixTask.taskId,
+                  goal_id: task.goal_id,
+                  project_id: task.project_id,
+                  title: fixTask.title,
+                  description: fixTask.description,
+                  assignee_id: fixTask.assigneeId,
+                  status: fixTask.status,
+                  action: "created",
+                });
+              }
+            }
+            if (conversion.manualApprovalRequired) {
+              transitionTask(db, broadcast, task, "pending_approval");
+              db.prepare(`
+                INSERT INTO activities (project_id, type, message, metadata)
+                VALUES (?, 'verification_manual_approval', ?, ?)
+              `).run(
+                task.project_id,
+              `Fix task assignee unavailable: ${task.title}`,
+                JSON.stringify({
+                  taskId,
+                  sourceVerificationId,
+                  status: "manual_approval",
+                  reason: "fix_assignee_unavailable",
+                }),
+              );
+              return { success: false, verdict: "conditional" };
+            }
+
+            const mappedFixTasks = conversion.fixTasks.filter((fixTask) => fixTask.assigneeId !== null);
+            if (mappedFixTasks.length > 0) {
+              const placeholders = mappedFixTasks.map(() => "?").join(", ");
+              db.prepare(`
+                UPDATE tasks SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now')
+                WHERE id IN (${placeholders})
+              `).run(...mappedFixTasks.map((fixTask) => fixTask.taskId));
+              for (const fixTask of mappedFixTasks) {
+                broadcast("task:updated", { id: fixTask.taskId, status: "in_progress" });
+              }
+            }
 
             // 누적 실패 이력 + 이번 라운드 이슈를 함께 주입 (Smart Resume)
             const failureContext = buildFailureHistoryContext(db, task.id, 3);
+            const structuredFixPrompts = mappedFixTasks
+              .map((fixTask) => fixTask.description)
+              .join("\n\n---\n\n");
             const fixPrompt = `
-# Fix Required (Smart Resume — round ${round}/${MAX_FIX_ROUNDS})
+# Fix Required (Smart Resume — round ${round}/${effectiveMaxRounds})
 ${failureContext}
 
-The following issues were found during verification:
-${reVerification.issues.map((i) => `- [${i.severity}] ${i.file ?? ""}:${i.line ?? ""} — ${i.message}`).join("\n")}
+${structuredFixPrompts || `The following issues were found during verification:
+${reVerification.issues.map((i) => `- [${i.severity}] ${i.file ?? ""}:${i.line ?? ""} — ${i.message}`).join("\n")}`}
 
 Fix ONLY these issues. Do not modify other code.
 `;
@@ -1202,14 +1510,43 @@ Fix ONLY these issues. Do not modify other code.
             db.prepare("UPDATE agents SET status = 'working', current_task_id = ?, current_activity = ? WHERE id = ?")
               .run(taskId, `fix(${round}): ${task.title?.slice(0, 72) ?? ""}`, task.assignee_id);
             const fixSession = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir, undefined, taskId);
+            const fixSessionRecord = sessionManager.getSessionRecord(task.assignee_id);
+            const fixSessionRowId = fixSessionRecord?.rowId && db.prepare(
+              "SELECT id FROM sessions WHERE id = ?",
+            ).get(fixSessionRecord.rowId)
+              ? fixSessionRecord.rowId
+              : null;
+            // runtime_session_id: session_id(sessions row id)는 evaluator의 runtime
+            // session id와 절대 충돌하지 않으므로, 세션 재사용(맥락 누수) 탐지에 쓰일
+            // CLI runtime id를 별도로 기록한다. spawn 직후엔 아직 null일 수 있어
+            // send() 이후 backfill한다.
+            const fixSessionRuntimeId = fixSessionRecord?.runtimeSessionId ?? null;
+            db.prepare(`
+              INSERT INTO verification_fix_rounds (
+                task_id, source_verification_id, round_number, assignee_id,
+                session_id, runtime_session_id, status, started_at
+              ) VALUES (?, ?, ?, ?, ?, ?, 'running', datetime('now'))
+              ON CONFLICT(source_verification_id) DO UPDATE SET
+                round_number = excluded.round_number,
+                assignee_id = excluded.assignee_id,
+                session_id = excluded.session_id,
+                runtime_session_id = excluded.runtime_session_id,
+                status = 'running',
+                started_at = datetime('now'),
+                completed_at = NULL
+            `).run(taskId, sourceVerificationId, round, task.assignee_id, fixSessionRowId, fixSessionRuntimeId);
             fixSession.on("rate-limit", (info: { waitMs: number; stderr: string }) => {
               broadcast("system:rate-limit", { agentId: task.assignee_id, agentName, taskId, waitMs: info.waitMs, message: info.stderr });
             });
             fixSession.on("crewdeck:error", (error: unknown) => {
               broadcast("system:error", { agentId: task.assignee_id, agentName, taskId, error });
             });
+            let fixRuntimeSessionId: string | null = fixSessionRuntimeId;
+            let fixRunFailed = false;
             try {
               const fixResult = await fixSession.send(fixPrompt);
+              // runtime session id는 send() 이후에야 확정된다 — spawn 시점 null을 교정.
+              fixRuntimeSessionId = fixResult.sessionId ?? fixSessionRecord?.runtimeSessionId ?? fixRuntimeSessionId;
               const fixParsed = parseAgentOutput(fixResult.stdout, fixResult.provider);
               // 헤맴 신호: fix 라운드 토큰도 태스크에 누적 (반복 수정할수록 총량↑)
               if (fixParsed.usage) {
@@ -1221,11 +1558,32 @@ Fix ONLY these issues. Do not modify other code.
               }
               const fixFailure = detectAgentRunFailure(fixResult, fixParsed);
               if (fixFailure) {
+                fixRunFailed = true;
                 log.error(`Auto-fix round ${round} failed [${fixFailure.code}]: ${fixFailure.message}`, { taskId, taskTitle: task.title, detail: fixFailure.detail });
                 broadcast("system:error", { agentId: task.assignee_id, agentName, taskId, error: fixFailure.toJSON() });
                 // Don't throw — re-verification decides the task's fate.
               }
+            } catch (err) {
+              fixRunFailed = true;
+              throw err;
             } finally {
+              db.prepare(`
+                UPDATE verification_fix_rounds
+                SET status = ?, completed_at = datetime('now'),
+                    runtime_session_id = COALESCE(?, runtime_session_id)
+                WHERE source_verification_id = ?
+              `).run(fixRunFailed ? "failed" : "completed", fixRuntimeSessionId, sourceVerificationId);
+              if (mappedFixTasks.length > 0) {
+                const placeholders = mappedFixTasks.map(() => "?").join(", ");
+                const fixTaskStatus = fixRunFailed ? "blocked" : "done";
+                db.prepare(`
+                  UPDATE tasks SET status = ?, updated_at = datetime('now')
+                  WHERE id IN (${placeholders})
+                `).run(fixTaskStatus, ...mappedFixTasks.map((fixTask) => fixTask.taskId));
+                for (const fixTask of mappedFixTasks) {
+                  broadcast("task:updated", { id: fixTask.taskId, status: fixTaskStatus });
+                }
+              }
               sessionManager.killSession(task.assignee_id);
               sessionManager.clearProviderOverride(task.assignee_id);
             }
@@ -1239,7 +1597,14 @@ Fix ONLY these issues. Do not modify other code.
               scope: effectiveVerificationScope,
               workdir: effectiveWorkdir,
             });
-            broadcast("verification:result", reVerification);
+            db.prepare(`
+              UPDATE verification_fix_rounds
+              SET result_verification_id = ?
+              WHERE source_verification_id = ?
+            `).run(reVerification.id, sourceVerificationId);
+            if (await stopForEvaluatorError(reVerification)) {
+              return { success: false, verdict: reVerification.verdict };
+            }
 
             // 스톨(비수렴) 조기 종료 — 이슈 셋(severity|file|line)이 직전 라운드와 동일하면
             // fix 가 그 이슈를 못 없앤 것(외부 blocker·수렴 불가). MAX_NO_PROGRESS_ROUNDS 연속
@@ -1249,7 +1614,7 @@ Fix ONLY these issues. Do not modify other code.
               if (sig && sig === prevIssueSig) {
                 noProgressRounds++;
                 if (noProgressRounds >= MAX_NO_PROGRESS_ROUNDS) {
-                  log.warn(`Auto-fix 스톨 감지 — 이슈 셋이 ${noProgressRounds + 1}라운드 연속 동일(비수렴), round ${round}/${MAX_FIX_ROUNDS} 에서 조기 escalate: ${task.title}`);
+                  log.warn(`Auto-fix 스톨 감지 — 이슈 셋이 ${noProgressRounds + 1}라운드 연속 동일(비수렴), round ${round}/${effectiveMaxRounds} 에서 조기 escalate: ${task.title}`);
                   break;
                 }
               } else {
@@ -1261,24 +1626,58 @@ Fix ONLY these issues. Do not modify other code.
         }
 
         // Auto-fix 루프 이후 처리 (초기 pass면 이 블록 스킵하고 아래 정상 경로로).
-        if (verification.verdict === "fail" && opts.autoFix && opts.maxFixRetries > 0) {
+        if (autoFixEligible) {
           // Update task status based on re-verification result
           const rePass = reVerification.verdict === "pass" || reVerification.verdict === "conditional";
 
-          // 1 self-heal(위 fix) 후에도 fail → goal-as-unit은 cap 안 기다리고 즉시 완료+goal-QA 이월
-          // (blocked→scheduler cross-cycle 재픽 무한검토 루프 차단). 비-goal은 이월 대상 QA가 없어 기존대로 blocked.
+          // maxFixRetries 라운드를 다 쓰고도 fail → goal-as-unit은 자동完료 대신 사람 승인 게이트로
+          // 넘긴다(미해결 실패를 조용히 done 처리하지 않는다). 비-goal은 기존대로 blocked.
           if (!rePass) {
             if (isGoalAsUnit) {
               const { dropCheckpoint } = await import("../project/worktree.js");
               dropCheckpoint(effectiveWorkdir, task.id);
-              escalateVerificationCap(db, broadcast, task, reVerification.issues ?? []);
-              if (task.goal_id) {
-                await checkAndTriggerGoalSquash(db, broadcast, sessionManager, task.goal_id, effectiveWorkdir);
-              }
-              return { success: true, verdict: reVerification.verdict };
+              db.prepare("UPDATE verifications SET termination_reason = 'fix_round_limit' WHERE id = ?")
+                .run(reVerification.id);
+              transitionTask(db, broadcast, task, "pending_approval");
+              db.prepare(`
+                INSERT INTO activities (project_id, type, message, metadata)
+                VALUES (?, 'verification_manual_approval', ?, ?)
+              `).run(
+                task.project_id,
+                `Fix round limit reached (${effectiveMaxRounds}) — manual approval required: ${task.title}`,
+                JSON.stringify({
+                  taskId,
+                  sourceVerificationId: reVerification.id,
+                  status: "manual_approval",
+                  reason: "fix_round_limit",
+                }),
+              );
+              return { success: false, verdict: "conditional" };
             }
             transitionTask(db, broadcast, task, "blocked");
             return { success: false, verdict: reVerification.verdict };
+          }
+
+          // goal-as-unit에서 conditional 재검증은 "통과"가 아니라 "사람 판단 필요" — 자동 done/squash 금지.
+          // termination_reason은 이미 evaluator가 저장 시점에 'conditional'로 기록했으므로 덮어쓰지 않는다.
+          if (isGoalAsUnit && reVerification.verdict === "conditional") {
+            const { dropCheckpoint } = await import("../project/worktree.js");
+            dropCheckpoint(effectiveWorkdir, task.id);
+            transitionTask(db, broadcast, task, "pending_approval");
+            db.prepare(`
+              INSERT INTO activities (project_id, type, message, metadata)
+              VALUES (?, 'verification_manual_approval', ?, ?)
+            `).run(
+              task.project_id,
+              `Verification returned conditional — manual approval required: ${task.title}`,
+              JSON.stringify({
+                taskId,
+                sourceVerificationId: reVerification.id,
+                status: "manual_approval",
+                reason: "conditional",
+              }),
+            );
+            return { success: false, verdict: "conditional" };
           }
 
           if (rePass) {
@@ -1322,6 +1721,28 @@ Fix ONLY these issues. Do not modify other code.
         // Update task status based on verification result
         // pass + conditional → done, fail → blocked
         const passed = verification.verdict === "pass" || verification.verdict === "conditional";
+
+        // goal-as-unit에서 conditional 판정은 "통과"가 아니라 "사람 판단 필요" — 자동 done/squash 금지.
+        // termination_reason은 이미 evaluator가 저장 시점에 'conditional'로 기록했으므로 덮어쓰지 않는다.
+        if (isGoalAsUnit && verification.verdict === "conditional") {
+          const { dropCheckpoint } = await import("../project/worktree.js");
+          dropCheckpoint(effectiveWorkdir, task.id);
+          transitionTask(db, broadcast, task, "pending_approval");
+          db.prepare(`
+            INSERT INTO activities (project_id, type, message, metadata)
+            VALUES (?, 'verification_manual_approval', ?, ?)
+          `).run(
+            task.project_id,
+            `Verification returned conditional — manual approval required: ${task.title}`,
+            JSON.stringify({
+              taskId,
+              sourceVerificationId: verification.id,
+              status: "manual_approval",
+              reason: "conditional",
+            }),
+          );
+          return { success: false, verdict: "conditional" };
+        }
 
         if (passed) {
           if (isGoalAsUnit) {

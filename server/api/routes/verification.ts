@@ -3,6 +3,10 @@ import type { AppContext } from "../../index.js";
 import { normalizeSeverity } from "../../utils/severity.js";
 import { loadProviderConfig } from "../../core/agent/provider.js";
 import { serializeTask, selectTaskForResponse } from "./tasks.js";
+import { flushVerificationBroadcastOutbox } from "../../core/quality-gate/outbox.js";
+import { createFixTasksFromVerification } from "../../core/orchestration/engine.js";
+
+const MANUAL_APPROVAL_ASSIGNEE = "__manual_approval__";
 
 export function createVerificationRoutes(ctx: AppContext): Router {
   const router = Router();
@@ -80,7 +84,16 @@ export function createVerificationRoutes(ctx: AppContext): Router {
 
   // Create verification result
   router.post("/", (req, res) => {
-    const { task_id, verdict, scope = "standard", dimensions, issues = [], severity, evaluator_session_id } = req.body;
+    const {
+      task_id,
+      verdict,
+      scope = "standard",
+      dimensions,
+      issues = [],
+      severity,
+      evaluator_session_id,
+      implementation_session_id,
+    } = req.body;
 
     if (!task_id || !verdict) {
       return res.status(400).json({ error: "task_id and verdict are required" });
@@ -92,109 +105,150 @@ export function createVerificationRoutes(ctx: AppContext): Router {
     const normScope = ["lite", "standard", "full"].includes(scope) ? scope : "standard";
     const normSeverity = normalizeSeverity(severity, normVerdict);
 
-    const result = db.prepare(`
-      INSERT INTO verifications (task_id, verdict, scope, dimensions, issues, severity, evaluator_session_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      task_id,
-      normVerdict,
-      normScope,
-      JSON.stringify(dimensions ?? {}),
-      JSON.stringify(issues),
-      normSeverity,
-      evaluator_session_id ?? null,
-    );
-
-    const verification = db.prepare("SELECT * FROM verifications WHERE rowid = ?").get(result.lastInsertRowid) as any;
-
-    // Update task with verification result
-    db.prepare("UPDATE tasks SET verification_id = ?, updated_at = datetime('now') WHERE id = ?")
-      .run(verification.id, task_id);
-
-    // If hard-block, set task to blocked + broadcast task status change
-    if (normSeverity === "hard-block") {
-      db.prepare("UPDATE tasks SET status = 'blocked', updated_at = datetime('now') WHERE id = ?")
-        .run(task_id);
-      const blockedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task_id) as any;
-      if (blockedTask) broadcast("task:updated", blockedTask);
-    }
-
-    // Log activity
-    const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task_id) as any;
-    if (task) {
-      db.prepare(`
-        INSERT INTO activities (project_id, type, message, metadata)
-        VALUES (?, ?, ?, ?)
+    // verification/task/activity 저장 + outbox 등록을 하나의 트랜잭션으로 묶는다 —
+    // 도중에 실패하면(예: activities INSERT 실패) 전부 롤백되어 verification만
+    // 남는 부분 저장 상태를 방지한다. WebSocket 발행은 커밋 후 outbox로 최소 1회 보장.
+    let blockedTask: any = null;
+    const persist = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO verifications (
+          task_id, verdict, scope, dimensions, issues, severity,
+          evaluator_session_id, implementation_session_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
-        task.project_id,
-        normVerdict === "pass" ? "verification_pass" : "verification_fail",
-        `Task "${task.title}" verification: ${normVerdict.toUpperCase()}`,
-        JSON.stringify({ taskId: task_id, verdict: normVerdict, severity: normSeverity }),
+        task_id,
+        normVerdict,
+        normScope,
+        JSON.stringify(dimensions ?? {}),
+        JSON.stringify(issues),
+        normSeverity,
+        evaluator_session_id ?? null,
+        implementation_session_id ?? null,
       );
-    }
 
-    let parsedDimensions: unknown = {};
-    let parsedIssues: unknown[] = [];
-    try { parsedDimensions = JSON.parse(verification.dimensions); } catch { /* invalid JSON */ }
-    try {
-      const p = JSON.parse(verification.issues);
-      parsedIssues = Array.isArray(p) ? p : [];
-    } catch { /* invalid JSON */ }
+      const verification = db.prepare("SELECT * FROM verifications WHERE rowid = ?").get(result.lastInsertRowid) as any;
 
-    const payload = { ...verification, dimensions: parsedDimensions, issues: parsedIssues };
-    broadcast("verification:result", payload);
+      const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task_id) as any;
+      const insertIssue = db.prepare(`
+        INSERT INTO verification_issues (
+          verification_id, dimension, severity, evidence, repro_command,
+          expected_result, actual_result, fix_instruction, assignee_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const issue of Array.isArray(issues) ? issues : []) {
+        const evidence = issue.evidence ?? issue.message;
+        const reproCommand = issue.repro_command ?? issue.reproCommand;
+        const expectedResult = issue.expected_result ?? issue.expectedResult;
+        const actualResult = issue.actual_result ?? issue.actualResult;
+        const fixInstruction = issue.fix_instruction ?? issue.fixInstruction;
+        // verification_issues.assignee_id is a deliberate soft reference. Preserve a
+        // structurally valid issue even when no agent can be resolved; fix-task
+        // conversion turns this sentinel into an unassigned pending-approval task.
+        const assigneeId = issue.assignee_id ?? issue.assigneeId ?? task?.assignee_id ?? MANUAL_APPROVAL_ASSIGNEE;
+        if (!issue.dimension || !evidence || !reproCommand || !expectedResult ||
+            !actualResult || !fixInstruction) continue;
+        insertIssue.run(
+          verification.id,
+          issue.dimension,
+          issue.severity,
+          evidence,
+          reproCommand,
+          expectedResult,
+          actualResult,
+          fixInstruction,
+          assigneeId,
+        );
+      }
+
+      // Update task with verification result
+      db.prepare("UPDATE tasks SET verification_id = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(verification.id, task_id);
+
+      // If hard-block, set task to blocked
+      if (normSeverity === "hard-block") {
+        db.prepare("UPDATE tasks SET status = 'blocked', updated_at = datetime('now') WHERE id = ?")
+          .run(task_id);
+        blockedTask = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task_id) as any;
+      }
+
+      // Log activity
+      if (task) {
+        db.prepare(`
+          INSERT INTO activities (project_id, type, message, metadata)
+          VALUES (?, ?, ?, ?)
+        `).run(
+          task.project_id,
+          normVerdict === "pass" ? "verification_pass" : "verification_fail",
+          `Task "${task.title}" verification: ${normVerdict.toUpperCase()}`,
+          JSON.stringify({ taskId: task_id, verdict: normVerdict, severity: normSeverity }),
+        );
+      }
+
+      let parsedDimensions: unknown = {};
+      let parsedIssues: unknown[] = [];
+      try { parsedDimensions = JSON.parse(verification.dimensions); } catch { /* invalid JSON */ }
+      try {
+        const p = JSON.parse(verification.issues);
+        parsedIssues = Array.isArray(p) ? p : [];
+      } catch { /* invalid JSON */ }
+
+      const payload = { ...verification, dimensions: parsedDimensions, issues: parsedIssues };
+      db.prepare(`
+        INSERT INTO verification_broadcast_outbox (verification_id, event_type, payload)
+        VALUES (?, 'verification:result', ?)
+      `).run(verification.id, JSON.stringify(payload));
+
+      return payload;
+    });
+
+    const payload = persist();
+
+    if (blockedTask) broadcast("task:updated", blockedTask);
+    flushVerificationBroadcastOutbox(db, broadcast);
+
     res.status(201).json(payload);
   });
 
-  // Create a fix task from a failed verification
+  // Create one fix task per normalized issue from a failed verification
   router.post("/:id/create-fix-task", (req, res) => {
     const { id } = req.params;
 
-    const verification = db.prepare("SELECT * FROM verifications WHERE id = ?").get(id) as any;
+    const verification = db.prepare("SELECT id, verdict FROM verifications WHERE id = ?").get(id) as {
+      id: string;
+      verdict: string;
+    } | undefined;
     if (!verification) return res.status(404).json({ error: "Verification not found" });
-
-    const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(verification.task_id) as any;
-    if (!task) return res.status(404).json({ error: "Original task not found" });
-
-    let issues: any[] = [];
-    try {
-      issues = JSON.parse(verification.issues);
-    } catch {
-      // fallback to empty
+    if (verification.verdict !== "fail") {
+      return res.status(409).json({ error: "Fix tasks can only be created from a failed verification" });
     }
 
-    const issueSummary = issues.length > 0
-      ? issues.map((i: any) => i.message ?? String(i)).join("; ").slice(0, 120)
-      : "verification issues";
+    try {
+      const conversion = createFixTasksFromVerification(db, id);
+      if (conversion.fixTasks.length === 0) {
+        return res.status(422).json({ error: "Verification has no valid normalized issues" });
+      }
 
-    const title = `Fix: ${issueSummary}`;
-    const description = issues.length > 0
-      ? `Issues found during verification of "${task.title}":\n\n` +
-        issues.map((i: any) =>
-          `- [${i.severity ?? "issue"}] ${i.file ? `${i.file}:${i.line ?? ""} — ` : ""}${i.message ?? i}${i.suggestion ? `\n  Suggestion: ${i.suggestion}` : ""}`,
-        ).join("\n")
-      : `Fix issues found in task "${task.title}".`;
+      const globalDefault = loadProviderConfig().defaultProvider;
+      const fixTasks = conversion.fixTasks.map((fixTask) => {
+        const row = selectTaskForResponse(db, fixTask.taskId);
+        if (!row) throw new Error(`Created fix task ${fixTask.taskId} not found`);
+        const serialized = serializeTask(row, globalDefault);
+        if (fixTask.created) broadcast("task:updated", { ...serialized, action: "created" });
+        return serialized;
+      });
 
-    const result = db.prepare(`
-      INSERT INTO tasks (goal_id, project_id, title, description, assignee_id, status)
-      VALUES (?, ?, ?, ?, ?, 'todo')
-    `).run(task.goal_id, task.project_id, title, description, task.assignee_id ?? null);
-
-    const inserted = db.prepare("SELECT id FROM tasks WHERE rowid = ?").get(result.lastInsertRowid) as { id: string };
-    const newTask = serializeTask(selectTaskForResponse(db, inserted.id)!, loadProviderConfig().defaultProvider);
-
-    broadcast("task:updated", { ...newTask, action: "created" });
-
-    db.prepare(`
-      INSERT INTO activities (project_id, type, message, metadata)
-      VALUES (?, 'task_created', ?, ?)
-    `).run(
-      task.project_id,
-      `Fix task created: "${title}"`,
-      JSON.stringify({ sourceVerificationId: id, sourceTaskId: task.id }),
-    );
-
-    res.status(201).json(newTask);
+      res.status(201).json({
+        verification_id: id,
+        status: conversion.manualApprovalRequired ? "manual_approval" : "fixing",
+        fix_tasks: fixTasks,
+        issue_task_mappings: conversion.fixTasks.map((fixTask) => ({
+          issue_id: fixTask.issueId,
+          fix_task_id: fixTask.taskId,
+        })),
+      });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
   });
 
   return router;

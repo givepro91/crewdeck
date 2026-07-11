@@ -7,7 +7,7 @@
  * - type: "result" — final result text + usage + cost
  * - type: "tool_use" / "tool_result" — tool calls
  */
-import { parseCodexJson } from "./codex-stream-parser.js";
+import { parseCodexJson } from "../codex-stream-parser.js";
 
 export interface UsageInfo {
   inputTokens: number;
@@ -211,4 +211,84 @@ export function parseStreamJson(rawOutput: string): ParsedStreamOutput {
  */
 export function parseAgentOutput(rawOutput: string, provider: "claude" | "codex"): ParsedStreamOutput {
   return provider === "codex" ? parseCodexJson(rawOutput) : parseStreamJson(rawOutput);
+}
+
+/**
+ * `from` 이후 첫 `{` 부터 짝이 맞는 `}` 까지의 JSON 객체 substring 을 스캔한다.
+ * 문자열 리터럴(escape 포함) 안의 `{` `}` 와 백틱은 무시하므로, 펜스나 코드
+ * 스니펫이 문자열 필드 안에 박혀도 잘리지 않는다. 균형이 맞지 않으면 null.
+ */
+function scanBalancedObject(
+  text: string,
+  from: number,
+): { json: string; start: number } | null {
+  const start = text.indexOf("{", from);
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    } else if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) return { json: text.slice(start, i + 1), start };
+    }
+  }
+  return null;
+}
+
+/**
+ * 에이전트 텍스트 응답에서 구조화 JSON 블록을 추출한다 (provider 무관).
+ *
+ * Quality Gate evaluator 처럼 구조화 출력을 요구하는 소비자가 재사용한다.
+ * ` ```json ` 펜스 블록을 우선하고, 없으면 `"verdict"` 를 포함한 최상위 객체를
+ * 탐지한다. 어느 쪽도 없으면 null — 소비자가 파싱 실패로 처리한다.
+ *
+ * 추출은 정규식 대신 문자열-인식 brace 밸런싱으로 한다. 과거 non-greedy 펜스
+ * 정규식은 evaluator 가 fixInstruction/reproCommand 같은 문자열 필드에 코드 펜스
+ * (```bash …```)를 넣으면 그 안쪽 첫 ``` 에서 JSON 을 잘라 "evaluator did not
+ * return valid JSON" 파싱 실패를 유발했다.
+ */
+export function extractJsonBlock(text: string): string | null {
+  if (!text) return null;
+
+  const candidates: string[] = [];
+
+  // 1) ```json 펜스가 있으면 그 뒤 첫 균형 객체를 우선한다.
+  const fenceIdx = text.indexOf("```json");
+  if (fenceIdx !== -1) {
+    const obj = scanBalancedObject(text, fenceIdx + "```json".length);
+    if (obj) candidates.push(obj.json);
+  }
+
+  // 2) 폴백: "verdict" 를 포함한 첫 균형 객체.
+  for (let from = 0; ; ) {
+    const obj = scanBalancedObject(text, from);
+    if (!obj) break;
+    if (obj.json.includes('"verdict"')) {
+      candidates.push(obj.json);
+      break;
+    }
+    from = obj.start + 1;
+  }
+
+  // 파싱 가능한 첫 후보를 우선 반환. 없으면 첫 후보(best-effort — 소비자가 실제
+  // 파싱 오류를 표면화), 후보도 없으면 null.
+  for (const c of candidates) {
+    try {
+      JSON.parse(c);
+      return c;
+    } catch {
+      /* 다음 후보 시도 */
+    }
+  }
+  return candidates[0] ?? null;
 }

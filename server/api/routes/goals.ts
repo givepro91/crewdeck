@@ -396,6 +396,253 @@ export function createGoalRoutes(ctx: AppContext): Router {
     res.json(response);
   });
 
+  router.get("/:goalId/verification-timeline", (req, res) => {
+    const goalId = req.params.goalId;
+    const goal = db.prepare("SELECT id FROM goals WHERE id = ?").get(goalId) as { id: string } | undefined;
+    if (!goal) return res.status(404).json({ error: "Goal not found" });
+
+    const verifications = db.prepare(`
+      SELECT v.id, v.task_id, t.title AS task_title, v.verdict, v.scope, v.severity,
+             v.dimensions, v.termination_reason, v.evaluator_session_id,
+             v.implementation_session_id, v.created_at
+      FROM verifications v
+      JOIN tasks t ON t.id = v.task_id
+      WHERE t.goal_id = ?
+      ORDER BY v.created_at ASC, v.rowid ASC
+    `).all(goalId) as any[];
+
+    const judgementStmt = db.prepare(
+      "SELECT dimension, verdict, evidence FROM verification_dimension_judgements WHERE verification_id = ?",
+    );
+    const issueStmt = db.prepare(`
+      SELECT vi.id, vi.dimension, vi.severity, vi.evidence, vi.repro_command,
+             vi.expected_result, vi.actual_result, vi.fix_instruction, vi.assignee_id,
+             (SELECT vit.task_id FROM verification_issue_tasks vit
+               WHERE vit.issue_id = vi.id AND vit.relation = 'fix'
+               ORDER BY vit.rowid ASC LIMIT 1) AS fix_task_id
+      FROM verification_issues vi WHERE vi.verification_id = ?
+      ORDER BY vi.rowid ASC
+    `);
+    const fixRoundStmt = db.prepare(`
+      SELECT session_id, runtime_session_id, status
+      FROM verification_fix_rounds WHERE source_verification_id = ? ORDER BY round_number ASC
+    `);
+
+    const dimensionNames = ["functionality", "dataFlow", "designAlignment", "craft", "edgeCases"];
+    const severityForContract = (severity: string): string => {
+      if (severity === "warning") return "medium";
+      if (severity === "info") return "low";
+      return severity;
+    };
+    // round.verdict 계약 enum: pass|fail|stopped|manual_approval (DB verdict은 pass|conditional|fail만 가능)
+    const verdictForContract = (verdict: string): string =>
+      verdict === "conditional" ? "manual_approval" : verdict;
+    const parseDimensions = (raw: string): Record<string, { value?: number; notes?: string }> => {
+      try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+      } catch {
+        return {};
+      }
+    };
+
+    const sourceRounds = verifications.map((verification) => ({
+      verification,
+      judgements: judgementStmt.all(verification.id) as Array<{
+        dimension: string;
+        verdict: "pass" | "fail" | "not_applicable";
+        evidence: string;
+      }>,
+      issues: issueStmt.all(verification.id) as Array<{
+        id: string;
+        dimension: string;
+        severity: string;
+        evidence: string;
+        repro_command: string;
+        expected_result: string;
+        actual_result: string;
+        fix_instruction: string;
+        assignee_id: string;
+        fix_task_id: string | null;
+      }>,
+      fixRounds: fixRoundStmt.all(verification.id) as Array<{
+        session_id: string | null;
+        runtime_session_id: string | null;
+        status: string;
+      }>,
+    }));
+
+    // evidence는 Evaluator가 매 라운드 자유서술로 재작성하므로 fingerprint에 넣지 않는다 —
+    // 같은 이슈라도 문구가 달라지면 다른 이슈로 오인해 resolved/regression 판정이 뒤집힌다.
+    const issueFingerprint = (issue: { dimension: string; repro_command: string }): string =>
+      JSON.stringify([issue.dimension, issue.repro_command.trim()]);
+    // issue lifecycle(resolved/regression)은 한 task의 fix 루프 안에서만 의미가 있다.
+    // goal에 여러 task가 있으면 verification이 created_at으로 뒤섞이므로, task별로 라운드
+    // 순번을 매기고 occurrence도 task 단위로 분리해야 한다 — 그러지 않으면 다른 task의 뒤
+    // 라운드(예: PASS)가 이전 task의 미해결 실패를 resolved로 오판한다.
+    const taskRoundIndex = new Map<string, number>();
+    const taskRoundCount = new Map<string, number>();
+    sourceRounds.forEach((round) => {
+      const taskId = round.verification.task_id;
+      const index = taskRoundCount.get(taskId) ?? 0;
+      taskRoundIndex.set(round.verification.id, index);
+      taskRoundCount.set(taskId, index + 1);
+    });
+    const occurrenceKey = (taskId: string, issue: { dimension: string; repro_command: string }): string =>
+      `${taskId}::${issueFingerprint(issue)}`;
+    const occurrences = new Map<string, number[]>();
+    sourceRounds.forEach((round) => {
+      const taskIndex = taskRoundIndex.get(round.verification.id) ?? 0;
+      for (const issue of round.issues) {
+        const key = occurrenceKey(round.verification.task_id, issue);
+        const indexes = occurrences.get(key) ?? [];
+        indexes.push(taskIndex);
+        occurrences.set(key, indexes);
+      }
+    });
+
+    const rounds = sourceRounds.map((roundData, roundIndex) => {
+      const { verification } = roundData;
+      // 이 라운드가 속한 task 안에서의 순번/총 라운드 수 — lifecycle 판정은 이 task 기준.
+      const taskIndex = taskRoundIndex.get(verification.id) ?? 0;
+      const taskTotal = taskRoundCount.get(verification.task_id) ?? 1;
+      const scores = parseDimensions(verification.dimensions);
+      const judgementByDimension = new Map(roundData.judgements.map((item) => [item.dimension, item]));
+      const dimensions = dimensionNames.map((dimension) => {
+        const judgement = judgementByDimension.get(dimension);
+        const storedScore = scores[dimension];
+        const score = typeof storedScore?.value === "number"
+          ? storedScore.value
+          : judgement?.verdict === "pass" ? 10 : 0;
+        return {
+          dimension,
+          score,
+          passed: judgement ? judgement.verdict !== "fail" : score >= 7,
+          rationale: judgement?.evidence ?? storedScore?.notes ?? "",
+        };
+      });
+
+      const issues = roundData.issues.map((issue) => {
+        const indexes = occurrences.get(occurrenceKey(verification.task_id, issue)) ?? [];
+        const previousIndex = [...indexes].reverse().find((index) => index < taskIndex);
+        const nextIndex = indexes.find((index) => index > taskIndex);
+        // round 0(task 최초 검증)은 회귀할 이전 상태가 없어 무조건 open. round 0 이후에는
+        // 이전 라운드에 없던 이슈(previousIndex undefined)도 fix가 만든 새 실패이므로 regression —
+        // 재발(같은 fingerprint가 사라졌다 돌아옴)만 regression인 게 아니다.
+        const regressed = taskIndex > 0 && (previousIndex === undefined || previousIndex < taskIndex - 1);
+        const status = regressed
+          ? "regression"
+          : (nextIndex === undefined && taskIndex < taskTotal - 1)
+              || (nextIndex !== undefined && nextIndex > taskIndex + 1)
+            ? "resolved"
+            : "open";
+        return {
+          issue_id: issue.id,
+          status,
+          dimension: issue.dimension,
+          severity: severityForContract(issue.severity),
+          evidence: issue.evidence,
+          repro_command: issue.repro_command,
+          expected_result: issue.expected_result,
+          actual_result: issue.actual_result,
+          fix_instruction: issue.fix_instruction,
+          assignee_id: issue.assignee_id,
+          fix_task_id: issue.fix_task_id,
+        };
+      });
+
+      return {
+        round: roundIndex + 1,
+        verification_id: verification.id,
+        task_id: verification.task_id,
+        task_title: verification.task_title,
+        verdict: verdictForContract(verification.verdict),
+        reason: verification.termination_reason,
+        scope: verification.scope,
+        severity: verification.severity,
+        implementation_session_id: verification.implementation_session_id ?? "",
+        evaluator_session_id: verification.evaluator_session_id ?? "",
+        fix_session_ids: [...new Set(roundData.fixRounds
+          .map((fixRound) => fixRound.runtime_session_id ?? fixRound.session_id)
+          .filter((sessionId): sessionId is string => Boolean(sessionId)))],
+        dimensions,
+        issues,
+        created_at: verification.created_at,
+      };
+    });
+
+    if (sourceRounds.length === 0) {
+      // 아직 검증이 없음 — 계약 enum(passed|fixing|stopped|manual_approval) 밖의 "pending"은 쓸 수 없다.
+      // fix 루프가 진행 중도 아니고 승인 대기도 아니므로 "stopped"(진행 정지 상태)로 표현한다.
+      return res.json({ goal_id: goalId, status: "stopped", reason: "no_verifications", rounds: [] });
+    }
+
+    // goal status는 각 task의 "최신 검증"을 종합한다. 다른 task가 나중에 PASS해도
+    // 통과하지 못한 task가 하나라도 있으면 goal은 passed가 아니다 — task마다 fix 루프가
+    // 독립이라, 마지막 verification 하나로 goal 전체를 판정하면 다른 task의 PASS가 미해결
+    // 실패를 덮어버린다. failing task가 있으면 그중 가장 최근 것을, 없으면 goal 전체의
+    // 최신 검증을 대표(governing)로 status/reason을 계산한다. (sourceRounds는
+    // created_at ASC, rowid ASC 정렬이므로 index가 클수록 최신)
+    const latestIndexByTask = new Map<string, number>();
+    sourceRounds.forEach((round, index) => {
+      latestIndexByTask.set(round.verification.task_id, index);
+    });
+    const taskLatestIndexes = [...latestIndexByTask.values()];
+    const failingLatestIndexes = taskLatestIndexes.filter(
+      (index) => sourceRounds[index].verification.verdict !== "pass",
+    );
+    const governingIndex = Math.max(
+      ...(failingLatestIndexes.length > 0 ? failingLatestIndexes : taskLatestIndexes),
+    );
+    const latest = sourceRounds[governingIndex];
+    const latestVerification = latest.verification;
+    const fixInProgress = latest.fixRounds.some((fixRound) =>
+      fixRound.status === "pending" || fixRound.status === "running",
+    );
+    const fixAssigneeApproval = db.prepare(`
+      SELECT 1
+      FROM verification_issues vi
+      JOIN verification_issue_tasks vit ON vit.issue_id = vi.id AND vit.relation = 'fix'
+      JOIN tasks fix_task ON fix_task.id = vit.task_id
+      WHERE vi.verification_id = ?
+        AND fix_task.status = 'pending_approval'
+        AND fix_task.assignee_id IS NULL
+      LIMIT 1
+    `).get(latestVerification.id) !== undefined;
+    const status = latestVerification.verdict === "pass"
+      ? "passed"
+      : latestVerification.verdict === "conditional" || fixAssigneeApproval
+        ? "manual_approval"
+        : fixInProgress ? "fixing" : "stopped";
+    const reason = status === "fixing"
+      ? "auto_fix_in_progress"
+      : fixAssigneeApproval
+        ? "fix_assignee_unavailable"
+      : latestVerification.termination_reason
+        ?? (latestVerification.verdict === "pass" ? "passed"
+          : latestVerification.verdict === "conditional" ? "conditional" : "verification_failed");
+
+    // 미검증 sibling task 누락 방지: governing 로직은 verification이 있는 task만 종합하므로,
+    // 순차 실행 중 아직 검증 전인 형제 task(status todo/in_progress 등, verification 없음)가
+    // 남아 있어도 먼저 통과한 task 하나로 goal 전체가 passed로 표시된다. 검증되지 않은 미완료
+    // task가 하나라도 있으면 goal 커버리지가 불완전하므로 passed로 볼 수 없다 — 검증 기록이
+    // 전혀 없을 때(no_verifications)와 같은 "진행 정지" 버킷(stopped)으로 표현한다.
+    const unverifiedPending = db.prepare(`
+      SELECT COUNT(*) AS count FROM tasks t
+      WHERE t.goal_id = ? AND t.parent_task_id IS NULL
+        AND t.status IN ('todo', 'in_progress', 'in_review', 'pending_approval', 'blocked')
+        AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.task_id = t.id)
+    `).get(goalId) as { count: number };
+    const incompleteCoverage = status === "passed" && unverifiedPending.count > 0;
+
+    res.json({
+      goal_id: goalId,
+      status: incompleteCoverage ? "stopped" : status,
+      reason: incompleteCoverage ? "verification_incomplete" : reason,
+      rounds,
+    });
+  });
+
   // Create goal — triggers autopilot if enabled
   router.post("/", (req, res) => {
     const { project_id, title, description, priority = "medium", references, skip_adversarial, acceptance_script, source_material } = req.body;

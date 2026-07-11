@@ -150,6 +150,28 @@ describe("buildReverifyContext — 재검증 프롬프트 정책", () => {
     const ctx = buildReverifyContext([{ issues: "not-json{", created_at: "2026-07-08" }]);
     expect(ctx).toContain("not-json{");
   });
+
+  it("이전 이슈의 reproCommand/expectedResult/actualResult를 재검증 세션에 그대로 전달한다", () => {
+    const reproCommand = `npm test -- ${"long-filter-".repeat(24)}`;
+    const ctx = buildReverifyContext([
+      {
+        issues: JSON.stringify([{
+          severity: "high",
+          file: "src/App.tsx",
+          line: 543,
+          message: "ESC 누수",
+          reproCommand,
+          expectedResult: "오류 응답 반환",
+          actualResult: "TypeError 발생",
+        }]),
+        created_at: "2026-07-08 10:20:29",
+      },
+    ]);
+    expect(reproCommand.length).toBeGreaterThan(200);
+    expect(ctx).toContain(reproCommand);
+    expect(ctx).toContain("오류 응답 반환");
+    expect(ctx).toContain("TypeError 발생");
+  });
 });
 
 /**

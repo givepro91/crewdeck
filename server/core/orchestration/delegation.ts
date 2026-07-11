@@ -326,8 +326,6 @@ Respond in this EXACT JSON format:
         try {
           log.info(`Parent task ${parentTaskId}: all subtasks done, running verification`);
           const verification = await parentVerifier.verify(parentTaskId, {});
-          broadcast("verification:result", verification);
-
           const passed = verification.verdict === "pass" || verification.verdict === "conditional";
 
           // 검증 라운드 상한: blocked 로 돌리지 않고 완료+이월 (무한 검토 방지 —

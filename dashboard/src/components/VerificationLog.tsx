@@ -85,7 +85,20 @@ export function VerificationLog({ projectId }: VerificationLogProps) {
   const [olderCount, setOlderCount] = useState(OLDER_PAGE_SIZE);
 
   useEffect(() => {
-    api.verifications.list(projectId).then(setVerifications);
+    let cancelled = false;
+    const load = () => {
+      api.verifications.list(projectId).then((data) => {
+        if (!cancelled) setVerifications(data);
+      });
+    };
+    load();
+    // verification:result 발행 시 즉시 재조회 — 새 판정(특히 실패)이 실시간으로 나타난다.
+    // mount 1회 조회만으로는 판정이 생겨도 화면에 반영되지 않던 버그를 고친다.
+    window.addEventListener("crewdeck:verification-result", load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("crewdeck:verification-result", load);
+    };
   }, [projectId]);
 
   const handleCreateFixTask = async (e: React.MouseEvent, verificationId: string) => {

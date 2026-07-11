@@ -93,7 +93,9 @@ export function migrate(db: Database.Database): void {
       issues TEXT NOT NULL DEFAULT '[]',     -- JSON array of issues
       severity TEXT NOT NULL DEFAULT 'auto-resolve' CHECK (severity IN ('auto-resolve', 'soft-block', 'hard-block')),
       evaluator_session_id TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      implementation_session_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      termination_reason TEXT CHECK (termination_reason IN ('passed', 'conditional', 'hard_blocked', 'auto_fix_disabled', 'fix_round_limit', 'escalated_to_goal_qa', 'evaluator_error'))
     );
 
     -- Agent Sessions (Claude Code CLI process tracking)
@@ -541,6 +543,103 @@ export function migrate(db: Database.Database): void {
   if (!projectColsLate.some((c) => c.name === "base_branch")) {
     db.exec("ALTER TABLE projects ADD COLUMN base_branch TEXT NOT NULL DEFAULT 'main'");
   }
+
+  // Quality Gate normalized records. Legacy dimensions/issues JSON remains untouched;
+  // rows are only created by the normalized write path once all required data is known.
+  const migrateQualityGateSchema = db.transaction(() => {
+    const verificationColumns = db.prepare("PRAGMA table_info(verifications)").all() as { name: string }[];
+    if (!verificationColumns.some((c) => c.name === "termination_reason")) {
+      db.exec(`
+        ALTER TABLE verifications ADD COLUMN termination_reason TEXT
+          CHECK (termination_reason IN ('passed', 'conditional', 'hard_blocked', 'auto_fix_disabled', 'fix_round_limit', 'escalated_to_goal_qa', 'evaluator_error'))
+      `);
+    }
+    if (!verificationColumns.some((c) => c.name === "implementation_session_id")) {
+      db.exec("ALTER TABLE verifications ADD COLUMN implementation_session_id TEXT");
+    }
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS verification_dimension_judgements (
+        verification_id TEXT NOT NULL REFERENCES verifications(id) ON DELETE CASCADE,
+        dimension TEXT NOT NULL CHECK (dimension IN ('functionality', 'dataFlow', 'designAlignment', 'craft', 'edgeCases')),
+        verdict TEXT NOT NULL CHECK (verdict IN ('pass', 'fail', 'not_applicable')),
+        evidence TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+        UNIQUE (verification_id, dimension)
+      );
+
+      CREATE TABLE IF NOT EXISTS verification_issues (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+        verification_id TEXT NOT NULL REFERENCES verifications(id) ON DELETE CASCADE,
+        dimension TEXT NOT NULL CHECK (dimension IN ('functionality', 'dataFlow', 'designAlignment', 'craft', 'edgeCases')),
+        severity TEXT NOT NULL CHECK (severity IN ('critical', 'high', 'warning', 'info')),
+        evidence TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+        repro_command TEXT NOT NULL CHECK (length(trim(repro_command)) > 0),
+        expected_result TEXT NOT NULL CHECK (length(trim(expected_result)) > 0),
+        actual_result TEXT NOT NULL CHECK (length(trim(actual_result)) > 0),
+        fix_instruction TEXT NOT NULL CHECK (length(trim(fix_instruction)) > 0),
+        assignee_id TEXT NOT NULL CHECK (length(trim(assignee_id)) > 0)
+      );
+
+      CREATE TABLE IF NOT EXISTS verification_fix_rounds (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        source_verification_id TEXT NOT NULL REFERENCES verifications(id) ON DELETE CASCADE,
+        result_verification_id TEXT REFERENCES verifications(id) ON DELETE SET NULL,
+        round_number INTEGER NOT NULL CHECK (round_number > 0),
+        assignee_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+        session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+        -- CLI runtime session id of the fix session. session_id는 sessions row id라
+        -- evaluator의 runtime session id와 절대 충돌하지 않는다 → 세션 재사용(맥락 누수)
+        -- 탐지에는 runtime id 비교가 필요하다.
+        runtime_session_id TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+        started_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (source_verification_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS verification_issue_tasks (
+        issue_id TEXT NOT NULL REFERENCES verification_issues(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        relation TEXT NOT NULL CHECK (relation IN ('source', 'fix', 'carryover')),
+        PRIMARY KEY (issue_id, task_id, relation)
+      );
+
+      CREATE TABLE IF NOT EXISTS verification_broadcast_outbox (
+        id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+        verification_id TEXT NOT NULL UNIQUE REFERENCES verifications(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL CHECK (event_type = 'verification:result'),
+        payload TEXT NOT NULL CHECK (json_valid(payload)),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        delivered_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_verification_dimension_judgements_verification
+        ON verification_dimension_judgements(verification_id);
+      CREATE INDEX IF NOT EXISTS idx_verification_issues_verification
+        ON verification_issues(verification_id);
+      CREATE INDEX IF NOT EXISTS idx_verification_fix_rounds_source_verification
+        ON verification_fix_rounds(source_verification_id);
+      CREATE INDEX IF NOT EXISTS idx_verification_fix_rounds_result_verification
+        ON verification_fix_rounds(result_verification_id);
+      CREATE INDEX IF NOT EXISTS idx_verification_fix_rounds_task_round
+        ON verification_fix_rounds(task_id, round_number);
+      CREATE INDEX IF NOT EXISTS idx_verification_issue_tasks_task_relation
+        ON verification_issue_tasks(task_id, relation);
+      CREATE INDEX IF NOT EXISTS idx_verification_broadcast_outbox_pending
+        ON verification_broadcast_outbox(delivered_at, created_at);
+    `);
+
+    // 기존 DB에 runtime_session_id 컬럼 backfill (CREATE TABLE IF NOT EXISTS는 no-op).
+    const fixRoundColumns = db.prepare("PRAGMA table_info(verification_fix_rounds)").all() as { name: string }[];
+    if (!fixRoundColumns.some((c) => c.name === "runtime_session_id")) {
+      db.exec("ALTER TABLE verification_fix_rounds ADD COLUMN runtime_session_id TEXT");
+    }
+  });
+  migrateQualityGateSchema();
 
 }
 

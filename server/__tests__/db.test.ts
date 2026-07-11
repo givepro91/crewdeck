@@ -27,6 +27,36 @@ describe('createDatabase + migrate', () => {
     expect(tableNames).toContain('verifications');
     expect(tableNames).toContain('sessions');
     expect(tableNames).toContain('activities');
+    expect(tableNames).toContain('verification_dimension_judgements');
+    expect(tableNames).toContain('verification_issues');
+    expect(tableNames).toContain('verification_fix_rounds');
+    expect(tableNames).toContain('verification_issue_tasks');
+    expect(tableNames).toContain('verification_broadcast_outbox');
+  });
+
+  it('creates the Quality Gate columns and indexes required by the timeline API', () => {
+    const db = createTestDb();
+    const verificationColumns = db
+      .prepare('PRAGMA table_info(verifications)')
+      .all() as { name: string }[];
+    const indexRows = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+      .all() as { name: string }[];
+
+    expect(verificationColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(['implementation_session_id', 'termination_reason']),
+    );
+    expect(indexRows.map((index) => index.name)).toEqual(
+      expect.arrayContaining([
+        'idx_verification_dimension_judgements_verification',
+        'idx_verification_issues_verification',
+        'idx_verification_fix_rounds_source_verification',
+        'idx_verification_fix_rounds_result_verification',
+        'idx_verification_fix_rounds_task_round',
+        'idx_verification_issue_tasks_task_relation',
+        'idx_verification_broadcast_outbox_pending',
+      ]),
+    );
   });
 
   it('migrate is idempotent (run twice, no error)', () => {
@@ -35,6 +65,54 @@ describe('createDatabase + migrate', () => {
       migrate(db);
       migrate(db);
     }).not.toThrow();
+  });
+
+  it('upgrades a legacy verification schema idempotently without losing rows', () => {
+    const db = createDatabase(':memory:');
+    migrate(db);
+    db.prepare(
+      "INSERT INTO projects (id, name, source) VALUES ('legacy-project', 'Legacy', 'new')",
+    ).run();
+    db.prepare(
+      "INSERT INTO goals (id, project_id, description) VALUES ('legacy-goal', 'legacy-project', 'Keep me')",
+    ).run();
+    db.prepare(
+      "INSERT INTO tasks (id, goal_id, project_id, title) VALUES ('legacy-task', 'legacy-goal', 'legacy-project', 'Keep me')",
+    ).run();
+    db.prepare(
+      "INSERT INTO verifications (id, task_id, verdict) VALUES ('legacy-verification', 'legacy-task', 'pass')",
+    ).run();
+
+    db.exec(`
+      DROP TABLE verification_broadcast_outbox;
+      DROP TABLE verification_issue_tasks;
+      DROP TABLE verification_fix_rounds;
+      DROP TABLE verification_issues;
+      DROP TABLE verification_dimension_judgements;
+      ALTER TABLE verifications DROP COLUMN termination_reason;
+      ALTER TABLE verifications DROP COLUMN implementation_session_id;
+    `);
+
+    expect(() => {
+      migrate(db);
+      migrate(db);
+    }).not.toThrow();
+
+    const verification = db
+      .prepare('SELECT id, task_id, verdict FROM verifications WHERE id = ?')
+      .get('legacy-verification');
+    const verificationColumns = db
+      .prepare('PRAGMA table_info(verifications)')
+      .all() as { name: string }[];
+
+    expect(verification).toEqual({
+      id: 'legacy-verification',
+      task_id: 'legacy-task',
+      verdict: 'pass',
+    });
+    expect(verificationColumns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(['implementation_session_id', 'termination_reason']),
+    );
   });
 });
 

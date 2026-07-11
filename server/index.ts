@@ -22,6 +22,7 @@ import { createFsRoutes } from "./api/routes/fs.js";
 import { createSessionRoutes } from "./api/routes/sessions.js";
 import { createWSHandler } from "./api/websocket.js";
 import { agentActivityLog } from "./core/agent/activity-log.js";
+import { flushVerificationBroadcastOutbox } from "./core/quality-gate/outbox.js";
 
 import { loadOrCreateApiKey, authMiddleware } from "./api/middleware/auth.js";
 import type { Database } from "better-sqlite3";
@@ -252,13 +253,17 @@ export async function startServer(config: ServerConfig): Promise<void> {
   // 연결을 항상 수락하되, 인증 여부를 태깅 — proxy EPIPE 방지
   const wss = new WebSocketServer({ server, path: "/ws" });
 
-  const broadcast = (event: string, data: unknown) => {
+  // 반환값 = 실제 전송에 성공한 인증된 client 수. quality-gate outbox가 이 수로
+  // "진짜 전달됐는지"를 판단한다 (0이면 아직 아무도 못 받은 것 — delivered 처리 금지).
+  const broadcast = (event: string, data: unknown): number => {
     const message = JSON.stringify({ type: event, payload: data, timestamp: new Date().toISOString() });
+    let sent = 0;
     for (const client of wss.clients) {
       if (client.readyState === 1 && (client as any).__authenticated) {
-        try { client.send(message); } catch { /* skip dead client */ }
+        try { client.send(message); sent++; } catch { /* skip dead client */ }
       }
     }
+    return sent;
   };
 
   const ctx: AppContext = { db, wss, broadcast };
@@ -270,7 +275,9 @@ export async function startServer(config: ServerConfig): Promise<void> {
   rebroadcastPendingApprovals(db, broadcast);
 
   // WebSocket handler
-  createWSHandler(wss, apiKey);
+  createWSHandler(wss, apiKey, () => {
+    flushVerificationBroadcastOutbox(db, broadcast);
+  });
 
   // API routes
   app.use("/api/projects", createProjectRoutes(ctx));

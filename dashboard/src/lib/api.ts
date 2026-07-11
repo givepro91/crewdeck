@@ -30,6 +30,55 @@ export interface GoalStatusResponse {
   activity_events: GoalActivityEvent[];
 }
 
+export type VerificationTimelineStatus = "passed" | "fixing" | "stopped" | "manual_approval";
+export type VerificationRoundVerdict = "pass" | "fail" | "stopped" | "manual_approval";
+export type VerificationIssueStatus = "open" | "resolved" | "regression";
+
+export interface VerificationTimelineDimension {
+  dimension: string;
+  score: number;
+  passed: boolean;
+  rationale: string;
+}
+
+export interface VerificationTimelineIssue {
+  issue_id: string;
+  status: VerificationIssueStatus;
+  dimension: string;
+  severity: string;
+  evidence: string;
+  repro_command: string;
+  expected_result: string;
+  actual_result: string;
+  fix_instruction: string;
+  assignee_id: string | null;
+  fix_task_id: string | null;
+}
+
+export interface VerificationTimelineRound {
+  round: number;
+  verification_id: string;
+  task_id: string;
+  task_title: string;
+  verdict: VerificationRoundVerdict;
+  reason: string | null;
+  scope: string;
+  severity: string;
+  implementation_session_id: string;
+  evaluator_session_id: string;
+  fix_session_ids: string[];
+  dimensions: VerificationTimelineDimension[];
+  issues: VerificationTimelineIssue[];
+  created_at: string;
+}
+
+export interface VerificationTimelineResponse {
+  goal_id: string;
+  status: VerificationTimelineStatus;
+  reason: string;
+  rounds: VerificationTimelineRound[];
+}
+
 // 대시보드 UI 언어 — AI 생성물(목표·팀 설계·mission 제안)을 이 언어로 만들도록 서버에 전달한다.
 // LanguageToggle이 localStorage("crewdeck-lang")에 저장하는 값과 동일 소스(i18n과 일치).
 function uiLang(): "ko" | "en" {
@@ -196,6 +245,8 @@ export const api = {
     delete: (id: string) => request<any>(`/goals/${id}`, { method: "DELETE" }),
     getSpec: (goalId: string) => request<any>(`/goals/${goalId}/spec`),
     getStatus: (goalId: string) => request<GoalStatusResponse>(`/goals/${goalId}/status`),
+    getVerificationTimeline: (goalId: string) =>
+      request<VerificationTimelineResponse>(`/goals/${goalId}/verification-timeline`),
     updateSpec: (goalId: string, data: any) =>
       request<any>(`/goals/${goalId}/spec`, { method: "PATCH", body: JSON.stringify(data) }),
     generateSpec: (goalId: string) =>

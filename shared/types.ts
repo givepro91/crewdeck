@@ -222,6 +222,19 @@ export interface Task {
 export type VerificationScope = "lite" | "standard" | "full";
 export type Severity = "auto-resolve" | "soft-block" | "hard-block";
 export type Verdict = "pass" | "conditional" | "fail";
+export type QualityGateDimension = "functionality" | "dataFlow" | "designAlignment" | "craft" | "edgeCases";
+export type DimensionVerdict = "pass" | "fail" | "not_applicable";
+export type IssueSeverity = "critical" | "high" | "warning" | "info";
+export type FixRoundStatus = "pending" | "running" | "completed" | "failed";
+export type IssueTaskRelation = "source" | "fix" | "carryover";
+export type VerificationTerminationReason =
+  | "passed"
+  | "conditional"
+  | "hard_blocked"
+  | "auto_fix_disabled"
+  | "fix_round_limit"
+  | "escalated_to_goal_qa"
+  | "evaluator_error";
 
 export interface Score {
   value: number; // 0-10
@@ -240,19 +253,69 @@ export interface VerificationResult {
     craft: Score;
     edgeCases: Score;
   };
+  /** Strict evaluator output; absent only for evaluator/session failures. */
+  dimensionJudgements?: Array<Omit<VerificationDimensionJudgement, "verificationId">>;
   issues: VerificationIssue[];
   severity: Severity;
   evaluatorSessionId: string;
+  /** Omitted by legacy/intermediate verification payloads; null until terminal. */
+  terminationReason?: VerificationTerminationReason | null;
   createdAt: string;
 }
 
+/** Legacy evaluator transport DTO. Normalized writes use QualityGateIssue. */
 export interface VerificationIssue {
   id: string;
-  severity: "critical" | "high" | "warning" | "info";
+  severity: IssueSeverity;
+  dimension?: QualityGateDimension;
   file?: string;
   line?: number;
   message: string;
+  reproCommand?: string;
+  expectedResult?: string;
+  actualResult?: string;
+  fixInstruction?: string;
   suggestion?: string;
+}
+
+export interface VerificationDimensionJudgement {
+  verificationId: string;
+  dimension: QualityGateDimension;
+  verdict: DimensionVerdict;
+  evidence: string;
+}
+
+export interface QualityGateIssue {
+  id: string;
+  verificationId: string;
+  dimension: QualityGateDimension;
+  severity: IssueSeverity;
+  evidence: string;
+  reproCommand: string;
+  expectedResult: string;
+  actualResult: string;
+  fixInstruction: string;
+  assigneeId: string;
+}
+
+export interface VerificationFixRound {
+  id: string;
+  taskId: string;
+  sourceVerificationId: string;
+  resultVerificationId: string | null;
+  roundNumber: number;
+  assigneeId: string | null;
+  sessionId: string | null;
+  status: FixRoundStatus;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
+export interface VerificationIssueTaskLink {
+  issueId: string;
+  taskId: string;
+  relation: IssueTaskRelation;
 }
 
 // ─── Goal Spec (Structured Planning) ─────────────────────

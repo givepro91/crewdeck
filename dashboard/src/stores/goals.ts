@@ -1,16 +1,26 @@
 import { create } from "zustand";
-import { api, type GoalActivityEvent, type GoalStatus, type GoalStatusResponse } from "../lib/api";
+import {
+  api,
+  type GoalActivityEvent,
+  type GoalStatus,
+  type GoalStatusResponse,
+  type VerificationTimelineResponse,
+} from "../lib/api";
 
-export type { GoalActivityEvent, GoalStatus, GoalStatusResponse };
+export type { GoalActivityEvent, GoalStatus, GoalStatusResponse, VerificationTimelineResponse };
 
 interface GoalStatusStore {
   byGoalId: Record<string, GoalStatusResponse | undefined>;
   loadingByGoalId: Record<string, boolean | undefined>;
   approvingByGoalId: Record<string, boolean | undefined>;
   errorByGoalId: Record<string, string | undefined>;
+  timelineByGoalId: Record<string, VerificationTimelineResponse | undefined>;
+  timelineLoadingByGoalId: Record<string, boolean | undefined>;
+  timelineErrorByGoalId: Record<string, string | undefined>;
   setGoalStatus: (status: GoalStatusResponse) => void;
   clearGoalStatus: (goalId: string) => void;
   fetchGoalStatus: (goalId: string) => Promise<GoalStatusResponse>;
+  fetchVerificationTimeline: (goalId: string) => Promise<VerificationTimelineResponse>;
   approveGoal: (goalId: string) => Promise<GoalStatusResponse>;
 }
 
@@ -25,6 +35,9 @@ export const useGoalStatusStore = create<GoalStatusStore>((set, get) => ({
   loadingByGoalId: {},
   approvingByGoalId: {},
   errorByGoalId: {},
+  timelineByGoalId: {},
+  timelineLoadingByGoalId: {},
+  timelineErrorByGoalId: {},
 
   setGoalStatus: (status) =>
     set((state) => ({
@@ -38,11 +51,25 @@ export const useGoalStatusStore = create<GoalStatusStore>((set, get) => ({
       const loadingByGoalId = { ...state.loadingByGoalId };
       const approvingByGoalId = { ...state.approvingByGoalId };
       const errorByGoalId = { ...state.errorByGoalId };
+      const timelineByGoalId = { ...state.timelineByGoalId };
+      const timelineLoadingByGoalId = { ...state.timelineLoadingByGoalId };
+      const timelineErrorByGoalId = { ...state.timelineErrorByGoalId };
       delete byGoalId[goalId];
       delete loadingByGoalId[goalId];
       delete approvingByGoalId[goalId];
       delete errorByGoalId[goalId];
-      return { byGoalId, loadingByGoalId, approvingByGoalId, errorByGoalId };
+      delete timelineByGoalId[goalId];
+      delete timelineLoadingByGoalId[goalId];
+      delete timelineErrorByGoalId[goalId];
+      return {
+        byGoalId,
+        loadingByGoalId,
+        approvingByGoalId,
+        errorByGoalId,
+        timelineByGoalId,
+        timelineLoadingByGoalId,
+        timelineErrorByGoalId,
+      };
     }),
 
   fetchGoalStatus: async (goalId) => {
@@ -63,6 +90,30 @@ export const useGoalStatusStore = create<GoalStatusStore>((set, get) => ({
     } finally {
       set((state) => ({
         loadingByGoalId: { ...state.loadingByGoalId, [goalId]: false },
+      }));
+    }
+  },
+
+  fetchVerificationTimeline: async (goalId) => {
+    set((state) => ({
+      timelineLoadingByGoalId: { ...state.timelineLoadingByGoalId, [goalId]: true },
+      timelineErrorByGoalId: { ...state.timelineErrorByGoalId, [goalId]: undefined },
+    }));
+    try {
+      const timeline = await api.goals.getVerificationTimeline(goalId);
+      set((state) => ({
+        timelineByGoalId: { ...state.timelineByGoalId, [goalId]: timeline },
+      }));
+      return timeline;
+    } catch (error) {
+      const message = getErrorMessage(error);
+      set((state) => ({
+        timelineErrorByGoalId: { ...state.timelineErrorByGoalId, [goalId]: message },
+      }));
+      throw error;
+    } finally {
+      set((state) => ({
+        timelineLoadingByGoalId: { ...state.timelineLoadingByGoalId, [goalId]: false },
       }));
     }
   },

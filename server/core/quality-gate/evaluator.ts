@@ -1,11 +1,23 @@
 import type { Database } from "better-sqlite3";
 import { spawnSync } from "node:child_process";
 import type { SessionManager, SessionRecord } from "../agent/session.js";
-import { parseAgentOutput } from "../agent/adapters/stream-parser.js";
+import { parseAgentOutput, extractJsonBlock } from "../agent/stream-parser.js";
 import { createLogger } from "../../utils/logger.js";
 import { normalizeSeverity } from "../../utils/severity.js";
 import { createMethodologyEngine } from "../methodology/index.js";
-import type { VerificationResult, VerificationScope, Verdict, Severity, Score, VerificationIssue } from "../../../shared/types.js";
+import { flushVerificationBroadcastOutbox } from "./outbox.js";
+import type {
+  DimensionVerdict,
+  IssueSeverity,
+  QualityGateDimension,
+  VerificationResult,
+  VerificationScope,
+  Verdict,
+  Severity,
+  Score,
+  VerificationIssue,
+  VerificationTerminationReason,
+} from "../../../shared/types.js";
 
 const log = createLogger("quality-gate");
 
@@ -27,11 +39,25 @@ function resolveSessionIdentity(
   return runtimeSessionId ?? record?.runtimeSessionId ?? record?.rowId ?? fallback ?? null;
 }
 
+function resolveSessionIdentities(
+  record: SessionRecord | undefined,
+  runtimeSessionId?: string | null,
+  fallback?: string | null,
+): string[] {
+  return [...new Set([
+    runtimeSessionId,
+    record?.runtimeSessionId,
+    record?.rowId,
+    fallback,
+  ].filter((id): id is string => typeof id === "string" && id.length > 0))];
+}
+
 function buildSessionSeparationFailure(
   taskId: string,
   scope: VerificationScope,
   evaluatorSessionId: string,
-  implementationSessionId: string,
+  reusedSessionId: string,
+  reusedSessionSource: "implementation" | "fix",
 ): VerificationResult {
   const zero: Score = { value: 0, notes: "Generator-Evaluator session separation failed" };
   return {
@@ -49,11 +75,12 @@ function buildSessionSeparationFailure(
     issues: [{
       id: "issue-evaluator-session-reused",
       severity: "critical",
-      message: `Quality Gate가 구현 세션(${implementationSessionId})을 evaluator_session_id로 재사용했습니다. Generator-Evaluator 분리 계약 위반입니다.`,
-      suggestion: "구현 세션과 다른 evaluator sessionKey로 새 세션을 spawn하고, 실제 evaluator session id를 기록하세요.",
+      message: `Quality Gate가 ${reusedSessionSource === "fix" ? "과거 수정" : "구현"} 세션(${reusedSessionId})을 evaluator_session_id로 재사용했습니다. Generator-Evaluator 분리 계약 위반입니다.`,
+      suggestion: "구현·수정 세션과 다른 evaluator sessionKey로 새 세션을 spawn하고, 실제 evaluator session id를 기록하세요.",
     }],
     severity: "hard-block",
     evaluatorSessionId,
+    terminationReason: "evaluator_error",
     createdAt: new Date().toISOString(),
   };
 }
@@ -129,9 +156,24 @@ export function createQualityGate(
       // same evaluator agent without aborting each other (spawnAgent cleanup
       // only affects the same sessionKey).
       const evaluatorId = `evaluator-${taskId}`;
-      const implementationSessionId = task.assignee_id
-        ? resolveSessionIdentity(sessionManager.getSessionRecord(task.assignee_id))
-        : null;
+      const implementationSessionIdentities = task.assignee_id
+        ? resolveSessionIdentities(sessionManager.getSessionRecord(task.assignee_id))
+        : [];
+      const implementationSessionId = implementationSessionIdentities[0] ?? null;
+      // 과거 fix session의 두 식별자를 모두 수집한다. session_id(sessions row id)는
+      // evaluator의 새 row id와 절대 충돌하지 않으므로, 실제 맥락 누수를 잡는 건
+      // runtime_session_id 비교다 — evaluator가 과거 fix 세션의 CLI runtime 대화를
+      // 이어받으면 runtime id가 일치한다.
+      const fixSessionRows = db.prepare(`
+        SELECT session_id, runtime_session_id
+        FROM verification_fix_rounds
+        WHERE task_id = ? AND (session_id IS NOT NULL OR runtime_session_id IS NOT NULL)
+      `).all(taskId) as { session_id: string | null; runtime_session_id: string | null }[];
+      const fixSessionIds = new Set<string>();
+      for (const row of fixSessionRows) {
+        if (row.session_id) fixSessionIds.add(row.session_id);
+        if (row.runtime_session_id) fixSessionIds.add(row.runtime_session_id);
+      }
 
       // Find reviewer agent — Generator-Evaluator separation requires a DIFFERENT agent
       // Always exclude the task's assignee (Generator) to prevent self-review
@@ -164,11 +206,11 @@ export function createQualityGate(
           }
         };
 
-        const persistVerification = (result: VerificationResult): VerificationResult => {
+        const persistVerification = db.transaction((result: VerificationResult): VerificationResult => {
           assertTaskStillExists("persist");
           const verRow = db.prepare(`
-            INSERT INTO verifications (task_id, verdict, scope, dimensions, issues, severity, evaluator_session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
+            INSERT INTO verifications (task_id, verdict, scope, dimensions, issues, severity, evaluator_session_id, implementation_session_id, termination_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
           `).get(
             taskId,
             result.verdict,
@@ -177,15 +219,86 @@ export function createQualityGate(
             JSON.stringify(result.issues),
             normalizeSeverity(result.severity, result.verdict),
             result.evaluatorSessionId,
+            implementationSessionId,
+            result.terminationReason ?? null,
           ) as { id: string };
+
+          const insertJudgement = db.prepare(`
+            INSERT INTO verification_dimension_judgements (verification_id, dimension, verdict, evidence)
+            VALUES (?, ?, ?, ?)
+          `);
+          for (const judgement of result.dimensionJudgements ?? []) {
+            insertJudgement.run(verRow.id, judgement.dimension, judgement.verdict, judgement.evidence);
+          }
+
+          const insertIssue = db.prepare(`
+            INSERT INTO verification_issues (
+              verification_id, dimension, severity, evidence, repro_command,
+              expected_result, actual_result, fix_instruction, assignee_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const issue of result.issues) {
+            if (!issue.dimension || !issue.reproCommand || !issue.expectedResult ||
+                !issue.actualResult || !issue.fixInstruction) continue;
+            insertIssue.run(
+              verRow.id,
+              issue.dimension,
+              issue.severity,
+              issue.message,
+              issue.reproCommand,
+              issue.expectedResult,
+              issue.actualResult,
+              issue.fixInstruction,
+              task.assignee_id,
+            );
+          }
 
           db.prepare("UPDATE tasks SET verification_id = ?, updated_at = datetime('now') WHERE id = ?")
             .run(verRow.id, taskId);
 
-          return { ...result, id: verRow.id };
+          // 판정 저장과 감사 activity를 같은 트랜잭션으로 묶는다 — 저장 직후 프로세스가
+          // 죽어도(WebSocket broadcast 유실과 무관하게) verification_pass/fail 감사 row는 남는다.
+          db.prepare(`
+            INSERT INTO activities (project_id, agent_id, type, message, metadata)
+            VALUES (?, ?, ?, ?, ?)
+          `).run(
+            task.project_id,
+            evaluatorAgent.id,
+            result.verdict === "pass" ? "verification_pass" : "verification_fail",
+            `Task "${task.title}" verification: ${result.verdict.toUpperCase()}`,
+            JSON.stringify({
+              taskId,
+              verdict: result.verdict,
+              severity: normalizeSeverity(result.severity, result.verdict),
+              status: result.verdict === "pass"
+                ? "passed"
+                : result.verdict === "conditional" ? "manual_approval" : "stopped",
+              reason: result.terminationReason
+                ?? (result.verdict === "pass" ? "passed"
+                  : result.verdict === "conditional" ? "conditional" : "verification_failed"),
+            }),
+          );
+
+          const stored = { ...result, id: verRow.id };
+          db.prepare(`
+            INSERT INTO verification_broadcast_outbox (verification_id, event_type, payload)
+            VALUES (?, 'verification:result', ?)
+          `).run(verRow.id, JSON.stringify(stored));
+
+          return stored;
+        });
+
+        const persistAndPublishVerification = (result: VerificationResult): VerificationResult => {
+          const stored = persistVerification(result);
+          flushVerificationBroadcastOutbox(db, broadcast);
+          return stored;
         };
 
-        const recordSessionSeparationFailure = (result: VerificationResult) => {
+        const recordSessionSeparationFailure = (
+          result: VerificationResult,
+          reusedSessionId: string,
+          reusedSessionSource: "implementation" | "fix",
+        ) => {
           db.prepare(`
             INSERT INTO activities (project_id, agent_id, type, message, metadata)
             VALUES (?, ?, 'verification_fail', ?, ?)
@@ -197,27 +310,37 @@ export function createQualityGate(
               taskId,
               reason: "evaluator_session_reused",
               implementationSessionId,
+              reusedSessionId,
+              reusedSessionSource,
               evaluatorSessionId: result.evaluatorSessionId,
             }),
           );
         };
 
-        const failIfEvaluatorReusedImplementation = (evaluatorSessionId: string | null): VerificationResult | null => {
-          if (!implementationSessionId || !evaluatorSessionId || implementationSessionId !== evaluatorSessionId) {
-            return null;
-          }
+        const failIfEvaluatorReusedGeneratorSession = (
+          evaluatorSessionIds: string[],
+          reportedEvaluatorSessionId: string,
+        ): VerificationResult | null => {
+          const reusedImplementationId = evaluatorSessionIds.find((id) => implementationSessionIdentities.includes(id));
+          const reusedFixId = evaluatorSessionIds.find((id) => fixSessionIds.has(id));
+          const reusedSessionId = reusedImplementationId ?? reusedFixId;
+          if (!reusedSessionId) return null;
+          const reusedSessionSource = reusedImplementationId ? "implementation" : "fix";
           const failed = buildSessionSeparationFailure(
             taskId,
             opts.scope,
-            evaluatorSessionId,
-            implementationSessionId,
+            reportedEvaluatorSessionId,
+            reusedSessionId,
+            reusedSessionSource,
           );
-          const stored = persistVerification(failed);
-          recordSessionSeparationFailure(stored);
+          const stored = persistAndPublishVerification(failed);
+          recordSessionSeparationFailure(stored, reusedSessionId, reusedSessionSource);
           log.error("Generator-Evaluator session separation failed", {
             taskId,
             implementationSessionId,
-            evaluatorSessionId,
+            reusedSessionId,
+            reusedSessionSource,
+            evaluatorSessionId: reportedEvaluatorSessionId,
           });
           return stored;
         };
@@ -251,7 +374,12 @@ export function createQualityGate(
           runResult.sessionId,
           session.id,
         ) ?? evaluatorId;
-        const separationFailure = failIfEvaluatorReusedImplementation(evaluatorSessionId);
+        let evaluatorSessionIdentities = resolveSessionIdentities(
+          sessionManager.getSessionRecord(evaluatorId),
+          runResult.sessionId,
+          session.id,
+        );
+        const separationFailure = failIfEvaluatorReusedGeneratorSession(evaluatorSessionIdentities, evaluatorSessionId);
         if (separationFailure) return separationFailure;
 
         const parsed = parseAgentOutput(runResult.stdout, runResult.provider);
@@ -259,8 +387,9 @@ export function createQualityGate(
         const taskType = (task.task_type ?? "code") as string;
         let result = parseVerificationResult(taskId, parsed.text, opts.scope, evaluatorSessionId, taskType);
 
-        // Parse 실패(비-JSON)면 명시적 신호로 1회 재시도 — 5-dim 유무와 무관
-        if (result.issues.some((i) => i.id === "issue-parse-error")) {
+        // Parse 실패(비-JSON) 또는 구조화 계약 위반(evaluator_error)이면 명시적
+        // 신호로 1회 재시도 — 재시도 후에도 실패하면 fail 유지(강등 없음).
+        if (result.issues.some((i) => i.id === "issue-parse-error" || i.id === "issue-evaluator-error")) {
           log.info("Parse failed, retrying with explicit JSON reminder...");
           const retryPrompt = `이전 응답에서 JSON을 파싱하지 못했습니다. 반드시 \`\`\`json 블록으로만 응답하세요.\n\n${evaluationPrompt}`;
           assertTaskStillExists("parse retry");
@@ -271,7 +400,12 @@ export function createQualityGate(
             retryResult.sessionId,
             session.id,
           ) ?? evaluatorSessionId;
-          const retrySeparationFailure = failIfEvaluatorReusedImplementation(evaluatorSessionId);
+          evaluatorSessionIdentities = resolveSessionIdentities(
+            sessionManager.getSessionRecord(evaluatorId),
+            retryResult.sessionId,
+            session.id,
+          );
+          const retrySeparationFailure = failIfEvaluatorReusedGeneratorSession(evaluatorSessionIdentities, evaluatorSessionId);
           if (retrySeparationFailure) return retrySeparationFailure;
 
           const retryParsed = parseAgentOutput(retryResult.stdout, retryResult.provider);
@@ -281,18 +415,18 @@ export function createQualityGate(
         // 리뷰할 변경이 없으면(git merge/cleanup 등) 막지 않고 통과 — 구 all-zero→conditional 꼼수 대체.
         // ⚠ untracked(신규 미추적 파일)도 0이어야 한다 — goal-as-unit은 WIP가 미커밋이고
         //   신규 파일은 fileCount(=git diff)에 안 잡혀, 이 가드가 없으면 신규파일 태스크가 매번 auto-pass된다.
-        if (diffSummary.fileCount === 0 && diffSummary.untracked.length === 0 && result.verdict === "fail") {
+        if (diffSummary.fileCount === 0 &&
+            diffSummary.untracked.length === 0 &&
+            result.verdict === "fail" &&
+            result.terminationReason !== "evaluator_error") {
           log.warn(`No reviewable changes for "${task.title}" — auto-pass (nothing to verify)`);
           result.verdict = "pass";
           result.severity = "auto-resolve";
-          result.issues = [{
-            id: "issue-no-changes",
-            severity: "info" as any,
-            message: "리뷰할 코드 변경이 없어 자동 통과 처리.",
-          }];
+          result.issues = [];
+          result.terminationReason = "passed";
         }
 
-        result = persistVerification(result);
+        result = persistAndPublishVerification(result);
 
         log.info(`Verification complete: ${result.verdict.toUpperCase()} [${result.severity}]`);
         return result;
@@ -648,7 +782,15 @@ export function buildReverifyContext(priorFails: { issues: string; created_at: s
     try {
       const arr = JSON.parse(v.issues);
       items = (Array.isArray(arr) ? arr : [])
-        .map((x: any) => `- [${x.severity ?? "?"}] ${x.file ?? ""}${x.line != null ? `:${x.line}` : ""} — ${String(x.message ?? "").slice(0, 200)}`)
+        .map((x: any) => {
+          const header = `- [${x.severity ?? "?"}] ${x.file ?? ""}${x.line != null ? `:${x.line}` : ""} — ${String(x.message ?? "").slice(0, 200)}`;
+          const detail = [
+            x.reproCommand ? `  repro: ${String(x.reproCommand)}` : null,
+            x.expectedResult ? `  expected: ${String(x.expectedResult).slice(0, 200)}` : null,
+            x.actualResult ? `  actual: ${String(x.actualResult).slice(0, 200)}` : null,
+          ].filter(Boolean).join("\n");
+          return detail ? `${header}\n${detail}` : header;
+        })
         .join("\n") || "- (no issue detail)";
     } catch {
       items = `- ${String(v.issues).slice(0, 200)}`;
@@ -664,6 +806,8 @@ This task already FAILED verification ${priorFails.length} time(s). Previously r
 ${rounds}
 
 ### Verdict policy for re-verification (STRICT — overrides general rules above)
+For each previous issue that lists a \`repro\`, re-run that exact command yourself
+and compare against its \`expected\`/\`actual\` before judging it fixed.
 FAIL is justified ONLY by:
 1. A previously-reported issue above that is still NOT fixed, or
 2. A regression introduced by the fixes, or
@@ -918,6 +1062,13 @@ Do NOT apply code-specific checks (scope mismatch, data flow, edge cases).
 {
   "verdict": "pass",
   "severity": "auto-resolve",
+  "dimensionJudgements": [
+    { "dimension": "functionality", "verdict": "not_applicable", "evidence": "콘텐츠 태스크 — completeness 점수로 검증" },
+    { "dimension": "dataFlow", "verdict": "not_applicable", "evidence": "콘텐츠 태스크 — 데이터 흐름 없음" },
+    { "dimension": "designAlignment", "verdict": "not_applicable", "evidence": "콘텐츠 태스크 — consistency 점수로 검증" },
+    { "dimension": "craft", "verdict": "not_applicable", "evidence": "콘텐츠 태스크 — clarity 점수로 검증" },
+    { "dimension": "edgeCases", "verdict": "not_applicable", "evidence": "콘텐츠 태스크 — 코드 경계값 없음" }
+  ],
   "dimensions": {
     "functionality": { "value": 0, "notes": "N/A — content task" },
     "dataFlow": { "value": 0, "notes": "N/A — content task" },
@@ -935,7 +1086,9 @@ Do NOT apply code-specific checks (scope mismatch, data flow, edge cases).
 
 - Dimensions \`functionality\`, \`dataFlow\`, \`designAlignment\`, \`craft\`, \`edgeCases\` must be present but set value=0 and notes="N/A — content task"
 - Use \`completeness\`, \`consistency\`, \`clarity\` for the actual evaluation
-- \`issues\`: only list actual problems found, empty array if none
+- \`dimensionJudgements\`: 위 5개 항목을 정확히 한 번씩 포함
+- \`issues\`: 문제 발견 시 code 출력 계약과 동일하게 dimension, severity, message,
+  reproCommand, expectedResult, actualResult, fixInstruction을 모두 포함. 없으면 빈 배열
 `;
   }
 
@@ -967,6 +1120,13 @@ Apply only Validity and Security checks.
 {
   "verdict": "pass",
   "severity": "auto-resolve",
+  "dimensionJudgements": [
+    { "dimension": "functionality", "verdict": "not_applicable", "evidence": "설정 태스크 — validity 점수로 검증" },
+    { "dimension": "dataFlow", "verdict": "not_applicable", "evidence": "설정 태스크 — 데이터 흐름 없음" },
+    { "dimension": "designAlignment", "verdict": "not_applicable", "evidence": "설정 태스크 — 설정 체계 정합성은 validity에 반영" },
+    { "dimension": "craft", "verdict": "not_applicable", "evidence": "설정 태스크 — security 점수로 검증" },
+    { "dimension": "edgeCases", "verdict": "not_applicable", "evidence": "설정 태스크 — validity 점수로 검증" }
+  ],
   "dimensions": {
     "functionality": { "value": 0, "notes": "N/A — config task" },
     "dataFlow": { "value": 0, "notes": "N/A — config task" },
@@ -983,7 +1143,9 @@ Apply only Validity and Security checks.
 
 - Dimensions \`functionality\`, \`dataFlow\`, \`designAlignment\`, \`craft\`, \`edgeCases\` must be present but set value=0 and notes="N/A — config task"
 - Use \`validity\` and \`security\` for the actual evaluation
-- \`issues\`: only list actual problems found, empty array if none
+- \`dimensionJudgements\`: 위 5개 항목을 정확히 한 번씩 포함
+- \`issues\`: 문제 발견 시 code 출력 계약과 동일하게 dimension, severity, message,
+  reproCommand, expectedResult, actualResult, fixInstruction을 모두 포함. 없으면 빈 배열
 `;
   }
 
@@ -1015,6 +1177,13 @@ Do NOT score code quality dimensions. Set all dimension values to 0 with "N/A �
 {
   "verdict": "pass",
   "severity": "auto-resolve",
+  "dimensionJudgements": [
+    { "dimension": "functionality", "verdict": "pass", "evidence": "실행 명령과 성공 결과" },
+    { "dimension": "dataFlow", "verdict": "not_applicable", "evidence": "실행 검증 태스크 — 별도 데이터 흐름 없음" },
+    { "dimension": "designAlignment", "verdict": "not_applicable", "evidence": "실행 검증 태스크 — 설계 리뷰 대상 아님" },
+    { "dimension": "craft", "verdict": "not_applicable", "evidence": "실행 검증 태스크 — 코드 품질 리뷰 대상 아님" },
+    { "dimension": "edgeCases", "verdict": "not_applicable", "evidence": "실행 검증 태스크 — 지정된 실행 시나리오로 검증" }
+  ],
   "dimensions": {
     "functionality": { "value": 0, "notes": "N/A — review task, see execution results" },
     "dataFlow": { "value": 0, "notes": "N/A — review task" },
@@ -1028,7 +1197,9 @@ Do NOT score code quality dimensions. Set all dimension values to 0 with "N/A �
 \`\`\`
 
 - Set all dimension values to 0 with notes="N/A — review task"
-- \`issues\`: only list execution failures found
+- \`dimensionJudgements\`: 위 5개 항목을 정확히 한 번씩 포함
+- \`issues\`: 실행 실패 발견 시 dimension, severity, message, reproCommand,
+  expectedResult, actualResult, fixInstruction을 모두 포함. 없으면 빈 배열
 - \`knownGaps\`: commands you needed to run but couldn't execute
 `;
   }
@@ -1084,13 +1255,25 @@ If you CANNOT execute Layer 3 (no DB, no runtime, no test runner):
 {
   "verdict": "pass",
   "severity": "auto-resolve",
+  "dimensionJudgements": [
+    { "dimension": "functionality", "verdict": "pass", "evidence": "요구 동작 확인 명령/관찰 결과" },
+    { "dimension": "dataFlow", "verdict": "pass", "evidence": "Input → Save → Load → Display 확인 결과" },
+    { "dimension": "designAlignment", "verdict": "pass", "evidence": "기존 아키텍처 패턴 대조 결과" },
+    { "dimension": "craft", "verdict": "pass", "evidence": "타입·오류 처리 검토 결과" },
+    { "dimension": "edgeCases", "verdict": "pass", "evidence": "빈 값·경계값 재현 결과" }
+  ],
   "issues": [
     {
+      "dimension": "functionality",
       "severity": "critical",
-      "file": "path/to/file.py",
+      "file": "path/to/file.ts",
       "line": 42,
-      "message": "Concrete description of the problem — what is wrong and why it breaks. REQUIRED. Never omit or leave blank. The auto-fix agent reads this verbatim.",
-      "suggestion": "Concrete fix guidance — what code change resolves it. REQUIRED for critical/hard-block."
+      "message": "무엇이 왜 잘못됐는지 구체 서술. REQUIRED. 절대 비우지 말 것.",
+      "reproCommand": "재현 방법 — 실행한 명령 또는 UI 클릭 경로. 비워두지 말 것.",
+      "expectedResult": "기대한 결과",
+      "actualResult": "실제 관찰한 결과",
+      "fixInstruction": "무엇을 어떻게 고치면 해결되는지 — auto-fix 에이전트가 그대로 읽는다. 비워두지 말 것.",
+      "suggestion": "선택 — fixInstruction 요약"
     }
   ],
   "knownGaps": []
@@ -1099,59 +1282,115 @@ If you CANNOT execute Layer 3 (no DB, no runtime, no test runner):
 
 - \`verdict\`: "pass" | "conditional" | "fail"
 - \`severity\`: "auto-resolve" (minor), "soft-block" (runtime risk), "hard-block" (security/data loss)
-- \`issues\`: only list actual problems found, empty array if none. In \`message\`,
-  include HOW you observed it (command run / browser step / grep result) — repro beats assertion.
-  **CRITICAL: every issue MUST have a non-empty \`message\` field.** An issue
-  without a message is useless — the auto-fix loop cannot act on it and the
-  task will get stuck retrying. If you cannot describe the problem concretely,
-  do not file the issue.
-  **Write \`message\` and \`suggestion\` in Korean** (기술 용어·식별자·파일 경로는
-  원문 유지) — these are shown directly to the user in the dashboard.
+- \`dimensionJudgements\`: 5차원(functionality·dataFlow·designAlignment·craft·edgeCases) 각각의
+  판정. \`verdict\`는 "pass" | "fail" | "not_applicable", \`evidence\`는 비어있으면 안 된다.
+- \`issues\`: only list actual problems found, empty array if none. 각 이슈는 아래
+  구조화 필드를 반드시 채운다 — **누락·빈 값·잘못된 enum 은 판정 오류(evaluator_error)로
+  거부되어 재검증된다**:
+  - \`dimension\`: 위 5차원 중 하나
+  - \`severity\`: "critical" | "high" | "warning" | "info"
+  - \`reproCommand\`: 재현 명령/경로 — **비우지 말 것** (빈 재현 명령은 거부됨)
+  - \`fixInstruction\`: 구체적 수정 지시 — **비우지 말 것** (auto-fix 에이전트가 그대로 읽는다)
+  - \`message\`/\`expectedResult\`/\`actualResult\`: 문제·기대·실제를 구체적으로 서술
+  **Write in Korean** (기술 용어·식별자·파일 경로는 원문 유지) — dashboard 에 그대로 노출된다.
 - \`knownGaps\`: areas that could not be verified (Layer 3 not executed, etc.)
 `;
 }
 
+// ─── Structured evaluation contract ──────────────────────────────────────
+// Quality Gate 판정·수정 루프 구조화: evaluator 가 실패 항목을 fix 태스크로
+// 변환할 수 있도록 구조화 필드(dimension·severity·재현 명령·수정 지시)를 강제한다.
+// 필드 누락·잘못된 enum·빈 재현 명령은 판정으로 신뢰하지 않고 evaluator_error 로
+// 거부한다 — 잘못된 구조의 출력이 거짓 pass/fail 로 흘러가는 것을 막는다.
+const QG_DIMENSION_NAMES = ["functionality", "dataFlow", "designAlignment", "craft", "edgeCases"] as const;
+const QG_DIMENSIONS = new Set<string>(QG_DIMENSION_NAMES);
+const QG_ISSUE_SEVERITIES = new Set<string>(["critical", "high", "warning", "info"]);
+const QG_DIMENSION_VERDICTS = new Set<string>(["pass", "fail", "not_applicable"]);
+const QG_VERDICTS = new Set<string>(["pass", "conditional", "fail"]);
+const QG_SEVERITIES = new Set<string>(["auto-resolve", "soft-block", "hard-block"]);
+
+const isNonEmptyString = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
+const pickField = (o: any, ...keys: string[]): unknown => {
+  for (const k of keys) if (o != null && o[k] !== undefined) return o[k];
+  return undefined;
+};
+
+export interface StructuredEvaluationValidation {
+  /** The Quality Gate always requires the structured contract. */
+  structured: boolean;
+  ok: boolean;
+  errors: string[];
+}
+
 /**
- * Extract the evaluator's JSON payload from raw LLM output.
+ * Evaluator 구조화 출력 계약 검사 (pure — 테스트 대상).
  *
- * Prefers the LAST ```json fenced block (models occasionally emit more than
- * one — e.g. an example before the real answer). Falls back to a
- * balanced-brace scan anchored on the `"verdict"` key instead of the old
- * greedy `\{[\s\S]*"verdict"[\s\S]*\}` regex, which matched from the first
- * `{` to the LAST `}` in the ENTIRE output — any trailing prose containing
- * a stray `{`/`}` (e.g. a code snippet in the evaluator's own commentary)
- * swept extra text into the match and broke `JSON.parse`, even though the
- * evaluator had returned syntactically valid JSON.
+ * 레거시/부분 출력도 판정으로 받아들이지 않는다. 모든 응답은 정확히 5개 차원
+ * 판정과 각 issue의 재현·기대·실제·수정 지시를 제공해야 한다.
  */
-function extractEvaluatorJson(rawOutput: string): string | null {
-  const fenceMatches = [...rawOutput.matchAll(/```json\s*([\s\S]*?)\s*```/g)];
-  const lastFence = fenceMatches[fenceMatches.length - 1]?.[1]?.trim();
-  if (lastFence) return lastFence;
-
-  const anchorIdx = rawOutput.indexOf('"verdict"');
-  if (anchorIdx === -1) return null;
-  const start = rawOutput.lastIndexOf("{", anchorIdx);
-  if (start === -1) return null;
-
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = start; i < rawOutput.length; i++) {
-    const ch = rawOutput[i];
-    if (inString) {
-      if (escape) escape = false;
-      else if (ch === "\\") escape = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') { inString = true; continue; }
-    if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) return rawOutput.slice(start, i + 1);
-    }
+export function validateStructuredEvaluation(parsed: any): StructuredEvaluationValidation {
+  const errors: string[] = [];
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { structured: true, ok: false, errors: ["evaluation must be an object"] };
   }
-  return null;
+
+  const verdict = pickField(parsed, "verdict");
+  if (!QG_VERDICTS.has(verdict as string)) errors.push(`verdict invalid enum: ${JSON.stringify(verdict)}`);
+  const severity = pickField(parsed, "severity");
+  if (!QG_SEVERITIES.has(severity as string)) errors.push(`severity invalid enum: ${JSON.stringify(severity)}`);
+
+  const rawIssues: any[] = Array.isArray(parsed.issues) ? parsed.issues : [];
+  if (!Array.isArray(parsed.issues)) errors.push("issues missing/not array");
+  const judgementsRaw = parsed?.dimensionJudgements ?? parsed?.dimension_judgements;
+  const judgements: any[] = Array.isArray(judgementsRaw) ? judgementsRaw : [];
+  if (!Array.isArray(judgementsRaw)) errors.push("dimensionJudgements missing/not array");
+  if (judgements.length !== QG_DIMENSION_NAMES.length) {
+    errors.push(`dimensionJudgements must contain exactly ${QG_DIMENSION_NAMES.length} items`);
+  }
+
+  const seenDimensions = new Set<string>();
+  judgements.forEach((j, i) => {
+    const dim = pickField(j, "dimension");
+    if (!QG_DIMENSIONS.has(dim as string)) errors.push(`dimensionJudgements[${i}].dimension invalid enum: ${JSON.stringify(dim)}`);
+    else if (seenDimensions.has(dim as string)) errors.push(`dimensionJudgements[${i}].dimension duplicate: ${JSON.stringify(dim)}`);
+    else seenDimensions.add(dim as string);
+    const v = pickField(j, "verdict");
+    if (!QG_DIMENSION_VERDICTS.has(v as string)) errors.push(`dimensionJudgements[${i}].verdict invalid enum: ${JSON.stringify(v)}`);
+    if (!isNonEmptyString(pickField(j, "evidence"))) errors.push(`dimensionJudgements[${i}].evidence missing/empty`);
+  });
+  for (const dimension of QG_DIMENSION_NAMES) {
+    if (!seenDimensions.has(dimension)) errors.push(`dimensionJudgements missing dimension: ${dimension}`);
+  }
+
+  rawIssues.forEach((it, i) => {
+    if (it === null || typeof it !== "object" || Array.isArray(it)) {
+      errors.push(`issues[${i}] must be an object`);
+      return;
+    }
+    const dim = pickField(it, "dimension");
+    if (!QG_DIMENSIONS.has(dim as string)) errors.push(`issues[${i}].dimension invalid enum: ${JSON.stringify(dim)}`);
+    const sev = pickField(it, "severity");
+    if (!QG_ISSUE_SEVERITIES.has(sev as string)) errors.push(`issues[${i}].severity invalid enum: ${JSON.stringify(sev)}`);
+    if (!isNonEmptyString(pickField(it, "message"))) errors.push(`issues[${i}].message missing/empty`);
+    if (!isNonEmptyString(pickField(it, "reproCommand", "repro_command", "repro"))) errors.push(`issues[${i}].reproCommand missing/empty`);
+    if (!isNonEmptyString(pickField(it, "expectedResult", "expected_result"))) errors.push(`issues[${i}].expectedResult missing/empty`);
+    if (!isNonEmptyString(pickField(it, "actualResult", "actual_result"))) errors.push(`issues[${i}].actualResult missing/empty`);
+    if (!isNonEmptyString(pickField(it, "fixInstruction", "fix_instruction"))) errors.push(`issues[${i}].fixInstruction missing/empty`);
+  });
+
+  // verdict과 issues는 서로를 증명해야 한다 — pass인데 critical/high issue가 남아있거나,
+  // fail인데 fix 루프가 실행할 repro가 하나도 없는 상태는 둘 다 신뢰할 수 없는 판정이다.
+  if (verdict === "pass" && rawIssues.some((it) => {
+    const sev = pickField(it, "severity");
+    return sev === "critical" || sev === "high";
+  })) {
+    errors.push("verdict pass invalid with a critical or high severity issue present");
+  }
+  if (verdict === "fail" && rawIssues.length === 0) {
+    errors.push("verdict fail requires at least one issue");
+  }
+
+  return { structured: true, ok: errors.length === 0, errors };
 }
 
 export function parseVerificationResult(
@@ -1183,39 +1422,66 @@ export function parseVerificationResult(
     issues: [parseErrorIssue],
     severity: "soft-block" as Severity,
     evaluatorSessionId,
+    terminationReason: "evaluator_error",
     createdAt: new Date().toISOString(),
   };
 
   try {
-    // Extract JSON from the output
-    const jsonStr = extractEvaluatorJson(rawOutput);
-
-    if (!jsonStr) {
+    // Extract JSON from the output (shared, provider-agnostic extractor).
+    const jsonStr = extractJsonBlock(rawOutput);
+    if (jsonStr === null) {
       log.warn("Could not parse verification JSON, returning fail");
       return defaultResult;
     }
 
     const parsed = JSON.parse(jsonStr);
 
+    // 구조화 계약 위반은 어떤 verdict도 신뢰하지 않고 evaluator_error로 거부한다.
+    const structuredValidation = validateStructuredEvaluation(parsed);
+    if (!structuredValidation.ok) {
+      log.warn("Structured evaluation rejected — evaluator_error", structuredValidation.errors);
+      return {
+        ...defaultResult,
+        issues: [{
+          id: "issue-evaluator-error",
+          severity: "high",
+          message: `Evaluator 구조화 출력 계약 위반 — ${structuredValidation.errors.slice(0, 8).join("; ")}`,
+          suggestion: "5개 dimensionJudgements와 각 issue의 필수 구조화 필드를 모두 채워 다시 출력하세요.",
+        }],
+      };
+    }
+
+    const dimensionJudgements = (parsed.dimensionJudgements ?? parsed.dimension_judgements).map((judgement: any) => ({
+      dimension: judgement.dimension as QualityGateDimension,
+      verdict: judgement.verdict as DimensionVerdict,
+      evidence: String(judgement.evidence).trim(),
+    }));
+    const scoreFor = (dimension: QualityGateDimension): Score => {
+      const judgement = dimensionJudgements.find((item: { dimension: QualityGateDimension }) => item.dimension === dimension)!;
+      return {
+        value: judgement.verdict === "pass" ? 10 : 0,
+        notes: judgement.evidence,
+      };
+    };
+
     const dimensions = {
-      functionality: parsed.dimensions?.functionality ?? defaultScore,
-      dataFlow: parsed.dimensions?.dataFlow ?? defaultScore,
-      designAlignment: parsed.dimensions?.designAlignment ?? defaultScore,
-      craft: parsed.dimensions?.craft ?? defaultScore,
-      edgeCases: parsed.dimensions?.edgeCases ?? defaultScore,
+      functionality: scoreFor("functionality"),
+      dataFlow: scoreFor("dataFlow"),
+      designAlignment: scoreFor("designAlignment"),
+      craft: scoreFor("craft"),
+      edgeCases: scoreFor("edgeCases"),
     };
 
     // Trust the evaluator agent's verdict — do NOT override based on score averages.
     // The evaluator may FAIL a task with high dimension scores if it found a critical
     // issue (e.g., security vulnerability) that doesn't map neatly to any dimension.
     // Overriding FAIL→PASS based on avg score was a Critical bug (Crewdeck gap analysis).
-    const VALID_VERDICTS = new Set(["pass", "conditional", "fail"]);
-    const rawVerdict = String(parsed.verdict ?? "fail").toLowerCase().trim();
-    let verdict: Verdict = VALID_VERDICTS.has(rawVerdict) ? (rawVerdict as Verdict) : "fail";
+    let verdict = parsed.verdict as Verdict;
 
     // ── task_type별 임계값 검사 ────────────────────────────────────────────
     // 에이전트가 반환한 verdict를 기반으로 하되, 유형별 최소 임계값 미달 시
     // fail로 강제 전환한다. pass→fail 방향만 허용 (fail→pass 금지).
+    let thresholdIssue: VerificationIssue | null = null;
     if (taskType === "content" && verdict === "pass") {
       // content: Completeness, Consistency, Clarity 평균 6.0+ 필요
       const completeness = (parsed.dimensions?.completeness?.value ?? 0) as number;
@@ -1224,6 +1490,17 @@ export function parseVerificationResult(
       const contentAvg = (completeness + consistency + clarity) / 3;
       if (contentAvg < 6.0) {
         verdict = "fail";
+        thresholdIssue = {
+          id: "issue-content-threshold",
+          dimension: "craft",
+          severity: "high",
+          message: `콘텐츠 품질 점수 평균이 통과 임계값에 미달했습니다 (${contentAvg.toFixed(1)} < 6.0).`,
+          reproCommand: `Crewdeck Quality Gate 재검증: task=${taskId}, type=content`,
+          expectedResult: "completeness, consistency, clarity 평균이 6.0 이상",
+          actualResult: `completeness=${completeness}, consistency=${consistency}, clarity=${clarity}, average=${contentAvg.toFixed(1)}`,
+          fixInstruction: "평균 6.0 미만을 만든 completeness, consistency, clarity 항목의 지적을 보완한 뒤 동일 Quality Gate를 재실행합니다.",
+          suggestion: "임계값 미달 차원의 콘텐츠를 보완하세요.",
+        };
         log.info(`content task 임계값 미달 (avg=${contentAvg.toFixed(1)} < 6.0) → fail 전환`);
       }
     } else if (taskType === "config" && verdict === "pass") {
@@ -1232,52 +1509,57 @@ export function parseVerificationResult(
       const security = (parsed.dimensions?.security?.value ?? 0) as number;
       if (validity < 8.0 || security < 8.0) {
         verdict = "fail";
+        thresholdIssue = {
+          id: "issue-config-threshold",
+          dimension: validity < 8.0 ? "functionality" : "craft",
+          severity: "high",
+          message: `설정 품질 점수가 통과 임계값에 미달했습니다 (validity=${validity}, security=${security}; 각 8.0 이상 필요).`,
+          reproCommand: `Crewdeck Quality Gate 재검증: task=${taskId}, type=config`,
+          expectedResult: "validity와 security가 모두 8.0 이상",
+          actualResult: `validity=${validity}, security=${security}`,
+          fixInstruction: "8.0 미만인 validity 또는 security 항목의 설정 결함을 보완한 뒤 동일 Quality Gate를 재실행합니다.",
+          suggestion: "임계값 미달 설정 항목을 보완하세요.",
+        };
         log.info(`config task 임계값 미달 (validity=${validity}, security=${security}) → fail 전환`);
       }
     }
     // review 타입은 에이전트의 실행 결과 verdict를 그대로 신뢰 (별도 임계값 없음)
     // code 타입은 에이전트의 verdict를 그대로 신뢰 (기존 동작 유지)
 
-    // Resolve message across known field name variants. Different evaluator
-    // runs have returned the payload under `message`, `description`, `detail`,
-    // `text`, `issue`, or `title` — accept any of them so the auto-fix loop
-    // receives a concrete problem statement instead of "No description".
-    const pickMessage = (issue: any): string => {
-      const candidates = [
-        issue.message,
-        issue.description,
-        issue.detail,
-        issue.text,
-        issue.issue,
-        issue.title,
-        issue.reason,
-        issue.problem,
-      ];
-      for (const c of candidates) {
-        if (typeof c === "string" && c.trim()) return c;
-      }
-      return "No description";
-    };
-
-    const issues = (parsed.issues ?? []).map((issue: any, i: number) => ({
+    const issues: VerificationIssue[] = parsed.issues.map((issue: any, i: number) => ({
       id: `issue-${i}`,
-      severity: issue.severity ?? "warning",
+      dimension: issue.dimension as QualityGateDimension,
+      severity: issue.severity as IssueSeverity,
       file: issue.file,
       line: issue.line,
-      message: pickMessage(issue),
-      suggestion: issue.suggestion ?? issue.fix ?? issue.recommendation,
+      message: issue.message.trim(),
+      reproCommand: String(pickField(issue, "reproCommand", "repro_command", "repro")).trim(),
+      expectedResult: String(pickField(issue, "expectedResult", "expected_result")).trim(),
+      actualResult: String(pickField(issue, "actualResult", "actual_result")).trim(),
+      fixInstruction: String(pickField(issue, "fixInstruction", "fix_instruction")).trim(),
+      suggestion: issue.suggestion ?? issue.fixInstruction ?? issue.fix_instruction,
     }));
+    if (thresholdIssue) issues.push(thresholdIssue);
 
     // Also correct severity based on actual issues
     const hasCritical = issues.some((i: any) => i.severity === "critical");
     const severity: Severity = hasCritical ? "hard-block" : normalizeSeverity(parsed.severity, verdict);
+
+    // 통과·중단·수동 승인 이유 추적: evaluator 가 스스로 판정할 수 있는 사유만
+    // 기록한다. auto_fix_disabled/fix_round_limit/escalated_to_goal_qa 는 engine 소관.
+    let terminationReason: VerificationTerminationReason | null = null;
+    if (verdict === "pass") terminationReason = "passed";
+    else if (verdict === "conditional") terminationReason = "conditional";
+    else if (severity === "hard-block") terminationReason = "hard_blocked";
 
     return {
       ...defaultResult,
       verdict,
       severity,
       dimensions,
+      dimensionJudgements,
       issues,
+      terminationReason,
     };
   } catch (err) {
     log.warn("Failed to parse verification result", err);

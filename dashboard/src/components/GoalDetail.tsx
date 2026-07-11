@@ -6,6 +6,11 @@ import {
   type GoalStatusResponse,
   useGoalStatusStore,
 } from "../stores/goals";
+import type {
+  VerificationIssueStatus,
+  VerificationRoundVerdict,
+  VerificationTimelineStatus,
+} from "../lib/api";
 
 interface GoalDetailProps {
   goalId: string;
@@ -30,6 +35,20 @@ const COPY = {
     savePoint: "Save point",
     evaluator: "Evaluator",
     loadFailed: "Could not load goal status",
+    timeline: "Quality decision timeline",
+    round: "Round",
+    dimensions: "Quality dimensions",
+    issues: "Issues",
+    noIssues: "No issues found",
+    noRounds: "No quality decisions yet",
+    reason: "End reason",
+    assignee: "Owner",
+    fixTask: "Fix task",
+    execution: "Agent run details",
+    implementationAgent: "Implementation agent",
+    evaluatorAgent: "Evaluation agent",
+    fixAgents: "Fix agents",
+    timelineLoadFailed: "Could not load quality decisions",
   },
   ko: {
     status: {
@@ -44,7 +63,69 @@ const COPY = {
     savePoint: "저장 지점",
     evaluator: "검증 에이전트",
     loadFailed: "목표 상태를 불러오지 못했습니다",
+    timeline: "품질 판정 타임라인",
+    round: "라운드",
+    dimensions: "품질 항목",
+    issues: "발견된 문제",
+    noIssues: "발견된 문제가 없습니다",
+    noRounds: "아직 품질 판정이 없습니다",
+    reason: "종료 이유",
+    assignee: "담당자",
+    fixTask: "수정 작업",
+    execution: "에이전트 실행 정보",
+    implementationAgent: "구현 에이전트",
+    evaluatorAgent: "검증 에이전트",
+    fixAgents: "수정 에이전트",
+    timelineLoadFailed: "품질 판정을 불러오지 못했습니다",
   },
+};
+
+const TIMELINE_STATUS_LABELS: Record<VerificationTimelineStatus, { en: string; ko: string }> = {
+  passed: { en: "Passed", ko: "통과" },
+  fixing: { en: "Fixing", ko: "수정 중" },
+  stopped: { en: "Stopped", ko: "중단" },
+  manual_approval: { en: "Needs review", ko: "확인 필요" },
+};
+
+const VERDICT_LABELS: Record<VerificationRoundVerdict, { en: string; ko: string }> = {
+  pass: { en: "Passed", ko: "통과" },
+  fail: { en: "Failed", ko: "실패" },
+  stopped: { en: "Stopped", ko: "중단" },
+  manual_approval: { en: "Needs review", ko: "확인 필요" },
+};
+
+const ISSUE_STATUS_LABELS: Record<VerificationIssueStatus, { en: string; ko: string }> = {
+  open: { en: "Open", ko: "미해결" },
+  resolved: { en: "Resolved", ko: "해결됨" },
+  regression: { en: "Regression", ko: "재발" },
+};
+
+const DIMENSION_LABELS: Record<string, { en: string; ko: string }> = {
+  functionality: { en: "Functionality", ko: "기능" },
+  dataFlow: { en: "Data flow", ko: "데이터 흐름" },
+  designAlignment: { en: "Design fit", ko: "설계 일치" },
+  craft: { en: "Completeness", ko: "완성도" },
+  edgeCases: { en: "Edge cases", ko: "예외 상황" },
+};
+
+const TIMELINE_STATUS_TONES: Record<VerificationTimelineStatus, string> = {
+  passed: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400",
+  fixing: "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400",
+  stopped: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400",
+  manual_approval: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400",
+};
+
+const VERDICT_TONES: Record<VerificationRoundVerdict, string> = {
+  pass: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400",
+  fail: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400",
+  stopped: "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300",
+  manual_approval: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400",
+};
+
+const ISSUE_STATUS_TONES: Record<VerificationIssueStatus, string> = {
+  open: "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400",
+  resolved: "bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400",
+  regression: "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400",
 };
 
 function getCopy(language: string) {
@@ -89,6 +170,10 @@ function shortPath(path: string): string {
   return parts.slice(-2).join("/");
 }
 
+function readableCode(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
 export function GoalDetail({
   goalId,
   title,
@@ -100,12 +185,23 @@ export function GoalDetail({
   const { t, i18n } = useTranslation();
   const copy = getCopy(i18n.language);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [roundSelection, setRoundSelection] = useState<{
+    goalId: string;
+    verificationId: string | null;
+  } | null>(null);
   const storeStatus = useGoalStatusStore((state) => state.byGoalId[goalId]);
   const loading = useGoalStatusStore((state) => Boolean(state.loadingByGoalId[goalId]));
   const storeError = useGoalStatusStore((state) => state.errorByGoalId[goalId]);
   const setGoalStatus = useGoalStatusStore((state) => state.setGoalStatus);
   const fetchGoalStatus = useGoalStatusStore((state) => state.fetchGoalStatus);
+  const timeline = useGoalStatusStore((state) => state.timelineByGoalId[goalId]);
+  const timelineLoading = useGoalStatusStore((state) => Boolean(state.timelineLoadingByGoalId[goalId]));
+  const timelineError = useGoalStatusStore((state) => state.timelineErrorByGoalId[goalId]);
+  const fetchVerificationTimeline = useGoalStatusStore((state) => state.fetchVerificationTimeline);
   const status = storeStatus ?? initialStatus;
+  const expandedRound = roundSelection?.goalId === goalId
+    ? roundSelection.verificationId
+    : timeline?.rounds.at(-1)?.verification_id ?? null;
 
   useEffect(() => {
     if (initialStatus) setGoalStatus(initialStatus);
@@ -123,11 +219,12 @@ export function GoalDetail({
           const message = error instanceof Error ? error.message : copy.loadFailed;
           setLocalError(message);
         });
+      fetchVerificationTimeline(goalId).catch(() => undefined);
     };
     load();
     window.addEventListener("crewdeck:refresh", load);
     return () => window.removeEventListener("crewdeck:refresh", load);
-  }, [autoLoad, copy.loadFailed, fetchGoalStatus, goalId, onStatusChange]);
+  }, [autoLoad, copy.loadFailed, fetchGoalStatus, fetchVerificationTimeline, goalId, onStatusChange]);
 
   const statusTone = useMemo(
     () => (status ? getStatusTone(status.status) : getStatusTone("running")),
@@ -208,6 +305,191 @@ export function GoalDetail({
       {errorMessage && (
         <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
           {errorMessage}
+        </div>
+      )}
+
+      {(timeline || timelineLoading || timelineError) && (
+        <div className="mt-3 border-t border-gray-100 pt-3 dark:border-gray-700" data-testid="verification-timeline">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h4 className="text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
+              {copy.timeline}
+            </h4>
+            <div className="flex items-center gap-1.5">
+              {timelineLoading && (
+                <span className="text-[10px] text-gray-400 dark:text-gray-500">{t("loading")}</span>
+              )}
+              {timeline && (
+                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${TIMELINE_STATUS_TONES[timeline.status]}`}>
+                  {TIMELINE_STATUS_LABELS[timeline.status][i18n.language.startsWith("ko") ? "ko" : "en"]}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {timeline && (
+            <div className="mt-1.5 flex min-w-0 items-start gap-1.5 text-[11px] text-gray-500 dark:text-gray-400">
+              <span className="shrink-0 font-medium">{copy.reason}</span>
+              <span className="min-w-0 break-words">{readableCode(timeline.reason)}</span>
+            </div>
+          )}
+
+          {timelineError && (
+            <div className="mt-2 rounded border border-red-200 bg-red-50 px-2.5 py-2 text-[11px] text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300">
+              {copy.timelineLoadFailed}: {timelineError}
+            </div>
+          )}
+
+          {timeline && timeline.rounds.length === 0 && (
+            <p className="mt-2 text-[11px] text-gray-400 dark:text-gray-500">{copy.noRounds}</p>
+          )}
+
+          {timeline && timeline.rounds.length > 0 && (
+            <div className="mt-2 space-y-2">
+              {timeline.rounds.map((round) => {
+                const isExpanded = expandedRound === round.verification_id;
+                const language = i18n.language.startsWith("ko") ? "ko" : "en";
+                return (
+                  <div key={round.verification_id} className="overflow-hidden rounded-md border border-gray-200 dark:border-gray-700">
+                    <button type="button"
+                      aria-expanded={isExpanded}
+                      aria-controls={`verification-round-${round.verification_id}`}
+                      onClick={() => setRoundSelection({
+                        goalId,
+                        verificationId: isExpanded ? null : round.verification_id,
+                      })}
+                      className="flex w-full min-w-0 items-center gap-2 bg-gray-50 px-2.5 py-2 text-left hover:bg-gray-100 focus-visible:ring-2 focus-visible:ring-blue-500 dark:bg-gray-800/50 dark:hover:bg-gray-800"
+                    >
+                      <svg
+                        className={`h-3 w-3 shrink-0 text-gray-400 transition-transform ${isExpanded ? "rotate-90" : ""}`}
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2.5"
+                        aria-hidden="true"
+                      >
+                        <path d="m9 18 6-6-6-6" />
+                      </svg>
+                      <span className="shrink-0 text-[11px] font-semibold text-gray-700 dark:text-gray-200">
+                        {copy.round} {round.round}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
+                        {round.task_title}
+                      </span>
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${VERDICT_TONES[round.verdict]}`}>
+                        {VERDICT_LABELS[round.verdict][language]}
+                      </span>
+                    </button>
+
+                    {isExpanded && (
+                      <div id={`verification-round-${round.verification_id}`} className="space-y-3 px-2.5 py-2.5">
+                        {round.reason && (
+                          <div className="text-[11px] text-gray-500 dark:text-gray-400">
+                            <span className="font-medium">{copy.reason}: </span>
+                            {readableCode(round.reason)}
+                          </div>
+                        )}
+
+                        <div>
+                          <h5 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                            {copy.dimensions}
+                          </h5>
+                          <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-5">
+                            {round.dimensions.map((dimension) => (
+                              <div
+                                key={dimension.dimension}
+                                className={`min-w-0 rounded border px-2 py-1.5 ${
+                                  dimension.passed
+                                    ? "border-green-200 bg-green-50/60 dark:border-green-900 dark:bg-green-900/10"
+                                    : "border-red-200 bg-red-50/60 dark:border-red-900 dark:bg-red-900/10"
+                                }`}
+                              >
+                                <div className="truncate text-[10px] text-gray-500 dark:text-gray-400" title={dimension.rationale}>
+                                  {DIMENSION_LABELS[dimension.dimension]?.[language] ?? dimension.dimension}
+                                </div>
+                                <div className={`text-xs font-semibold ${dimension.passed ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}`}>
+                                  {dimension.score}/10
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div>
+                          <h5 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                            {copy.issues} ({round.issues.length})
+                          </h5>
+                          {round.issues.length === 0 ? (
+                            <p className="text-[11px] text-gray-400 dark:text-gray-500">{copy.noIssues}</p>
+                          ) : (
+                            <div className="space-y-1.5">
+                              {round.issues.map((issue) => (
+                                <div key={issue.issue_id} className="rounded border border-gray-200 bg-gray-50/60 px-2 py-2 dark:border-gray-700 dark:bg-gray-800/40">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${ISSUE_STATUS_TONES[issue.status]}`}>
+                                      {ISSUE_STATUS_LABELS[issue.status][language]}
+                                    </span>
+                                    <span className="text-[9px] font-semibold uppercase text-gray-500 dark:text-gray-400">{issue.severity}</span>
+                                    <span className="text-[10px] text-gray-400 dark:text-gray-500">
+                                      {DIMENSION_LABELS[issue.dimension]?.[language] ?? issue.dimension}
+                                    </span>
+                                  </div>
+                                  <p className="mt-1 break-words text-[11px] text-gray-700 dark:text-gray-300">{issue.evidence}</p>
+                                  {(issue.assignee_id || issue.fix_task_id) && (
+                                    <dl className="mt-1.5 grid gap-x-3 gap-y-1 text-[10px] text-gray-500 dark:text-gray-400 sm:grid-cols-2">
+                                      {issue.assignee_id && (
+                                        <div className="min-w-0">
+                                          <dt className="font-medium">{copy.assignee}</dt>
+                                          <dd className="break-all font-mono" title={issue.assignee_id}>{issue.assignee_id}</dd>
+                                        </div>
+                                      )}
+                                      {issue.fix_task_id && (
+                                        <div className="min-w-0">
+                                          <dt className="font-medium">{copy.fixTask}</dt>
+                                          <dd className="break-all font-mono" title={issue.fix_task_id}>{issue.fix_task_id}</dd>
+                                        </div>
+                                      )}
+                                    </dl>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <details className="text-[10px] text-gray-500 dark:text-gray-400">
+                          <summary className="cursor-pointer select-none font-medium focus-visible:ring-2 focus-visible:ring-blue-500">
+                            {copy.execution}
+                          </summary>
+                          <dl className="mt-1.5 grid gap-x-3 gap-y-1.5 sm:grid-cols-2">
+                            {round.implementation_session_id && (
+                              <div className="min-w-0">
+                                <dt>{copy.implementationAgent}</dt>
+                                <dd className="break-all font-mono">{round.implementation_session_id}</dd>
+                              </div>
+                            )}
+                            {round.evaluator_session_id && (
+                              <div className="min-w-0">
+                                <dt>{copy.evaluatorAgent}</dt>
+                                <dd className="break-all font-mono">{round.evaluator_session_id}</dd>
+                              </div>
+                            )}
+                            {round.fix_session_ids.length > 0 && (
+                              <div className="min-w-0 sm:col-span-2">
+                                <dt>{copy.fixAgents}</dt>
+                                {round.fix_session_ids.map((sessionId) => (
+                                  <dd key={sessionId} className="break-all font-mono">{sessionId}</dd>
+                                ))}
+                              </div>
+                            )}
+                          </dl>
+                        </details>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

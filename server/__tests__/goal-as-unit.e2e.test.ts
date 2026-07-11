@@ -13,6 +13,7 @@ import { createGoalRoutes } from "../api/routes/goals.js";
 import { createScheduler } from "../core/orchestration/scheduler.js";
 import { createOrchestrationEngine } from "../core/orchestration/engine.js";
 import { createQualityGate } from "../core/quality-gate/evaluator.js";
+import { flushVerificationBroadcastOutbox } from "../core/quality-gate/outbox.js";
 import { recoverOnStartup, rebroadcastPendingApprovals } from "../core/recovery.js";
 import type { SessionManager, SessionRecord } from "../core/agent/session.js";
 import type { AgentProvider, AgentSession } from "../core/agent/adapters/backend.js";
@@ -98,6 +99,13 @@ function passVerification(): string {
 {
   "verdict": "pass",
   "severity": "auto-resolve",
+  "dimensionJudgements": [
+    { "dimension": "functionality", "verdict": "pass", "evidence": "fixture functionality" },
+    { "dimension": "dataFlow", "verdict": "pass", "evidence": "fixture data flow" },
+    { "dimension": "designAlignment", "verdict": "pass", "evidence": "fixture design" },
+    { "dimension": "craft", "verdict": "pass", "evidence": "fixture craft" },
+    { "dimension": "edgeCases", "verdict": "pass", "evidence": "fixture edge cases" }
+  ],
   "dimensions": {
     "functionality": { "value": 8, "notes": "fixture pass" },
     "dataFlow": { "value": 8, "notes": "fixture pass" },
@@ -116,14 +124,52 @@ function failVerification(): string {
 {
   "verdict": "fail",
   "severity": "hard-block",
-  "dimensions": {
-    "functionality": { "value": 2, "notes": "fixture fail" },
-    "dataFlow": { "value": 2, "notes": "fixture fail" },
-    "designAlignment": { "value": 2, "notes": "fixture fail" },
-    "craft": { "value": 2, "notes": "fixture fail" },
-    "edgeCases": { "value": 2, "notes": "fixture fail" }
-  },
-  "issues": [{ "severity": "critical", "message": "fixture issue" }],
+  "dimensionJudgements": [
+    { "dimension": "functionality", "verdict": "fail", "evidence": "npm test -- null-case 실패" },
+    { "dimension": "dataFlow", "verdict": "pass", "evidence": "저장/조회 경로 확인" },
+    { "dimension": "designAlignment", "verdict": "pass", "evidence": "기존 패턴과 일치" },
+    { "dimension": "craft", "verdict": "fail", "evidence": "null guard 누락" },
+    { "dimension": "edgeCases", "verdict": "fail", "evidence": "null 입력 실패" }
+  ],
+  "issues": [{
+    "dimension": "functionality",
+    "severity": "critical",
+    "file": "feature-one.txt",
+    "line": 1,
+    "message": "null 입력에서 crash",
+    "reproCommand": "npm test -- null-case",
+    "expectedResult": "오류 응답 반환",
+    "actualResult": "TypeError 발생",
+    "fixInstruction": "null guard를 추가한다"
+  }],
+  "knownGaps": []
+}
+\`\`\``;
+}
+
+function conditionalVerification(): string {
+  return `\`\`\`json
+{
+  "verdict": "conditional",
+  "severity": "soft-block",
+  "dimensionJudgements": [
+    { "dimension": "functionality", "verdict": "pass", "evidence": "fixture functionality" },
+    { "dimension": "dataFlow", "verdict": "pass", "evidence": "fixture data flow" },
+    { "dimension": "designAlignment", "verdict": "pass", "evidence": "fixture design" },
+    { "dimension": "craft", "verdict": "pass", "evidence": "fixture craft" },
+    { "dimension": "edgeCases", "verdict": "pass", "evidence": "fixture edge cases" }
+  ],
+  "issues": [{
+    "dimension": "edgeCases",
+    "severity": "warning",
+    "file": "feature-one.txt",
+    "line": 1,
+    "message": "경계값 케이스 미확인",
+    "reproCommand": "npm test -- edge-case",
+    "expectedResult": "경계값도 통과",
+    "actualResult": "미검증",
+    "fixInstruction": "경계값 테스트를 추가한다"
+  }],
   "knownGaps": []
 }
 \`\`\``;
@@ -142,6 +188,7 @@ class FakeSession extends EventEmitter implements AgentSession {
   constructor(
     private readonly workdir: string,
     private readonly runtimeSessionId = `runtime-${fakeSessionSeq}`,
+    private readonly verificationResponse = passVerification(),
   ) {
     super();
   }
@@ -214,7 +261,7 @@ class FakeSession extends EventEmitter implements AgentSession {
     }
 
     if (message.includes("Quality Verification")) {
-      return this.stream(passVerification());
+      return this.stream(this.verificationResponse);
     }
 
     if (message.includes("\"before\"") && message.includes("\"changed\"")) {
@@ -238,24 +285,39 @@ class FakeSession extends EventEmitter implements AgentSession {
 class FakeSessionManager implements SessionManager {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly records = new Map<string, SessionRecord>();
+  private verificationSpawnCount = 0;
+  private verificationCount = 0;
   readonly spawns: Array<{ agentId: string; workdir: string; sessionKey?: string; taskId?: string | null }> = [];
 
-  private verificationCount = 0;
-
-  constructor(private readonly opts: { reuseEvaluatorRuntimeSession?: boolean; failVerificationOnce?: boolean } = {}) {}
+  constructor(private readonly opts: {
+    reuseEvaluatorRuntimeSession?: boolean;
+    reuseEvaluatorRuntimeSessionId?: string;
+    evaluatorRowId?: string;
+    verificationResponse?: string;
+    verificationResponses?: string[];
+    failVerificationOnce?: boolean;
+  } = {}) {}
 
   spawnAgent(agentId: string, projectWorkdir: string, sessionKey?: string, taskId?: string | null): AgentSession {
     const key = sessionKey ?? agentId;
     this.spawns.push({ agentId, workdir: projectWorkdir, sessionKey, taskId });
     const implementationRuntimeId = this.records.get("agent-coder")?.runtimeSessionId ?? undefined;
-    const runtimeSessionId = this.opts.reuseEvaluatorRuntimeSession && key.startsWith("evaluator-")
-      ? implementationRuntimeId
+    const runtimeSessionId = key.startsWith("evaluator-")
+      ? (this.opts.reuseEvaluatorRuntimeSessionId
+          ?? (this.opts.reuseEvaluatorRuntimeSession ? implementationRuntimeId : undefined))
       : undefined;
-    const session = new FakeSession(projectWorkdir, runtimeSessionId);
+    const verificationResponse = key.startsWith("evaluator-") && this.opts.verificationResponses
+      ? this.opts.verificationResponses[
+          Math.min(this.verificationSpawnCount++, this.opts.verificationResponses.length - 1)
+        ]
+      : this.opts.verificationResponse;
+    const session = new FakeSession(projectWorkdir, runtimeSessionId, verificationResponse);
     const record: SessionRecord = {
       sessionKey: key,
       agentId,
-      rowId: `fake-session-row-${++fakeSessionRowSeq}`,
+      rowId: key.startsWith("evaluator-") && this.opts.evaluatorRowId
+        ? this.opts.evaluatorRowId
+        : `fake-session-row-${++fakeSessionRowSeq}`,
       provider: "claude",
       runtimeSessionId: session.lastSessionId,
     };
@@ -335,6 +397,12 @@ async function fetchWithRetry(input: string, init?: RequestInit, attempts = 5): 
 
 async function readGoalStatus(baseUrl: string, goalId: string): Promise<any> {
   const res = await fetchWithRetry(`${baseUrl}/api/goals/${goalId}/status`);
+  expect(res.status).toBe(200);
+  return res.json();
+}
+
+async function readVerificationTimeline(baseUrl: string, goalId: string): Promise<any> {
+  const res = await fetch(`${baseUrl}/api/goals/${goalId}/verification-timeline`);
   expect(res.status).toBe(200);
   return res.json();
 }
@@ -483,6 +551,789 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
     } finally {
       await api.close();
     }
+  });
+
+  it("구조화 판정과 이슈를 normalized tables에 함께 저장한다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-normalized-verification";
+    const taskId = "task-normalized-verification";
+    const sessions = new FakeSessionManager({ verificationResponse: failVerification() });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Normalized verification', 'Persist structured result', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Structured failure', 'Persist all evaluator fields.', 'agent-coder', 'in_review', 'code')
+    `).run(taskId, goalId, projectId);
+    writeFileSync(join(repo, "feature-one.txt"), "changed\n");
+
+    const result = await createQualityGate(db, sessions, () => {}).verify(taskId, {
+      scope: "full",
+      workdir: repo,
+    });
+
+    expect(result.verdict).toBe("fail");
+    expect(result.dimensionJudgements).toHaveLength(5);
+    expect(db.prepare(
+      "SELECT count(*) AS count FROM verification_dimension_judgements WHERE verification_id = ?",
+    ).get(result.id)).toEqual({ count: 5 });
+    expect(db.prepare(`
+      SELECT dimension, severity, evidence, repro_command, expected_result,
+             actual_result, fix_instruction, assignee_id
+      FROM verification_issues WHERE verification_id = ?
+    `).get(result.id)).toMatchObject({
+      dimension: "functionality",
+      severity: "critical",
+      evidence: "null 입력에서 crash",
+      repro_command: "npm test -- null-case",
+      expected_result: "오류 응답 반환",
+      actual_result: "TypeError 발생",
+      fix_instruction: "null guard를 추가한다",
+      assignee_id: "agent-coder",
+    });
+  });
+
+  it("판정·감사 저장 후 broadcast가 실패해도 outbox에서 재전송한다", { timeout: 20_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-outbox";
+    const taskId = "task-verification-outbox";
+    const sessions = new FakeSessionManager();
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Verification outbox', 'Persist before broadcast', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Outbox fixture', 'Persist event.', 'agent-coder', 'in_review', 'code')
+    `).run(taskId, goalId, projectId);
+    writeFileSync(join(repo, "outbox.txt"), "changed\n");
+
+    const result = await createQualityGate(db, sessions, (event) => {
+      if (event === "verification:result") throw new Error("socket unavailable");
+    }).verify(taskId, { scope: "full", workdir: repo });
+
+    expect(result.verdict).toBe("pass");
+    expect(db.prepare("SELECT count(*) AS count FROM verifications WHERE id = ?").get(result.id))
+      .toEqual({ count: 1 });
+    const passActivity = db.prepare(`
+      SELECT metadata FROM activities
+      WHERE project_id = ? AND type = 'verification_pass'
+      ORDER BY id DESC LIMIT 1
+    `).get(projectId) as { metadata: string } | undefined;
+    expect(JSON.parse(passActivity?.metadata ?? "{}")).toMatchObject({
+      taskId,
+      status: "passed",
+      reason: "passed",
+    });
+    expect(db.prepare(`
+      SELECT delivered_at, attempts, last_error
+      FROM verification_broadcast_outbox WHERE verification_id = ?
+    `).get(result.id)).toMatchObject({
+      delivered_at: null,
+      attempts: 1,
+      last_error: "socket unavailable",
+    });
+
+    const replayed: Array<{ event: string; payload: any }> = [];
+    expect(flushVerificationBroadcastOutbox(db, (event, payload) => replayed.push({ event, payload }))).toBe(1);
+    expect(replayed).toEqual([{
+      event: "verification:result",
+      payload: expect.objectContaining({ id: result.id, taskId, verdict: "pass" }),
+    }]);
+    expect(db.prepare(`
+      SELECT delivered_at, attempts FROM verification_broadcast_outbox WHERE verification_id = ?
+    `).get(result.id)).toMatchObject({ delivered_at: expect.any(String), attempts: 2 });
+  });
+
+  it("verification timeline API가 공개 계약과 issue lifecycle을 다중 라운드로 반환한다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-timeline";
+    const taskId = "task-verification-timeline";
+    const fixTaskId = "task-verification-fix";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Verification timeline', 'Expose rounds', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Timeline fixture', 'Expose rounds.', 'agent-coder', 'in_review', 'code')
+    `).run(taskId, goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Fix timeline fixture', 'Fix issue.', 'agent-coder', 'done', 'code')
+    `).run(fixTaskId, goalId, projectId);
+
+    const scores = JSON.stringify(Object.fromEntries([
+      "functionality", "dataFlow", "designAlignment", "craft", "edgeCases",
+    ].map((dimension) => [dimension, { value: 8, notes: `${dimension} notes` }])));
+    const insertVerification = db.prepare(`
+      INSERT INTO verifications (
+        id, task_id, verdict, scope, dimensions, severity,
+        evaluator_session_id, implementation_session_id, termination_reason, created_at
+      ) VALUES (?, ?, ?, 'full', ?, ?, ?, ?, ?, ?)
+    `);
+    insertVerification.run("verification-1", taskId, "fail", scores, "soft-block", "eval-1", "impl-1", null, "2026-07-10 01:00:00");
+    insertVerification.run("verification-2", taskId, "pass", scores, "auto-resolve", "eval-2", "impl-2", "passed", "2026-07-10 02:00:00");
+    insertVerification.run("verification-3", taskId, "fail", scores, "hard-block", "eval-3", "impl-3", "hard_blocked", "2026-07-10 03:00:00");
+
+    const insertJudgement = db.prepare(`
+      INSERT INTO verification_dimension_judgements (verification_id, dimension, verdict, evidence)
+      VALUES (?, ?, 'pass', ?)
+    `);
+    for (const verificationId of ["verification-1", "verification-2", "verification-3"]) {
+      for (const dimension of ["functionality", "dataFlow", "designAlignment", "craft", "edgeCases"]) {
+        insertJudgement.run(verificationId, dimension, `${verificationId}-${dimension}`);
+      }
+    }
+
+    const insertIssue = db.prepare(`
+      INSERT INTO verification_issues (
+        id, verification_id, dimension, severity, evidence, repro_command,
+        expected_result, actual_result, fix_instruction, assignee_id
+      ) VALUES (?, ?, 'functionality', ?, 'same failure', 'npm test -- same',
+                'pass', 'fail', 'fix it', 'agent-coder')
+    `);
+    insertIssue.run("issue-first", "verification-1", "warning");
+    insertIssue.run("issue-regression", "verification-3", "info");
+    db.prepare(`
+      INSERT INTO verification_issue_tasks (issue_id, task_id, relation)
+      VALUES ('issue-first', ?, 'fix')
+    `).run(fixTaskId);
+    db.prepare(`
+      INSERT INTO verification_fix_rounds (
+        task_id, source_verification_id, round_number, assignee_id,
+        runtime_session_id, status, result_verification_id
+      ) VALUES (?, 'verification-1', 1, 'agent-coder', 'fix-runtime-1', 'completed', 'verification-2')
+    `).run(taskId);
+
+    const api = await startGoalApi(db);
+    try {
+      const timeline = await readVerificationTimeline(api.baseUrl, goalId);
+      expect(timeline).toMatchObject({
+        goal_id: goalId,
+        status: "stopped",
+        reason: "hard_blocked",
+      });
+      expect(timeline.rounds).toHaveLength(3);
+      expect(timeline.rounds[0]).toMatchObject({
+        round: 1,
+        implementation_session_id: "impl-1",
+        evaluator_session_id: "eval-1",
+        fix_session_ids: ["fix-runtime-1"],
+        dimensions: expect.arrayContaining([
+          expect.objectContaining({ dimension: "functionality", score: 8, passed: true, rationale: "verification-1-functionality" }),
+        ]),
+        issues: [expect.objectContaining({
+          issue_id: "issue-first",
+          status: "resolved",
+          severity: "medium",
+          fix_task_id: fixTaskId,
+        })],
+      });
+      expect(timeline.rounds[2].issues).toEqual([
+        expect.objectContaining({ issue_id: "issue-regression", status: "regression", severity: "low", fix_task_id: null }),
+      ]);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("verification timeline API는 다른 task의 PASS로 미해결 실패를 resolved/passed로 오판하지 않는다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-timeline-multitask";
+    const failedTaskId = "task-timeline-multitask-failed";
+    const passedTaskId = "task-timeline-multitask-passed";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Multitask timeline', 'Independent tasks must not cross-resolve', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Failing fixture', 'Has an unresolved failure.', 'agent-coder', 'in_review', 'code')
+    `).run(failedTaskId, goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Passing fixture', 'Independent passing task.', 'agent-coder', 'done', 'code')
+    `).run(passedTaskId, goalId, projectId);
+
+    const scores = JSON.stringify(Object.fromEntries([
+      "functionality", "dataFlow", "designAlignment", "craft", "edgeCases",
+    ].map((dimension) => [dimension, { value: 8, notes: `${dimension} notes` }])));
+    const insertVerification = db.prepare(`
+      INSERT INTO verifications (
+        id, task_id, verdict, scope, dimensions, severity,
+        evaluator_session_id, implementation_session_id, termination_reason, created_at
+      ) VALUES (?, ?, ?, 'full', ?, ?, ?, ?, ?, ?)
+    `);
+    // task A는 실패(미해결 이슈), task B는 그 뒤에 PASS를 저장한다.
+    insertVerification.run("verification-mt-fail", failedTaskId, "fail", scores, "hard-block", "eval-a", "impl-a", null, "2026-07-10 01:00:00");
+    insertVerification.run("verification-mt-pass", passedTaskId, "pass", scores, "auto-resolve", "eval-b", "impl-b", "passed", "2026-07-10 02:00:00");
+
+    db.prepare(`
+      INSERT INTO verification_issues (
+        id, verification_id, dimension, severity, evidence, repro_command,
+        expected_result, actual_result, fix_instruction, assignee_id
+      ) VALUES ('issue-mt-open', 'verification-mt-fail', 'functionality', 'high', 'still failing',
+                'npm test -- mt', 'pass', 'fail', 'fix it', 'agent-coder')
+    `).run();
+
+    const api = await startGoalApi(db);
+    try {
+      const timeline = await readVerificationTimeline(api.baseUrl, goalId);
+      // 다른 task의 PASS가 goal 전체를 passed로 만들면 안 된다 — task A는 여전히 실패.
+      expect(timeline.status).toBe("stopped");
+      expect(timeline.reason).toBe("verification_failed");
+      expect(timeline.rounds).toHaveLength(2);
+      const failRound = timeline.rounds.find((round: any) => round.task_id === failedTaskId);
+      // task A의 이슈는 task B의 뒤 라운드로 resolved 처리되면 안 된다 — open 유지.
+      expect(failRound.issues).toEqual([
+        expect.objectContaining({ issue_id: "issue-mt-open", status: "open" }),
+      ]);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("verification timeline API는 검증 안 된 형제 task가 남아 있으면 먼저 통과한 task로 goal을 passed 표시하지 않는다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-timeline-unverified-sibling";
+    const passedTaskId = "task-timeline-sibling-passed";
+    const pendingTaskId = "task-timeline-sibling-pending";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Unverified sibling timeline', 'A passes while B is still unverified', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    // task A는 통과·완료, task B는 아직 실행 전(검증 기록 없음).
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Passing fixture', 'Passes first.', 'agent-coder', 'done', 'code')
+    `).run(passedTaskId, goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Pending fixture', 'Not verified yet.', 'agent-coder', 'todo', 'code')
+    `).run(pendingTaskId, goalId, projectId);
+
+    const scores = JSON.stringify(Object.fromEntries([
+      "functionality", "dataFlow", "designAlignment", "craft", "edgeCases",
+    ].map((dimension) => [dimension, { value: 8, notes: `${dimension} notes` }])));
+    db.prepare(`
+      INSERT INTO verifications (
+        id, task_id, verdict, scope, dimensions, severity,
+        evaluator_session_id, implementation_session_id, termination_reason, created_at
+      ) VALUES ('verification-sibling-pass', ?, 'pass', 'full', ?, 'auto-resolve', 'eval-a', 'impl-a', 'passed', '2026-07-10 01:00:00')
+    `).run(passedTaskId, scores);
+
+    const api = await startGoalApi(db);
+    try {
+      const timeline = await readVerificationTimeline(api.baseUrl, goalId);
+      // task A만 통과했다고 goal 전체가 passed가 되면 안 된다 — task B는 아직 미검증.
+      expect(timeline.status).toBe("stopped");
+      expect(timeline.reason).toBe("verification_incomplete");
+      expect(timeline.rounds).toHaveLength(1);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("verification timeline API는 fix 라운드 이후 처음 나타난 새 이슈도 regression으로 판정한다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-timeline-new-regression";
+    const taskId = "task-verification-timeline-new-regression";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'New regression timeline', 'Expose new-issue regression', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Timeline fixture', 'Expose rounds.', 'agent-coder', 'in_review', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const scores = JSON.stringify(Object.fromEntries([
+      "functionality", "dataFlow", "designAlignment", "craft", "edgeCases",
+    ].map((dimension) => [dimension, { value: 8, notes: `${dimension} notes` }])));
+    const insertVerification = db.prepare(`
+      INSERT INTO verifications (
+        id, task_id, verdict, scope, dimensions, severity,
+        evaluator_session_id, implementation_session_id, termination_reason, created_at
+      ) VALUES (?, ?, ?, 'full', ?, ?, ?, ?, ?, ?)
+    `);
+    insertVerification.run("verification-nr-1", taskId, "fail", scores, "soft-block", "eval-1", "impl-1", null, "2026-07-10 01:00:00");
+    insertVerification.run("verification-nr-2", taskId, "fail", scores, "soft-block", "eval-2", "impl-2", null, "2026-07-10 02:00:00");
+
+    const insertJudgement = db.prepare(`
+      INSERT INTO verification_dimension_judgements (verification_id, dimension, verdict, evidence)
+      VALUES (?, ?, 'pass', ?)
+    `);
+    for (const verificationId of ["verification-nr-1", "verification-nr-2"]) {
+      for (const dimension of ["functionality", "dataFlow", "designAlignment", "craft", "edgeCases"]) {
+        insertJudgement.run(verificationId, dimension, `${verificationId}-${dimension}`);
+      }
+    }
+
+    // round 0의 이슈는 fix로 해결되고, round 1(fix 이후)에 이전에 없던 새 이슈가 등장한다.
+    db.prepare(`
+      INSERT INTO verification_issues (
+        id, verification_id, dimension, severity, evidence, repro_command,
+        expected_result, actual_result, fix_instruction, assignee_id
+      ) VALUES ('issue-nr-original', 'verification-nr-1', 'functionality', 'high', 'original failure',
+                'npm test -- original', 'pass', 'fail', 'fix it', 'agent-coder')
+    `).run();
+    db.prepare(`
+      INSERT INTO verification_issues (
+        id, verification_id, dimension, severity, evidence, repro_command,
+        expected_result, actual_result, fix_instruction, assignee_id
+      ) VALUES ('issue-nr-new', 'verification-nr-2', 'craft', 'high', 'brand new failure introduced by the fix',
+                'npm test -- new', 'pass', 'fail', 'fix it', 'agent-coder')
+    `).run();
+
+    const api = await startGoalApi(db);
+    try {
+      const timeline = await readVerificationTimeline(api.baseUrl, goalId);
+      expect(timeline.rounds).toHaveLength(2);
+      expect(timeline.rounds[1].issues).toEqual([
+        expect.objectContaining({ issue_id: "issue-nr-new", status: "regression" }),
+      ]);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("verification timeline API는 같은 라운드에서 resolved와 regression을 동시에 판정한다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-timeline-simultaneous";
+    const taskId = "task-verification-timeline-simultaneous";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Simultaneous resolved+regression', 'One round both resolves an issue and regresses another', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Timeline fixture', 'Expose rounds.', 'agent-coder', 'in_review', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const scores = JSON.stringify(Object.fromEntries([
+      "functionality", "dataFlow", "designAlignment", "craft", "edgeCases",
+    ].map((dimension) => [dimension, { value: 8, notes: `${dimension} notes` }])));
+    const insertVerification = db.prepare(`
+      INSERT INTO verifications (
+        id, task_id, verdict, scope, dimensions, severity,
+        evaluator_session_id, implementation_session_id, termination_reason, created_at
+      ) VALUES (?, ?, ?, 'full', ?, ?, ?, ?, ?, ?)
+    `);
+    // round 0: issue-sim-c1만 발견. round 1: c1은 그대로 남아 있다가 round 2에서 사라지므로
+    // (이 라운드 기준으로) resolved, 동시에 이전에 없던 c2가 새로 등장해 regression — 한 라운드의
+    // issues 배열 안에 두 상태가 공존해야 한다. round 2: fix 완료로 이슈 없음(pass).
+    insertVerification.run("verification-sim-1", taskId, "fail", scores, "soft-block", "eval-sim-1", "impl-sim-1", null, "2026-07-10 01:00:00");
+    insertVerification.run("verification-sim-2", taskId, "fail", scores, "soft-block", "eval-sim-2", "impl-sim-2", null, "2026-07-10 02:00:00");
+    insertVerification.run("verification-sim-3", taskId, "pass", scores, "auto-resolve", "eval-sim-3", "impl-sim-3", "passed", "2026-07-10 03:00:00");
+
+    const insertIssue = db.prepare(`
+      INSERT INTO verification_issues (
+        id, verification_id, dimension, severity, evidence, repro_command,
+        expected_result, actual_result, fix_instruction, assignee_id
+      ) VALUES (?, ?, ?, 'high', ?, ?, 'pass', 'fail', 'fix it', 'agent-coder')
+    `);
+    insertIssue.run("issue-sim-c1", "verification-sim-1", "functionality", "continuing failure", "npm test -- c1");
+    insertIssue.run("issue-sim-c1-round2", "verification-sim-2", "functionality", "continuing failure", "npm test -- c1");
+    insertIssue.run("issue-sim-c2", "verification-sim-2", "craft", "brand new failure introduced by the fix", "npm test -- c2");
+
+    const api = await startGoalApi(db);
+    try {
+      const timeline = await readVerificationTimeline(api.baseUrl, goalId);
+      expect(timeline.rounds).toHaveLength(3);
+      // round 1: c1은 다음 라운드에도 그대로 등장하므로 아직 open.
+      expect(timeline.rounds[0].issues).toEqual([
+        expect.objectContaining({ issue_id: "issue-sim-c1", status: "open" }),
+      ]);
+      // round 2: 같은 이슈(issue-sim-c1-round2)는 round 3에서 사라지므로 resolved,
+      // 새로 나타난 issue-sim-c2는 regression — 한 라운드 안에서 두 상태가 동시에 나온다.
+      expect(timeline.rounds[1].issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ issue_id: "issue-sim-c1-round2", status: "resolved" }),
+          expect.objectContaining({ issue_id: "issue-sim-c2", status: "regression" }),
+        ]),
+      );
+      expect(timeline.rounds[1].issues).toHaveLength(2);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("verification timeline API가 검증 기록이 없는 goal에도 계약 enum 안의 status를 반환한다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-timeline-empty";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Empty timeline fixture', 'No verifications yet', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+
+    const api = await startGoalApi(db);
+    try {
+      const timeline = await readVerificationTimeline(api.baseUrl, goalId);
+      expect(["passed", "fixing", "stopped", "manual_approval"]).toContain(timeline.status);
+      expect(timeline.rounds).toEqual([]);
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("verification timeline API가 conditional 판정을 계약 enum(manual_approval)으로 매핑한다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-verification-timeline-conditional";
+    const taskId = "task-verification-timeline-conditional";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Conditional timeline fixture', 'Expose conditional round', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Conditional fixture', 'Expose conditional round.', 'agent-coder', 'in_review', 'code')
+    `).run(taskId, goalId, projectId);
+    db.prepare(`
+      INSERT INTO verifications (id, task_id, verdict, scope, termination_reason)
+      VALUES ('verification-conditional', ?, 'conditional', 'standard', 'conditional')
+    `).run(taskId);
+
+    const api = await startGoalApi(db);
+    try {
+      const timeline = await readVerificationTimeline(api.baseUrl, goalId);
+      expect(timeline.rounds).toHaveLength(1);
+      expect(["pass", "fail", "stopped", "manual_approval"]).toContain(timeline.rounds[0].verdict);
+      expect(timeline.rounds[0].verdict).toBe("manual_approval");
+      expect(timeline.status).toBe("manual_approval");
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("evaluator가 과거 fix session의 runtime 세션을 재사용하면 판정을 저장하지 않고 분리 실패한다", { timeout: 20_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-fix-session-separation";
+    const taskId = "task-fix-session-separation";
+    // sessions row id(세션 DB row)와 CLI runtime session id는 별개다. evaluator는
+    // 항상 새 row로 spawn되므로 row id는 절대 충돌하지 않고, 실제 맥락 누수는 runtime
+    // 대화를 이어받을 때(runtime id 일치) 발생한다 → 이 조건이 프로덕션에서 가능한 조건.
+    const fixSessionRowId = "fix-session-row";
+    const fixRuntimeSessionId = "runtime-fix-round-1";
+    const sourceVerificationId = "source-verification";
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Fix session separation', 'Reject previous fix session', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Fix session fixture', 'Reject reused fix session.', 'agent-coder', 'in_review', 'code')
+    `).run(taskId, goalId, projectId);
+    db.prepare("INSERT INTO sessions (id, agent_id, status) VALUES (?, 'agent-coder', 'completed')")
+      .run(fixSessionRowId);
+    db.prepare(`
+      INSERT INTO verifications (id, task_id, verdict, scope, evaluator_session_id)
+      VALUES (?, ?, 'fail', 'full', 'old-evaluator')
+    `).run(sourceVerificationId, taskId);
+    db.prepare(`
+      INSERT INTO verification_fix_rounds (
+        task_id, source_verification_id, round_number, assignee_id,
+        session_id, runtime_session_id, status
+      ) VALUES (?, ?, 1, 'agent-coder', ?, ?, 'completed')
+    `).run(taskId, sourceVerificationId, fixSessionRowId, fixRuntimeSessionId);
+
+    const sessions = new FakeSessionManager({ reuseEvaluatorRuntimeSessionId: fixRuntimeSessionId });
+    const result = await createQualityGate(db, sessions, () => {}).verify(taskId, {
+      scope: "full",
+      workdir: repo,
+    });
+
+    expect(result.verdict).toBe("fail");
+    expect(result.evaluatorSessionId).toBe(fixRuntimeSessionId);
+    expect(result.issues[0]?.id).toBe("issue-evaluator-session-reused");
+    expect(result.issues[0]?.message).toContain("과거 수정 세션");
+
+    // 판정이 실제로 저장됐는지 + 재사용 activity가 fix source로 남는지 확인
+    const activity = db.prepare(`
+      SELECT metadata FROM activities
+      WHERE project_id = ? AND type = 'verification_fail'
+      ORDER BY id DESC LIMIT 1
+    `).get(projectId) as { metadata: string } | undefined;
+    expect(JSON.parse(activity?.metadata ?? "{}")).toMatchObject({
+      taskId,
+      reason: "evaluator_session_reused",
+      reusedSessionSource: "fix",
+      reusedSessionId: fixRuntimeSessionId,
+    });
+  });
+
+  it("auto-fix 루프는 maxFixRetries 라운드만 소진하고 goal-as-unit 태스크를 pending_approval로 넘긴다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-fix-round-limit";
+    const taskId = "task-fix-round-limit";
+    const sessions = new FakeSessionManager({ verificationResponse: failVerification() });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Fix round limit fixture', 'Always-fail verification', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Implement first fixture', 'Create the first fixture file.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    const result = await engine.executeTask(taskId, { autoFix: true, maxFixRetries: 1 });
+
+    expect(result).toEqual({ success: false, verdict: "conditional" });
+
+    const task = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string };
+    expect(task.status).toBe("pending_approval");
+
+    const fixRounds = db.prepare(
+      "SELECT COUNT(*) AS count FROM verification_fix_rounds WHERE task_id = ?",
+    ).get(taskId) as { count: number };
+    expect(fixRounds.count).toBe(1);
+
+    const latestVerification = db.prepare(
+      "SELECT termination_reason FROM verifications WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+    ).get(taskId) as { termination_reason: string | null };
+    expect(latestVerification.termination_reason).toBe("fix_round_limit");
+
+    const activity = db.prepare(`
+      SELECT message, metadata FROM activities
+      WHERE project_id = ? AND type = 'verification_manual_approval'
+      ORDER BY id DESC LIMIT 1
+    `).get(projectId) as { message: string; metadata: string } | undefined;
+    expect(activity?.message).toContain("Fix round limit reached");
+    expect(JSON.parse(activity?.metadata ?? "{}")).toMatchObject({
+      taskId,
+      status: "manual_approval",
+      reason: "fix_round_limit",
+    });
+
+    const fixingActivity = db.prepare(`
+      SELECT metadata FROM activities
+      WHERE project_id = ? AND type = 'verification_fixing'
+      ORDER BY id DESC LIMIT 1
+    `).get(projectId) as { metadata: string } | undefined;
+    expect(JSON.parse(fixingActivity?.metadata ?? "{}")).toMatchObject({
+      taskId,
+      status: "fixing",
+      reason: "auto_fix_in_progress",
+      round: 1,
+      maxRounds: 1,
+    });
+  });
+
+  it("fail → fix → conditional 재검증은 done/squash로 자동완료하지 않고 pending_approval로 넘긴다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-reverify-conditional";
+    const taskId = "task-reverify-conditional";
+    const sessions = new FakeSessionManager({
+      verificationResponses: [failVerification(), conditionalVerification()],
+    });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Reverify conditional fixture', 'Fail then conditional on reverify', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Implement first fixture', 'Create the first fixture file.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    const result = await engine.executeTask(taskId, { autoFix: true, maxFixRetries: 2 });
+
+    expect(result).toEqual({ success: false, verdict: "conditional" });
+
+    const task = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string };
+    expect(task.status).toBe("pending_approval");
+
+    const latestVerification = db.prepare(
+      "SELECT termination_reason FROM verifications WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+    ).get(taskId) as { termination_reason: string | null };
+    expect(latestVerification.termination_reason).toBe("conditional");
+
+    const activity = db.prepare(`
+      SELECT message, metadata FROM activities
+      WHERE project_id = ? AND type = 'verification_manual_approval'
+      ORDER BY id DESC LIMIT 1
+    `).get(projectId) as { message: string; metadata: string } | undefined;
+    expect(activity?.message).toContain("conditional");
+    expect(JSON.parse(activity?.metadata ?? "{}")).toMatchObject({
+      taskId,
+      status: "manual_approval",
+      reason: "conditional",
+    });
+  });
+
+  it("evaluator_error 판정은 fix 루프에 진입하지 않고 fix session을 스폰하지 않는다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-evaluator-error-skip";
+    const taskId = "task-evaluator-error-skip";
+    // dimensionJudgements가 없는 구조화 계약 위반 응답 — parseVerificationResult가
+    // 매번 evaluator_error로 거부한다(1회 내부 재시도까지 포함).
+    const brokenEvaluation = "```json\n{\"verdict\":\"fail\",\"severity\":\"hard-block\",\"issues\":[]}\n```";
+    const sessions = new FakeSessionManager({ verificationResponse: brokenEvaluation });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Evaluator error fixture', 'Always-broken verification output', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Implement first fixture', 'Create the first fixture file.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    const result = await engine.executeTask(taskId, { autoFix: true, maxFixRetries: 2 });
+
+    expect(result).toEqual({ success: false, verdict: "fail" });
+
+    // fix 루프에 들어가지 않았어야 한다 — fix round record가 전혀 생기지 않는다.
+    const fixRounds = db.prepare(
+      "SELECT COUNT(*) AS count FROM verification_fix_rounds WHERE task_id = ?",
+    ).get(taskId) as { count: number };
+    expect(fixRounds.count).toBe(0);
+
+    const latestVerification = db.prepare(
+      "SELECT termination_reason FROM verifications WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+    ).get(taskId) as { termination_reason: string | null };
+    expect(latestVerification.termination_reason).toBe("evaluator_error");
+
+    const task = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string };
+    expect(task.status).toBe("blocked");
+
+    const stoppedActivity = db.prepare(`
+      SELECT metadata FROM activities
+      WHERE project_id = ? AND type = 'verification_stopped'
+      ORDER BY id DESC LIMIT 1
+    `).get(projectId) as { metadata: string } | undefined;
+    expect(JSON.parse(stoppedActivity?.metadata ?? "{}")).toMatchObject({
+      taskId,
+      status: "stopped",
+      reason: "evaluator_error",
+    });
+
+    const qaRegressionTasks = db.prepare(`
+      SELECT COUNT(*) AS count FROM tasks
+      WHERE goal_id = ? AND title LIKE '[실전 QA 회귀]%'
+    `).get(goalId) as { count: number };
+    expect(qaRegressionTasks.count).toBe(0);
+  });
+
+  it("변경 파일이 없어도 evaluator_error를 pass로 덮어쓰지 않고 stopped로 종료한다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-no-change-evaluator-error";
+    const taskId = "task-no-change-evaluator-error";
+    const brokenEvaluation = "```json\n{\"verdict\":\"fail\",\"severity\":\"hard-block\",\"issues\":[]}\n```";
+    const sessions = new FakeSessionManager({ verificationResponse: brokenEvaluation });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'No-change evaluator error', 'Evaluator contract failure without a diff', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'No-op implementation', 'Produce no file changes.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    const result = await engine.executeTask(taskId, { autoFix: true, maxFixRetries: 2 });
+
+    expect(result).toEqual({ success: false, verdict: "fail" });
+    expect(db.prepare(
+      "SELECT status FROM tasks WHERE id = ?",
+    ).get(taskId)).toEqual({ status: "blocked" });
+    expect(db.prepare(
+      "SELECT verdict, termination_reason FROM verifications WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+    ).get(taskId)).toEqual({ verdict: "fail", termination_reason: "evaluator_error" });
+  });
+
+  it("수정 후 재검증의 evaluator_error도 fix_round_limit으로 덮지 않고 stopped로 종료한다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-reverify-evaluator-error";
+    const taskId = "task-reverify-evaluator-error";
+    const brokenEvaluation = "```json\n{\"verdict\":\"fail\",\"severity\":\"hard-block\",\"issues\":[]}\n```";
+    const sessions = new FakeSessionManager({
+      verificationResponses: [failVerification(), brokenEvaluation],
+    });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Reverify evaluator error', 'Stop after broken re-verification', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Implement first fixture', 'Create the first fixture file.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    const result = await engine.executeTask(taskId, { autoFix: true, maxFixRetries: 2 });
+
+    expect(result).toEqual({ success: false, verdict: "fail" });
+    expect(db.prepare(
+      "SELECT status FROM tasks WHERE id = ?",
+    ).get(taskId)).toEqual({ status: "blocked" });
+    expect(db.prepare(
+      "SELECT COUNT(*) AS count FROM verification_fix_rounds WHERE task_id = ?",
+    ).get(taskId)).toEqual({ count: 1 });
+    expect(db.prepare(
+      "SELECT termination_reason FROM verifications WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+    ).get(taskId)).toEqual({ termination_reason: "evaluator_error" });
+    expect(db.prepare(`
+      SELECT COUNT(*) AS count FROM activities
+      WHERE project_id = ? AND type = 'verification_manual_approval'
+    `).get(projectId)).toEqual({ count: 0 });
+
+    const stoppedActivity = db.prepare(`
+      SELECT metadata FROM activities
+      WHERE project_id = ? AND type = 'verification_stopped'
+      ORDER BY id DESC LIMIT 1
+    `).get(projectId) as { metadata: string } | undefined;
+    expect(JSON.parse(stoppedActivity?.metadata ?? "{}")).toMatchObject({
+      taskId,
+      status: "stopped",
+      reason: "evaluator_error",
+    });
   });
 
   it("auto-fix 세션을 실행 task에 귀속시킨다", { timeout: 30_000 }, async () => {

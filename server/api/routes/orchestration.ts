@@ -223,7 +223,6 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
 
     try {
       const result = await qualityGate.verify(taskId, { scope });
-      broadcast("verification:result", result);
       // verification_id linkage is handled inside qualityGate.verify() via RETURNING
 
       // Auto-approve on pass
