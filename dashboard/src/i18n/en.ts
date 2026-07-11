@@ -3,6 +3,8 @@ const en = {
   appName: "Crewdeck",
   appSubtitle: "AI Team Orchestration",
   projects: "Projects",
+  sidebarWorking: "Working",
+  sidebarWaiting: "Needs approval",
   newProject: "+ New Project",
   importLocal: "Import Local",
   connectGitHub: "Connect GitHub",

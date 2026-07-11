@@ -33,6 +33,47 @@ export function createProjectRoutes(ctx: AppContext): Router {
     res.json(projects.map(toProjectResponse));
   });
 
+  // Cross-project live activity — powers the sidebar working/waiting indicators.
+  // DB-derived so it survives page reload; returns only non-idle projects (a
+  // missing key = idle) to keep the payload small. Structured enum + counts
+  // only — no user-facing strings; the dashboard localizes them.
+  // NOTE: must be registered before "/:id" or Express captures it as id="activity".
+  router.get("/activity", (_req, res) => {
+    type Agg = {
+      inProgress: number; workingAgents: number; specGen: number; squashRunning: number;
+      pending: number; waitingAgents: number; squashPending: number;
+    };
+    const map = new Map<string, Agg>();
+    const bump = (pid: string, key: keyof Agg, n: number) => {
+      let a = map.get(pid);
+      if (!a) {
+        a = { inProgress: 0, workingAgents: 0, specGen: 0, squashRunning: 0, pending: 0, waitingAgents: 0, squashPending: 0 };
+        map.set(pid, a);
+      }
+      a[key] += n;
+    };
+
+    for (const r of db.prepare("SELECT project_id, COUNT(*) c FROM tasks WHERE status = 'in_progress' GROUP BY project_id").all() as any[])
+      bump(r.project_id, "inProgress", r.c);
+    for (const r of db.prepare("SELECT project_id, COUNT(*) c FROM tasks WHERE status = 'pending_approval' GROUP BY project_id").all() as any[])
+      bump(r.project_id, "pending", r.c);
+    for (const r of db.prepare("SELECT project_id, status, COUNT(*) c FROM agents WHERE status IN ('working', 'waiting_approval') GROUP BY project_id, status").all() as any[])
+      bump(r.project_id, r.status === "working" ? "workingAgents" : "waitingAgents", r.c);
+    for (const r of db.prepare("SELECT project_id, squash_status, COUNT(*) c FROM goals WHERE squash_status IN ('resolving', 'triggering', 'pending_approval') GROUP BY project_id, squash_status").all() as any[])
+      bump(r.project_id, r.squash_status === "pending_approval" ? "squashPending" : "squashRunning", r.c);
+    for (const r of db.prepare(`SELECT g.project_id, COUNT(*) c FROM goal_specs gs JOIN goals g ON g.id = gs.goal_id WHERE gs.prd_summary LIKE '%"_status":"generating"%' GROUP BY g.project_id`).all() as any[])
+      bump(r.project_id, "specGen", r.c);
+
+    const out: Record<string, { state: "working" | "waiting"; activeCount: number }> = {};
+    for (const [pid, a] of map) {
+      const working = a.inProgress > 0 || a.workingAgents > 0 || a.specGen > 0 || a.squashRunning > 0;
+      const waiting = a.pending > 0 || a.waitingAgents > 0 || a.squashPending > 0;
+      if (working) out[pid] = { state: "working", activeCount: a.inProgress };
+      else if (waiting) out[pid] = { state: "waiting", activeCount: a.pending + a.squashPending + a.waitingAgents };
+    }
+    res.json(out);
+  });
+
   // Get single project
   router.get("/:id", (req, res) => {
     const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(req.params.id);

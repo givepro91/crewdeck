@@ -3,6 +3,8 @@ const ko = {
   appName: "Crewdeck",
   appSubtitle: "AI 팀 오케스트레이션",
   projects: "프로젝트",
+  sidebarWorking: "작업 중",
+  sidebarWaiting: "승인 대기",
   newProject: "+ 새 프로젝트",
   importLocal: "로컬 가져오기",
   connectGitHub: "GitHub 연결",

@@ -14,6 +14,34 @@ export function Sidebar() {
   const [showDialog, setShowDialog] = useState<"newProject" | "import" | "github" | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  // 프로젝트별 실시간 작업 상태 — 어떤 프로젝트가 지금 일하는지 사이드바에서 한눈에.
+  // DB 집계라 새로고침에도 정확. 마운트 1회 + WS refresh(디바운스) + 8s 폴백 폴링.
+  const [activity, setActivity] = useState<Record<string, { state: "working" | "waiting"; activeCount: number }>>({});
+
+  useEffect(() => {
+    let alive = true;
+    let debounce: ReturnType<typeof setTimeout> | null = null;
+    const fetchActivity = () => {
+      api.projects
+        .activity()
+        .then((a) => { if (alive) setActivity(a); })
+        .catch(() => { /* 서버 미지원/오류 시 인디케이터 없음 */ });
+    };
+    fetchActivity();
+    const onRefresh = () => {
+      if (debounce) clearTimeout(debounce);
+      debounce = setTimeout(fetchActivity, 400);
+    };
+    window.addEventListener("crewdeck:refresh", onRefresh);
+    const poll = setInterval(fetchActivity, 8000);
+    return () => {
+      alive = false;
+      if (debounce) clearTimeout(debounce);
+      window.removeEventListener("crewdeck:refresh", onRefresh);
+      clearInterval(poll);
+    };
+  }, []);
+
   // Listen for CommandPalette delegation events
   useEffect(() => {
     const onOpenNewProject = () => setShowDialog("newProject");
@@ -30,6 +58,28 @@ export function Sidebar() {
   }, []);
 
   const showToast = (msg: string) => setToast(msg);
+
+  // working = 인디고 pulse(+진행 태스크 수), waiting = 앰버(+승인 대기 수), idle = 표시 없음
+  const renderActivity = (projectId: string) => {
+    const act = activity[projectId];
+    if (!act) return null;
+    const working = act.state === "working";
+    const label = working ? t("sidebarWorking") : t("sidebarWaiting");
+    return (
+      <span className="shrink-0 flex items-center gap-1" title={label} aria-label={label}>
+        {act.activeCount > 0 && (
+          <span
+            className={`text-[10px] font-medium tabular-nums ${
+              working ? "text-indigo-500 dark:text-indigo-400" : "text-amber-500 dark:text-amber-400"
+            }`}
+          >
+            {act.activeCount}
+          </span>
+        )}
+        <span className={`w-2 h-2 rounded-full ${working ? "bg-indigo-500 animate-pulse" : "bg-amber-400"}`} />
+      </span>
+    );
+  };
 
   const handleNewProject = async (name: string, mission: string, workdir: string, autoAgents: boolean) => {
     setShowDialog(null);
@@ -162,7 +212,8 @@ export function Sidebar() {
                     ? "\uD83D\uDCC2"
                     : "\uD83D\uDCC1"}
               </span>
-              <span className="truncate">{p.name}</span>
+              <span className="truncate flex-1 min-w-0">{p.name}</span>
+              {renderActivity(p.id)}
             </button>
           ))}
         </nav>
