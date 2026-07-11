@@ -16,6 +16,7 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 let repo: string;
+const GIT_TEST_TIMEOUT_MS = 20_000;
 
 beforeEach(() => {
   repo = mkdtempSync(join(tmpdir(), 'crewdeck-evdiff-'));
@@ -29,13 +30,13 @@ beforeEach(() => {
   writeFileSync(join(repo, 'a.txt'), 'base\n');
   git(repo, 'add', 'a.txt');
   git(repo, 'commit', '-m', 'base');
-});
+}, GIT_TEST_TIMEOUT_MS);
 
 afterEach(() => {
   rmSync(repo, { recursive: true, force: true });
-});
+}, GIT_TEST_TIMEOUT_MS);
 
-describe('collectDiffSummary — Goal-as-Unit 누적 diff (goalBase)', () => {
+describe('collectDiffSummary — Goal-as-Unit 누적 diff (goalBase)', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('분기점 이후의 커밋된 변경 + 미커밋 변경 + untracked를 모두 잡는다', () => {
     git(repo, 'checkout', '-b', 'goal/x');
     // 커밋된 변경 (architect phase 등)
@@ -61,7 +62,9 @@ describe('collectDiffSummary — Goal-as-Unit 누적 diff (goalBase)', () => {
     // 잔여물 커밋 시뮬레이션 — .omc만 커밋됨 (R1 1차 스모크의 residue 커밋)
     mkdirSync(join(repo, '.omc'), { recursive: true });
     writeFileSync(join(repo, '.omc', 'state.json'), '{}\n');
-    git(repo, 'add', '-f', '.omc'); // .omc는 전역 gitignore로 무시될 수 있어 강제 add (잔여물 커밋 시뮬레이션)
+    // .omc는 사용자 전역 gitignore(core.excludesFile)에 등록돼 있을 수 있으므로 -f로 강제 스테이징한다.
+    // (residue 커밋 시뮬레이션 — collectDiffSummary가 이를 제외하는지 검증하는 게 목적)
+    git(repo, 'add', '-f', '.omc');
     git(repo, 'commit', '-m', 'residue');
     // untracked 도구 상태
     mkdirSync(join(repo, '.playwright-mcp'), { recursive: true });
@@ -87,7 +90,7 @@ describe('collectDiffSummary — Goal-as-Unit 누적 diff (goalBase)', () => {
   });
 });
 
-describe('collectDiffSummary — legacy 모드 (goalBase 없음)', () => {
+describe('collectDiffSummary — legacy 모드 (goalBase 없음)', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('HEAD~1..HEAD 커밋 diff를 그대로 사용한다', () => {
     writeFileSync(join(repo, 'b.txt'), 'second\n');
     git(repo, 'add', 'b.txt');

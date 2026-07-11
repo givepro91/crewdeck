@@ -1,7 +1,7 @@
 # Goal-as-Unit 아키텍처 전환
 
 작성일: 2026-04-21
-상태: 설계 확정 (구현 전)
+상태: 구현 완료 · 운영 계약 (2026-07-11 현재)
 근거 사례: drift 기능 Full Auto 구현 실패 (false-positive 1,000건+, git log 파편화)
 
 ---
@@ -60,6 +60,83 @@ Goal
 ---
 
 ## Solution
+
+### 현행 스케줄링 계약
+
+> 이 절이 현행 구현의 규범 계약이다. 아래 §§1–5는 Goal-as-Unit 전환 배경과 구현 의사결정을 보존한다.
+
+#### 병렬성 단위와 환경변수
+
+- 프로젝트 실행 동시성의 단위는 agent나 task가 아니라 **활성 goal slot**이다.
+- 기본 상한은 goal 2개다. `CREWDECK_MAX_CONCURRENCY` 환경변수로 override하며, `server/utils/constants.ts`에서 기본값 `2`를 해석한다.
+- rate limit 발생 시 scheduler의 AIMD가 해당 프로젝트의 효과 동시성을 임시로 낮추고, 성공/쿨다운 후 설정 상한까지 복구한다. 대시보드의 `maxConcurrency`는 이 효과값이다.
+- goal 간은 각자의 worktree가 격리되므로 slot 상한까지 병렬 실행한다. goal 내부는 공유 worktree·체크포인트·선행 맥락을 보호하기 위해 **항상 태스크 1개만 live**다.
+- 동일 task assignee도 한 번에 live execution lane 1개만 소유한다. 수동 실행과 scheduler 실행은 같은 DB claim 경계를 사용한다.
+
+#### Lookahead 1
+
+- spec/decompose 준비 lane은 실행 lane과 별도이며, 프로젝트당 동시에 하나의 `goalPreparationFlight`만 소유한다.
+- task 상태를 진실원으로 활성 goal을 계산하고, `activeGoalCount < effectiveConcurrency + 1`일 때만 다음 미분해 goal 하나를 우선순위 순으로 spec → decompose한다. 즉 실행 slot 밖에 최대 1개 goal만 선행 준비한다.
+- 큐를 명시적으로 정지하면 이미 실행 중인 session은 강제 종료하지 않지만, 새 spec/decompose, decompose retry, full-autopilot 재시작, 새 task dispatch는 시작하지 않는다.
+
+#### Claim 소유권과 lane 상태
+
+`claimTaskForExecution()`이 transaction 안에서 유일한 실행 소유권을 획득한다.
+
+1. 후보 task가 `todo` 또는 `pending_approval`인지 확인한다.
+2. 같은 goal의 다른 `in_progress`/`in_review` task, 같은 agent의 다른 live task, 그리고 최근 5초 내 반납된 claim settle lease가 없을 때만 CAS로 `in_progress`를 기록한다.
+3. scheduler는 claim 성공 후에만 비동기 실행을 시작한다. 수동 API는 성공 시 `202 { status: "started", taskId }`, 충돌 시 현재 DB 상태를 포함한 `409`를 반환한다.
+
+스케줄링에서 lane을 점유하는 상태는 다음과 같다.
+
+| 상태 | 스케줄링 의미 |
+|------|-----------------|
+| `todo` | 실행 후보. 단, 최근 claim이 반납된 task는 `started_at` 기준 5초 settle 기간 동안 goal lane을 보유한다. |
+| `pending_approval` | 수동 승인 전에는 scheduler 후보가 아니다. goal/full autopilot 큐 시작 시 `todo`로 자동 승인할 수 있다. |
+| `in_progress` | Generator/아키텍트/실행 단계가 goal lane을 점유한다. 미종결 child를 기다리는 delegation parent는 live session이 없으므로 점유 계산에서 제외한다. |
+| `in_review` | 독립 Evaluator 검증 중이며 같은 goal lane을 계속 점유한다. |
+| `blocked` | 재시도 가능하면 쿨다운 동안 그 goal slot을 예약한다. retry/reassign 두 한도가 모두 소진되면 영구 차단으로 취급하여 신규 slot을 점유하지 않는다. |
+| `done` | terminal. lane을 반납하고 다음 태스크나 goal squash 단계를 진행한다. |
+
+실행 후보 정렬은 goal `priority` → `sort_order` → `created_at`이다. 각 goal 안에서는 실행 가능한 첫 task 하나만 선택한다. 상위 goal이 dependency 또는 reviewer gate에 막히면 slot을 노는 대신 다음 goal을 검색한다. retry/failover는 신규 sibling보다 먼저 같은 task를 재claim한다.
+
+Goal-as-Unit의 integration 상태는 task lane과 별개다.
+
+| `squash_status` | 의미 |
+|-----------------|------|
+| `none` | task 실행 중 또는 squash 미시작. |
+| `triggering` | 마지막 task 완료 후 squash 준비 CAS를 획득한 임시 상태. |
+| `pending_approval` | acceptance/QA/squash 준비가 끝나 사용자 반영 승인을 기다림. |
+| `approved` | 승인됐고 integration을 진행 중임. |
+| `resolving` | 병렬 goal과의 변경 겹침을 별도 해결 session이 처리 중임. |
+| `merged` | terminal. squash 반영과 worktree 정리가 완료됨. |
+| `blocked` | acceptance, worktree, 충돌 해결 또는 integration 실패로 사람 개입/재시도가 필요함. |
+
+#### Generator–Evaluator 분리
+
+- Generator의 구현 session과 Evaluator session은 다른 session ID여야 한다. Quality Gate는 구현 assignee를 reviewer 후보에서 제외하고, 필요하면 전용 `[Crewdeck] Evaluator` agent를 사용한다.
+- session 재사용이 감지되면 검증은 통과할 수 없고 분리 계약 실패를 기록한다.
+- task는 검증 동안 `in_review`를 유지하므로 Evaluator가 완료되기 전에 같은 goal의 다음 Generator가 시작할 수 없다. FAIL 시 fix → 재검증도 같은 goal lane에서 순차 수행한다.
+
+#### 실패·재시작·취소 정리
+
+**실패 및 재디스패치**
+
+- Goal-as-Unit task 시작 전 stash checkpoint를 만든다. PASS/conditional이면 checkpoint를 drop한다. 검증 FAIL이 최종 QA로 이월되는 경로는 checkpoint를 drop하고 현재 변경을 유지한다. 실행 예외는 task를 `blocked` 또는 `todo`로 전이하지만 `restoreCheckpoint()`/`saveDiscardedDiff()`를 호출하지 않으므로 재시도는 현재 worktree 상태에서 계속한다. 태스크 단위 실패 rollback 보장은 아직 Known Gap이다.
+- 복구 가능한 실패는 `blocked` + 쿨다운 → 같은 task의 `todo` 승격 → atomic re-claim 순으로 처리한다. retry/reassign 소진 전까지 해당 goal slot은 다른 goal에 빼앗기지 않는다.
+- provider failover가 허용된 실패는 같은 task를 대체 backend으로 우선 재디스패치한다. task에 시도 provider·원본 session·재디스패치 session을 연결하고, 재시작 후에도 영속 트레이스로 왕복 루프를 차단한다.
+
+**서버 재시작**
+
+- scheduler·HTTP route를 열기 전 `recoverOnStartup()`이 한 번 실행된다. 기존 `in_progress`/`in_review` task는 한 SQL update로 `todo`로 복구하고, 전 프로세스의 active session/process는 `killed`로 정리한 후 agent를 `idle`로 초기화한다. 복구 완료 전에는 새 dispatch가 없다.
+- `generating` spec은 `failed`로 바꾸어 재시도/오류 표시가 가능하게 하고, `triggering` squash는 `none`, `resolving` squash는 `blocked`로 복구한다.
+- `merged`가 아닌 goal의 활성 worktree는 보존하고 나머지 stale worktree와 `crewdeck-checkpoint-*` stash를 정리한다. `pending_approval`은 worktree가 있으면 `goal:squash_ready`를 재방송하고, 없으면 `blocked`로 전환한다.
+
+**Goal 취소(삭제)**
+
+- `DELETE /goals/:id`가 DB transaction 안에서 goal을 삭제하고 task/verification을 cascade 정리한다. side effect에 필요한 task ID·session 소유자·worktree 메타데이터는 삭제 전 캡처한다.
+- commit 후 task 실행 session, `spec-*`, `decompose-*`, `architect-*`, `evaluator-*`를 종료한다. scheduler의 preparation flight, decompose retry, task claim, failover/backfill timer·trace 소유권도 해제하여 삭제된 goal이 재디스패치되지 않게 한다. 단, 병렬 squash 충돌 해결에 쓰는 `squash-resolve:${goalId}` session은 현재 DELETE 경로가 종료하지 않는 Known Gap이다.
+- task checkpoint를 먼저 drop한 뒤 goal worktree·branch를 best-effort로 제거하고 `project:updated`를 broadcast한다. Git 정리 실패는 삭제 transaction을 롤백하지 않고 경고 로그로 남긴다.
 
 ### 1. Goal-per-worktree
 
@@ -122,9 +199,9 @@ Goal
 
 ---
 
-### 2. 태스크 체크포인트 (stash 기반) — 합의된 결정
+### 2. 태스크 체크포인트 (stash 기반) — 부분 구현, rollback 미연결
 
-**원칙**: 태스크 실패 시 해당 태스크만 롤백, 전체 Goal 롤백 금지.
+**현행 동작**: task 시작 전 checkpoint를 만드나, 실패 경로에서 해당 task만 롤백하는 연결은 아직 없다. `restoreCheckpoint()`는 helper로만 존재한다.
 
 #### 2.1 스냅샷 타이밍
 
@@ -135,14 +212,18 @@ Goal
 태스크 N 성공:
   git stash drop crewdeck-checkpoint-{taskId}  (체크포인트 제거)
 
-태스크 N 실패 (blocked 전환 시):
-  git stash pop crewdeck-checkpoint-{taskId}  (이 태스크 변경만 롤백)
-  → 재시도 또는 재할당
+태스크 N 검증 FAIL 이월:
+  git stash drop crewdeck-checkpoint-{taskId}
+  → 현재 변경 유지 + status='done' + goal QA로 issue 이월
+
+태스크 N 실행 예외:
+  status='blocked' 또는 'todo'
+  → checkpoint 복원 없이 현재 worktree에서 재시도 (Known Gap)
 ```
 
 #### 2.2 구현 위치
 
-`engine.ts executeTask()` 내 Goal-as-Unit 분기에 stash 호출 삽입.
+`engine.ts executeTask()`는 `stashCheckpoint()`·`dropCheckpoint()`를 호출한다. `restoreCheckpoint()`·`saveDiscardedDiff()`는 실패 실행 경로에 연결되지 않았다.
 
 신규 헬퍼 위치: `/Users/keunsik/develop/swk/crewdeck/server/core/project/worktree.ts`
 
@@ -152,13 +233,13 @@ function restoreCheckpoint(worktreePath: string, taskId: string): boolean
 function dropCheckpoint(worktreePath: string, taskId: string): void
 ```
 
-#### 2.3 stash 충돌 시나리오 처리
+#### 2.3 현재 정리 경계
 
-| 시나리오 | 처리 방안 |
+| 시나리오 | 현재 처리 |
 |----------|-----------|
-| stash pop 충돌 | `git stash drop` 후 태스크 blocked, 활동 피드에 "수동 개입 필요" 기록 |
-| stash 스택 누적 (재시도 반복) | `git stash list` grep `crewdeck-checkpoint-{taskId}` — 중복 push 방지 |
-| 서버 재시작 후 dangling stash | 서버 시작 시 `cleanupStaleWorktrees()` 확장: stash 목록에서 `crewdeck-checkpoint-` prefix 제거 |
+| 재시도 반복 | 같은 `crewdeck-checkpoint-{taskId}`가 있으면 중복 push를 건너뛰고 현재 worktree 변경을 계속 사용 |
+| 서버 재시작 후 dangling stash | `cleanupStaleWorktrees()`가 `crewdeck-checkpoint-` prefix stash를 제거 |
+| 실패 task만 롤백 | helper는 있지만 호출부가 없음. 연결·충돌 처리·회귀 테스트가 후속 필요 |
 
 ---
 
@@ -337,7 +418,8 @@ Task 1 실행 (shared worktree):
   stashCheckpoint(taskId)
   → 구현 → QG 검증
   → PASS: dropCheckpoint(taskId), result_summary 저장, status='done'
-  → FAIL: restoreCheckpoint(taskId), status='blocked' → retry
+  → 검증 FAIL 이월: dropCheckpoint(taskId), 변경 유지, status='done', goal QA issue 이월
+  → 실행 예외: status='blocked' 또는 'todo', 현재 worktree에서 retry (rollback 미연결)
   ↓
 Task 2, 3 ... (동일 worktree, 이전 파일 상태 이어받음)
   ↓
@@ -373,7 +455,7 @@ Task 2, 3 ... (동일 worktree, 이전 파일 상태 이어받음)
 ```bash
 # 타입 검사 (필수, 커밋 전)
 npm run typecheck
-cd dashboard && npx tsc --noEmit
+cd dashboard && npx tsc -b
 
 # 수동 E2E 검증 시나리오
 # 1. 새 프로젝트 생성 → 새 Goal 추가 (goal_model='goal_as_unit' 확인)
@@ -389,8 +471,8 @@ cd dashboard && npx tsc --noEmit
 
 | 위험 | 설명 | 완화 방안 |
 |------|------|-----------|
-| **concurrency=2+ 재활성화 시 충돌** | Goal-as-Unit에서 concurrency>1이면 같은 worktree에 2개 에이전트가 동시 접근 | Goal-as-Unit goal의 태스크는 강제 concurrency=1. scheduler에서 goal별 lock 적용. `DEFAULT_MAX_CONCURRENCY=1`은 이미 적용됨 |
-| **stash 충돌** | restoreCheckpoint 시 WD가 dirty한 경우 pop 충돌 | `git stash pop --index` 실패 시 `git checkout -- .` + `git stash drop` 후 blocked 전환. 활동 피드에 상세 기록 |
+| **concurrency=3+ 고부하 경합** | goal 간 병렬은 격리되지만 동시 squash/integration 경합이 커질 수 있음 | 기본 goal slot은 2. `CREWDECK_MAX_CONCURRENCY`로 높여도 atomic claim으로 goal 내부를 순차 1로 고정하고 integration-time 충돌 해결을 사용. 3+ 고부하는 ROADMAP Known Gap으로 추적 |
+| **task 실패 rollback 미연결** | 실행 예외 후 부분 변경이 공유 worktree에 남아 재시도·sibling에 영향을 줄 수 있음 | `restoreCheckpoint()`·`saveDiscardedDiff()` 호출부와 충돌 처리를 연결하기 전까지 ROADMAP Known Gap으로 추적 |
 | **승인 대기 중 서버 재시작** | `squash_status='pending_approval'` 상태에서 서버 재시작 | 서버 시작 시 `squash_status='pending_approval'` goal 목록 조회 → broadcast("goal:squash_ready") 재발송. worktree_path 존재 여부 확인 후 없으면 alert |
 | **acceptance_script 무한 대기** | 스크립트가 interactive 프롬프트를 띄우는 경우 | `spawnSync` 타임아웃 2분 강제 적용. stdin = /dev/null |
 | **worktree 중간 정리** | `cleanupStaleWorktrees()` 가 서버 재시작 시 진행 중 Goal worktree를 삭제 | `worktree_path IS NOT NULL AND squash_status != 'merged'` 인 goal의 worktree_path는 cleanup 제외 목록에 추가 |
@@ -412,14 +494,13 @@ cd dashboard && npx tsc --noEmit
 
 - **confident**:
   - `goal_model` 컬럼으로 신구 모델 분기 — 기존 `prompt_source`, `needs_worktree` 컬럼 증분 마이그레이션 패턴과 완전히 일치, 하위 호환성 보장
-  - stash 기반 체크포인트 — `cleanupStaleWorktrees()` + `worktreeInfo` 수명 주기와 직교하므로 기존 cleanup 로직과 충돌 없음
   - squash merge 후 worktree 삭제 — 현재 `finally` 블록에서 `removeWorktree` 호출 패턴 그대로 Goal 완료 시점으로 이동
 
 - **uncertain**:
-  - **stash pop 충돌 빈도**: 실제 복잡한 태스크 실행 후 stash 충돌이 얼마나 자주 발생하는지 측정 데이터 없음. 빈번할 경우 stash 대신 lightweight commit + `git reset HEAD~1` 방식으로 전환 검토 필요
+  - **task 단위 실패 rollback**: checkpoint helper는 있지만 실행 예외 경로에 복원·diff 보존 호출이 없음. 연결 후 stash 충돌 빈도와 공유 worktree 회귀를 실측해야 함
   - **acceptance_script 타임아웃 2분**: `drift-audit.ts` 실행 시간이 실제 환경(DB 크기, 네트워크)에 따라 다를 수 있음. 구현 후 실측 필요
 
 - **not_tested**:
-  - **concurrency=2 이상에서 Goal-as-Unit 동작**: `DEFAULT_MAX_CONCURRENCY=1`이 현재 기본값이나, 사용자가 override 가능한 경로가 있는지 확인 필요. Goal 단위 lock 구현 전까지 override 차단 필요
+  - **concurrency=3+ 고부하**: 기본 2-goal 병렬은 구현·실측했지만, `CREWDECK_MAX_CONCURRENCY=3` 이상에서 동시 squash/integration 경합은 실운영 표본이 부족함
   - **서버 재시작 후 pending_approval 복구**: 재발송 broadcast 로직은 설계했으나 실제 클라이언트(대시보드 WebSocket reconnect 흐름)에서 수신 여부 미검증
   - **branch_pr 모드에서 `gh pr create --squash`**: gh CLI가 squash 옵션을 PR 생성 시점에 지정할 수 있는지 실제 CLI 동작 확인 필요 (옵션명: `--squash` 존재 여부)

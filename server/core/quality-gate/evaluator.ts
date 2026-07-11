@@ -157,7 +157,15 @@ export function createQualityGate(
       }
 
       try {
+        const assertTaskStillExists = (stage: string): void => {
+          const exists = db.prepare("SELECT 1 FROM tasks WHERE id = ?").get(taskId);
+          if (!exists) {
+            throw new Error(`Task ${taskId} deleted during verification (${stage})`);
+          }
+        };
+
         const persistVerification = (result: VerificationResult): VerificationResult => {
+          assertTaskStillExists("persist");
           const verRow = db.prepare(`
             INSERT INTO verifications (task_id, verdict, scope, dimensions, issues, severity, evaluator_session_id)
             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
@@ -237,6 +245,7 @@ export function createQualityGate(
         });
 
         const runResult = await session.send(evaluationPrompt);
+        assertTaskStillExists("initial response");
         let evaluatorSessionId = resolveSessionIdentity(
           sessionManager.getSessionRecord(evaluatorId),
           runResult.sessionId,
@@ -254,7 +263,9 @@ export function createQualityGate(
         if (result.issues.some((i) => i.id === "issue-parse-error")) {
           log.info("Parse failed, retrying with explicit JSON reminder...");
           const retryPrompt = `이전 응답에서 JSON을 파싱하지 못했습니다. 반드시 \`\`\`json 블록으로만 응답하세요.\n\n${evaluationPrompt}`;
+          assertTaskStillExists("parse retry");
           const retryResult = await session.send(retryPrompt);
+          assertTaskStillExists("parse retry response");
           evaluatorSessionId = resolveSessionIdentity(
             sessionManager.getSessionRecord(evaluatorId),
             retryResult.sessionId,
@@ -1100,6 +1111,49 @@ If you CANNOT execute Layer 3 (no DB, no runtime, no test runner):
 `;
 }
 
+/**
+ * Extract the evaluator's JSON payload from raw LLM output.
+ *
+ * Prefers the LAST ```json fenced block (models occasionally emit more than
+ * one — e.g. an example before the real answer). Falls back to a
+ * balanced-brace scan anchored on the `"verdict"` key instead of the old
+ * greedy `\{[\s\S]*"verdict"[\s\S]*\}` regex, which matched from the first
+ * `{` to the LAST `}` in the ENTIRE output — any trailing prose containing
+ * a stray `{`/`}` (e.g. a code snippet in the evaluator's own commentary)
+ * swept extra text into the match and broke `JSON.parse`, even though the
+ * evaluator had returned syntactically valid JSON.
+ */
+function extractEvaluatorJson(rawOutput: string): string | null {
+  const fenceMatches = [...rawOutput.matchAll(/```json\s*([\s\S]*?)\s*```/g)];
+  const lastFence = fenceMatches[fenceMatches.length - 1]?.[1]?.trim();
+  if (lastFence) return lastFence;
+
+  const anchorIdx = rawOutput.indexOf('"verdict"');
+  if (anchorIdx === -1) return null;
+  const start = rawOutput.lastIndexOf("{", anchorIdx);
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < rawOutput.length; i++) {
+    const ch = rawOutput[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === "\\") escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return rawOutput.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 export function parseVerificationResult(
   taskId: string,
   rawOutput: string,
@@ -1134,15 +1188,13 @@ export function parseVerificationResult(
 
   try {
     // Extract JSON from the output
-    const jsonMatch = rawOutput.match(/```json\s*([\s\S]*?)\s*```/) ??
-                      rawOutput.match(/\{[\s\S]*"verdict"[\s\S]*\}/);
+    const jsonStr = extractEvaluatorJson(rawOutput);
 
-    if (!jsonMatch) {
+    if (!jsonStr) {
       log.warn("Could not parse verification JSON, returning fail");
       return defaultResult;
     }
 
-    const jsonStr = jsonMatch[1] ?? jsonMatch[0];
     const parsed = JSON.parse(jsonStr);
 
     const dimensions = {

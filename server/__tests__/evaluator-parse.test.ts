@@ -44,4 +44,32 @@ describe("parseVerificationResult (dimensions-optional)", () => {
     expect(r.verdict).toBe("fail");
     expect(r.issues.some((i) => i.id === "issue-parse-error")).toBe(true);
   });
+
+  // Regression: the old fallback regex (`\{[\s\S]*"verdict"[\s\S]*\}`) was greedy —
+  // it matched from the first `{` to the LAST `}` in the entire output. Trailing
+  // prose containing any stray brace (e.g. a code snippet in the evaluator's own
+  // commentary) got swept into the "JSON" string and broke JSON.parse, even though
+  // the evaluator had returned syntactically valid JSON.
+  it("parses unfenced JSON followed by trailing prose with stray braces", () => {
+    const r = parseVerificationResult(
+      "t1",
+      '{"verdict":"pass","severity":"auto-resolve","issues":[],"knownGaps":[]}\n\n참고: 코드에서 함수 f(){ return x; } 처럼 처리했습니다.',
+      "lite",
+      "e1",
+      "code",
+    );
+    expect(r.verdict).toBe("pass");
+    expect(r.issues.some((i) => i.id === "issue-parse-error")).toBe(false);
+  });
+
+  it("takes the LAST ```json fence when the evaluator emits more than one", () => {
+    const r = parseVerificationResult(
+      "t1",
+      '예시:\n```json\n{"verdict":"fail","issues":[]}\n```\n\n최종 답변:\n```json\n{"verdict":"pass","severity":"auto-resolve","issues":[],"knownGaps":[]}\n```',
+      "lite",
+      "e1",
+      "code",
+    );
+    expect(r.verdict).toBe("pass");
+  });
 });

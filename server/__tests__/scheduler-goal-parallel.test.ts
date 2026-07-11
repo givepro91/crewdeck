@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createDatabase, migrate } from "../db/schema.js";
-import { pickParallelGoals } from "../core/orchestration/scheduler.js";
+import { createScheduler, pickParallelGoals, getActiveAgentIds } from "../core/orchestration/scheduler.js";
+import type { SessionManager } from "../core/agent/session.js";
 import type Database from "better-sqlite3";
 
 /**
@@ -161,5 +162,128 @@ describe("pickParallelGoals", () => {
     seedTask(db, otherGoal, other.projectId, "todo", other.agentId);
 
     expect(pickParallelGoals(db, projectId, 5)).toEqual([mine]);
+  });
+});
+
+/**
+ * getActiveAgentIds — 실행 경로(스케줄러 vs 수동 실행) 무관 agent busy 판정.
+ *
+ * 수동 실행(POST /tasks/:id/execute)은 DB claim(in_progress)만 얻고 스케줄러의
+ * in-memory busyAgents 에는 등록되지 않는다. pickNextTasks 는 이 helper 로 DB 상
+ * live lane 을 가진 agent 를 usedAgents 에 합쳐, 같은 agent 에 배정된 다른 goal
+ * 태스크가 뽑혀 정상 세션이 SIGTERM 으로 죽는 것을 막는다.
+ */
+describe("getActiveAgentIds", () => {
+  let db: Database.Database;
+  let projectId: string;
+  let agentId: string;
+
+  function seedAgent(db: Database.Database, projectId: string): string {
+    const id = `a${++seq}`;
+    db.prepare(
+      "INSERT INTO agents (id, project_id, name, role) VALUES (?, ?, 'dev2', 'frontend')",
+    ).run(id, projectId);
+    return id;
+  }
+
+  beforeEach(() => {
+    db = createTestDb();
+    ({ projectId, agentId } = seedProject(db));
+  });
+
+  it("in_progress 태스크의 assignee 를 busy 로 판정한다", () => {
+    const g = seedGoal(db, projectId);
+    seedTask(db, g, projectId, "in_progress", agentId);
+
+    expect(getActiveAgentIds(db, projectId)).toEqual(new Set([agentId]));
+  });
+
+  it("in_review 도 busy 로 친다", () => {
+    const g = seedGoal(db, projectId);
+    seedTask(db, g, projectId, "in_review", agentId);
+
+    expect(getActiveAgentIds(db, projectId)).toEqual(new Set([agentId]));
+  });
+
+  it("todo/blocked/done/pending_approval 만 있으면 busy 없음", () => {
+    const g = seedGoal(db, projectId);
+    seedTask(db, g, projectId, "todo", agentId);
+    seedTask(db, g, projectId, "blocked", agentId);
+    seedTask(db, g, projectId, "done", agentId);
+    seedTask(db, g, projectId, "pending_approval", agentId);
+
+    expect(getActiveAgentIds(db, projectId)).toEqual(new Set());
+  });
+
+  it("위임 대기 부모(in_progress + 미종결 하위 작업)의 assignee 는 busy 가 아니다", () => {
+    const g = seedGoal(db, projectId);
+    const parent = seedTask(db, g, projectId, "in_progress", agentId);
+    seedTask(db, g, projectId, "todo", agentId, parent); // 실행 대기 하위 작업
+
+    expect(getActiveAgentIds(db, projectId)).toEqual(new Set());
+  });
+
+  it("하위 작업 자체가 in_progress 면 그 assignee 는 busy 다", () => {
+    const g = seedGoal(db, projectId);
+    const parent = seedTask(db, g, projectId, "in_progress", agentId);
+    const childAgent = seedAgent(db, projectId);
+    seedTask(db, g, projectId, "in_progress", childAgent, parent);
+
+    // 부모(대기)는 제외, 하위 작업(라이브)의 assignee 만 busy
+    expect(getActiveAgentIds(db, projectId)).toEqual(new Set([childAgent]));
+  });
+
+  it("다른 프로젝트의 in_progress 태스크는 섞이지 않는다", () => {
+    const mine = seedGoal(db, projectId);
+    seedTask(db, mine, projectId, "todo", agentId);
+
+    const other = seedProject(db);
+    const otherGoal = seedGoal(db, other.projectId);
+    seedTask(db, otherGoal, other.projectId, "in_progress", other.agentId);
+
+    expect(getActiveAgentIds(db, projectId)).toEqual(new Set());
+  });
+
+  it("실제 poll은 오래된 수동 실행 태스크의 active session을 보존하고 같은 agent를 재스폰하지 않는다", async () => {
+    vi.useFakeTimers();
+    const spawnAgent = vi.fn(() => {
+      throw new Error("active manual session must not be replaced");
+    });
+    const sessionManager = {
+      spawnAgent,
+      getSession: vi.fn(() => undefined),
+      getSessionRecord: vi.fn(() => undefined),
+      killSession: vi.fn(),
+      killAll: vi.fn(),
+      pauseSession: vi.fn(),
+      resumeSession: vi.fn(),
+      setProviderOverride: vi.fn(),
+      clearProviderOverride: vi.fn(),
+    } as SessionManager;
+    const scheduler = createScheduler(db, sessionManager, () => {});
+
+    const runningGoal = seedGoal(db, projectId, { priority: "high" });
+    const runningTask = seedTask(db, runningGoal, projectId, "in_progress", agentId);
+    db.prepare("UPDATE tasks SET updated_at = datetime('now', '-1 day') WHERE id = ?").run(runningTask);
+    db.prepare("INSERT INTO sessions (id, agent_id, status) VALUES ('manual-session', ?, 'active')").run(agentId);
+
+    const queuedGoal = seedGoal(db, projectId, { priority: "high" });
+    const queuedTask = seedTask(db, queuedGoal, projectId, "todo", agentId);
+
+    try {
+      scheduler.startQueue(projectId);
+      await vi.advanceTimersByTimeAsync(1);
+    } finally {
+      scheduler.stopQueue(projectId);
+      vi.useRealTimers();
+    }
+
+    expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(runningTask))
+      .toMatchObject({ status: "in_progress" });
+    expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(queuedTask))
+      .toMatchObject({ status: "todo" });
+    expect(db.prepare("SELECT status FROM sessions WHERE id = 'manual-session'").get())
+      .toMatchObject({ status: "active" });
+    expect(spawnAgent).not.toHaveBeenCalled();
   });
 });

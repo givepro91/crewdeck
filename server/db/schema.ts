@@ -115,6 +115,7 @@ export function migrate(db: Database.Database): void {
       provider_failover_loop_guard_blocked INTEGER NOT NULL DEFAULT 0,
       provider_failover_original_session_id TEXT,
       provider_failover_redispatched_session_id TEXT,
+      task_id TEXT,         -- task this session was spawned to execute (redispatch correlation)
       token_usage INTEGER DEFAULT 0,
       cost_usd REAL DEFAULT 0,
       last_output TEXT      -- Last output snippet for display
@@ -160,6 +161,13 @@ export function migrate(db: Database.Database): void {
   }
   if (!hasCostUsd) {
     db.exec("ALTER TABLE sessions ADD COLUMN cost_usd REAL DEFAULT 0");
+  }
+  // task_id on sessions — durable session↔task link for failover redispatch
+  // correlation. Without it, backfillRedispatchSession can only match by
+  // agent_id+provider+rowid, which mis-attributes an unrelated same-agent
+  // session that lands in the same rowid window as the real redispatch spawn.
+  if (!sessionColumns.some((c) => c.name === "task_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN task_id TEXT");
   }
 
   // Agent hierarchy: parent_id + expanded roles

@@ -111,6 +111,24 @@ function passVerification(): string {
 \`\`\``;
 }
 
+function failVerification(): string {
+  return `\`\`\`json
+{
+  "verdict": "fail",
+  "severity": "hard-block",
+  "dimensions": {
+    "functionality": { "value": 2, "notes": "fixture fail" },
+    "dataFlow": { "value": 2, "notes": "fixture fail" },
+    "designAlignment": { "value": 2, "notes": "fixture fail" },
+    "craft": { "value": 2, "notes": "fixture fail" },
+    "edgeCases": { "value": 2, "notes": "fixture fail" }
+  },
+  "issues": [{ "severity": "critical", "message": "fixture issue" }],
+  "knownGaps": []
+}
+\`\`\``;
+}
+
 let fakeSessionSeq = 0;
 let fakeSessionRowSeq = 0;
 let missionGenerationCount = 0;
@@ -220,13 +238,15 @@ class FakeSession extends EventEmitter implements AgentSession {
 class FakeSessionManager implements SessionManager {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly records = new Map<string, SessionRecord>();
-  readonly spawns: Array<{ agentId: string; workdir: string; sessionKey?: string }> = [];
+  readonly spawns: Array<{ agentId: string; workdir: string; sessionKey?: string; taskId?: string | null }> = [];
 
-  constructor(private readonly opts: { reuseEvaluatorRuntimeSession?: boolean } = {}) {}
+  private verificationCount = 0;
 
-  spawnAgent(agentId: string, projectWorkdir: string, sessionKey?: string): AgentSession {
+  constructor(private readonly opts: { reuseEvaluatorRuntimeSession?: boolean; failVerificationOnce?: boolean } = {}) {}
+
+  spawnAgent(agentId: string, projectWorkdir: string, sessionKey?: string, taskId?: string | null): AgentSession {
     const key = sessionKey ?? agentId;
-    this.spawns.push({ agentId, workdir: projectWorkdir, sessionKey });
+    this.spawns.push({ agentId, workdir: projectWorkdir, sessionKey, taskId });
     const implementationRuntimeId = this.records.get("agent-coder")?.runtimeSessionId ?? undefined;
     const runtimeSessionId = this.opts.reuseEvaluatorRuntimeSession && key.startsWith("evaluator-")
       ? implementationRuntimeId
@@ -241,7 +261,10 @@ class FakeSessionManager implements SessionManager {
     };
     const rawSend = session.send.bind(session);
     session.send = async (message: string) => {
-      const result = await rawSend(message);
+      let result = await rawSend(message);
+      if (this.opts.failVerificationOnce && message.includes("Quality Verification") && this.verificationCount++ === 0) {
+        result = streamJson(failVerification(), result.sessionId ?? undefined);
+      }
       record.runtimeSessionId = result.sessionId;
       return result;
     };
@@ -294,20 +317,36 @@ async function startGoalApi(db: Database.Database): Promise<{ baseUrl: string; c
   };
 }
 
+// 전체 스위트를 병렬로 돌리면 로컬 express 서버로의 fetch가 부하로 간헐적으로
+// "fetch failed"/ECONNRESET(연결 단계 리셋)을 낸다. 연결이 서지 않은 것이므로
+// 짧은 백오프로 재시도해 flaky 실패를 흡수한다.
+async function fetchWithRetry(input: string, init?: RequestInit, attempts = 5): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetch(input, init);
+    } catch (err) {
+      lastErr = err;
+      await new Promise((resolve) => setTimeout(resolve, 50 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 async function readGoalStatus(baseUrl: string, goalId: string): Promise<any> {
-  const res = await fetch(`${baseUrl}/api/goals/${goalId}/status`);
+  const res = await fetchWithRetry(`${baseUrl}/api/goals/${goalId}/status`);
   expect(res.status).toBe(200);
   return res.json();
 }
 
 async function readSquashPreview(baseUrl: string, goalId: string): Promise<any> {
-  const res = await fetch(`${baseUrl}/api/goals/${goalId}/squash-preview`);
+  const res = await fetchWithRetry(`${baseUrl}/api/goals/${goalId}/squash-preview`);
   expect(res.status).toBe(200);
   return res.json();
 }
 
 async function approveSquash(baseUrl: string, goalId: string): Promise<any> {
-  const res = await fetch(`${baseUrl}/api/goals/${goalId}/squash-approve`, {
+  const res = await fetchWithRetry(`${baseUrl}/api/goals/${goalId}/squash-approve`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}",
@@ -444,6 +483,31 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
     } finally {
       await api.close();
     }
+  });
+
+  it("auto-fix 세션을 실행 task에 귀속시킨다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-auto-fix-session-owner";
+    const taskId = "task-auto-fix-session-owner";
+    const sessions = new FakeSessionManager({ failVerificationOnce: true });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Auto-fix ownership fixture', 'Verify task_id on fix sessions', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Implement first fixture', 'Create the first fixture file.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    await engine.executeTask(taskId);
+
+    const generatorSpawns = sessions.spawns.filter((spawn) => spawn.agentId === "agent-coder");
+    expect(generatorSpawns).toHaveLength(2);
+    expect(generatorSpawns.every((spawn) => spawn.taskId === taskId)).toBe(true);
   });
 
   it("QA 회귀 태스크 생성이 누락되면 squash를 차단하고 activity log에 단계 실패를 남긴다", { timeout: 30_000 }, async () => {

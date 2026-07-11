@@ -2,7 +2,7 @@ import { Router } from "express";
 import { randomUUID } from "node:crypto";
 import type { AppContext } from "../../index.js";
 import { createSessionManager } from "../../core/agent/session.js";
-import { createOrchestrationEngine } from "../../core/orchestration/engine.js";
+import { claimTaskForExecution, createOrchestrationEngine } from "../../core/orchestration/engine.js";
 import { createScheduler } from "../../core/orchestration/scheduler.js";
 import { createQualityGate } from "../../core/quality-gate/evaluator.js";
 import { MAX_PROMPT_LEN, MAX_TITLE_LEN, MAX_DESC_LEN } from "../../utils/constants.js";
@@ -95,29 +95,56 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
 
     const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as any;
     if (!task) return res.status(404).json({ error: "Task not found" });
-    if (!task.assignee_id) return res.status(400).json({ error: "Task has no assigned agent" });
 
-    // Prevent duplicate execution — atomic status transition
-    if (task.status === "in_progress") {
-      return res.status(409).json({ error: "Task is already in progress" });
+    // Conflict(409) must win over the assignee check: an already-running task
+    // (in_progress, even with a null assignee) has to report the 409 contract,
+    // not 400. So claim first, then validate the assignee.
+    const claim = claimTaskForExecution(db, taskId);
+    if (!claim.claimed) {
+      if (claim.reason === "not_found") {
+        return res.status(404).json({ error: claim.error });
+      }
+      return res.status(409).json({
+        error: claim.error,
+        taskId: claim.taskId,
+        status: claim.status,
+      });
     }
-    if (task.status === "done") {
-      return res.status(400).json({ error: "Task is already done" });
+
+    // Claim succeeded (was todo/pending_approval). If there's no assignee to run
+    // it, release the claim so it doesn't strand in 'in_progress', then reject.
+    if (!task.assignee_id) {
+      db.prepare(
+        "UPDATE tasks SET status = ?, started_at = NULL, updated_at = datetime('now') WHERE id = ? AND status = 'in_progress'",
+      ).run(task.status, taskId);
+      broadcast("task:updated", { ...task });
+      return res.status(400).json({ error: "Task has no assigned agent" });
     }
 
     // Start execution asynchronously, return immediately
-    res.json({ status: "started", taskId });
+    res.status(202).json({ status: "started", taskId });
 
-    try {
-      const result = await engine.executeTask(taskId, { verificationScope });
-      broadcast("task:updated", { taskId, ...result });
-    } catch (err: any) {
-      broadcast("task:updated", {
-        taskId,
-        status: "blocked",
-        error: err.message,
+    // Yield before starting setup/spawn so requests that arrived together all
+    // contend on the in_progress CAS first. Without this boundary a fast setup
+    // failure can release the first claim back to todo while a concurrent HTTP
+    // handler is still waiting, allowing that handler to return a second 202
+    // and create another session for the same task.
+    setImmediate(() => {
+      void engine.executeTask(taskId, { verificationScope }, claim).then((result) => {
+        broadcast("task:updated", { taskId, ...result });
+      }).catch((err: any) => {
+        // 실행 실패 시 engine 이 이미 claim 을 해제하며 실제 상태(todo/blocked)로
+        // 전이·broadcast 했다. 여기서 고정 'blocked' 를 다시 쏘면 DB(예: todo)와 UI 가
+        // 어긋난다(scheduler 재실행 상태와 대시보드 불일치). DB 의 실제 상태를 다시 읽어
+        // 그대로 반영한다.
+        const cur = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as any;
+        if (cur) {
+          broadcast("task:updated", { ...cur, error: err.message });
+        } else {
+          broadcast("task:updated", { taskId, status: "blocked", error: err.message });
+        }
       });
-    }
+    });
   });
 
   // Decompose a goal into tasks (waits for completion)

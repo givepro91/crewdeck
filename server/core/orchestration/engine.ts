@@ -14,7 +14,7 @@ import type { VerificationScope } from "../../../shared/types.js";
 import { appendMemory } from "../agent/memory.js";
 import { createMethodologyEngine } from "../methodology/index.js";
 import { autoDetectScope } from "../quality-gate/evaluator.js";
-import { detectAgentRunFailure, classifyAgentFailure } from "../../utils/errors.js";
+import { AgentError, detectAgentRunFailure, classifyAgentFailure } from "../../utils/errors.js";
 import { getBackend } from "../agent/adapters/backend.js";
 import { loadProviderConfig } from "../agent/provider.js";
 import { escalateVerificationCap, issueSetSignature } from "./verification-policy.js";
@@ -62,6 +62,18 @@ interface AgentRow {
   role: string;
   parent_id: string | null;
 }
+
+export type TaskExecutionStatus = "todo" | "pending_approval" | "in_progress" | "in_review" | "done" | "blocked";
+
+export type TaskExecutionClaim =
+  | { claimed: true; taskId: string }
+  | {
+      claimed: false;
+      taskId: string;
+      reason: "not_found" | "conflict";
+      error: string;
+      status?: TaskExecutionStatus;
+    };
 
 export interface OrchestrationConfig {
   verificationScope: VerificationScope;
@@ -341,6 +353,145 @@ export function saveDiscardedDiff(db: Database, taskId: string, workdir: string)
   }
 }
 
+/**
+ * Atomically reserve one task execution slot for its goal.
+ *
+ * Both scheduler dispatch and the manual execute API use this transaction.
+ * The status CAS prevents duplicate ownership of the same task, while the
+ * correlated NOT EXISTS preserves both the goal-level sequential execution
+ * contract and the one-live-task-per-agent contract. In-progress delegation
+ * parents with unfinished children are not live sessions, so they are excluded
+ * exactly as they are in the scheduler; an actually running child still blocks
+ * every other task in that goal or assigned to the same agent.
+ * A claim released back to todo after an environment/setup failure keeps its
+ * started_at timestamp as a short database-backed settle lease. This closes
+ * the window where another HTTP request that arrived concurrently could claim
+ * the same goal after the first spawn failed but before that request ran.
+ */
+export function claimTaskForExecution(db: Database, taskId: string): TaskExecutionClaim {
+  const claim = db.transaction((candidateTaskId: string): TaskExecutionClaim => {
+    const existing = db.prepare(
+      "SELECT status FROM tasks WHERE id = ?",
+    ).get(candidateTaskId) as { status: TaskExecutionStatus } | undefined;
+    if (!existing) {
+      return {
+        claimed: false,
+        taskId: candidateTaskId,
+        reason: "not_found",
+        error: "Task not found",
+      };
+    }
+
+    const updated = db.prepare(`
+      UPDATE tasks AS candidate
+      SET status = 'in_progress',
+          started_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+          updated_at = datetime('now')
+      WHERE candidate.id = ?
+        AND candidate.status IN ('todo', 'pending_approval')
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks settling
+          WHERE settling.goal_id = candidate.goal_id
+            AND settling.status = 'todo'
+            AND julianday(settling.started_at) > julianday('now', '-5 seconds')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks active
+          WHERE active.goal_id = candidate.goal_id
+            AND active.id != candidate.id
+            AND active.status IN ('in_progress', 'in_review')
+            AND NOT (
+              active.status = 'in_progress'
+              AND EXISTS (
+                SELECT 1 FROM tasks child
+                WHERE child.parent_task_id = active.id
+                  AND child.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
+              )
+            )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tasks agent_active
+          WHERE candidate.assignee_id IS NOT NULL
+            AND agent_active.assignee_id = candidate.assignee_id
+            AND agent_active.id != candidate.id
+            AND agent_active.status IN ('in_progress', 'in_review')
+            AND NOT (
+              agent_active.status = 'in_progress'
+              AND EXISTS (
+                SELECT 1 FROM tasks child
+                WHERE child.parent_task_id = agent_active.id
+                  AND child.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
+              )
+            )
+        )
+    `).run(candidateTaskId);
+
+    if (updated.changes === 1) {
+      return { claimed: true, taskId: candidateTaskId };
+    }
+
+    const current = db.prepare(
+      "SELECT status FROM tasks WHERE id = ?",
+    ).get(candidateTaskId) as { status: TaskExecutionStatus };
+    const active = db.prepare(`
+      SELECT active.id FROM tasks active
+      JOIN tasks candidate ON candidate.goal_id = active.goal_id
+      WHERE candidate.id = ?
+        AND active.id != candidate.id
+        AND active.status IN ('in_progress', 'in_review')
+        AND NOT (
+          active.status = 'in_progress'
+          AND EXISTS (
+            SELECT 1 FROM tasks child
+            WHERE child.parent_task_id = active.id
+              AND child.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
+          )
+        )
+      LIMIT 1
+    `).get(candidateTaskId) as { id: string } | undefined;
+    const agentActive = db.prepare(`
+      SELECT agent_active.id FROM tasks agent_active
+      JOIN tasks candidate ON candidate.assignee_id = agent_active.assignee_id
+      WHERE candidate.id = ?
+        AND agent_active.id != candidate.id
+        AND agent_active.status IN ('in_progress', 'in_review')
+        AND NOT (
+          agent_active.status = 'in_progress'
+          AND EXISTS (
+            SELECT 1 FROM tasks child
+            WHERE child.parent_task_id = agent_active.id
+              AND child.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
+          )
+        )
+      LIMIT 1
+    `).get(candidateTaskId) as { id: string } | undefined;
+    const settling = db.prepare(`
+      SELECT settling.id FROM tasks settling
+      JOIN tasks candidate ON candidate.goal_id = settling.goal_id
+      WHERE candidate.id = ?
+        AND settling.status = 'todo'
+        AND julianday(settling.started_at) > julianday('now', '-5 seconds')
+      LIMIT 1
+    `).get(candidateTaskId) as { id: string } | undefined;
+
+    return {
+      claimed: false,
+      taskId: candidateTaskId,
+      reason: "conflict",
+      error: settling
+        ? `Goal has a recently released execution claim (${settling.id})`
+        : active
+        ? `Goal already has an active task (${active.id})`
+        : agentActive
+        ? `Agent already has an active task (${agentActive.id})`
+        : `Task is already ${current.status}`,
+      status: current.status,
+    };
+  });
+
+  return claim.immediate(taskId);
+}
+
 export function createOrchestrationEngine(
   db: Database,
   sessionManager: SessionManager,
@@ -356,6 +507,7 @@ export function createOrchestrationEngine(
     async executeTask(
       taskId: string,
       config: Partial<OrchestrationConfig> = {},
+      existingClaim?: Extract<TaskExecutionClaim, { claimed: true }>,
     ): Promise<{ success: boolean; verdict: string }> {
       const opts = { ...DEFAULT_CONFIG, ...config };
       const task = db.prepare("SELECT * FROM tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
@@ -371,19 +523,13 @@ export function createOrchestrationEngine(
         throw new Error("Task has no assigned agent");
       }
 
-      // Atomic guard: prevent duplicate execution of the same task.
-      // Two code paths can race here — scheduler.executeOne AND the
-      // manual /tasks/:id/execute API route. Without this, both spawn
-      // a session for the same agent → the second spawn kills the first
-      // → exit 143 (SIGTERM). CAS-style: only the caller that flips
-      // the status from todo→in_progress proceeds.
-      const cas = db.prepare(
-        "UPDATE tasks SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND status IN ('todo', 'pending_approval')",
-      ).run(taskId);
-      if (cas.changes === 0) {
-        // Another caller already claimed this task
-        const current = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
-        throw new Error(`Task already ${current?.status ?? "unknown"} — skipping duplicate execution`);
+      // Scheduler dispatch claims here; the manual API claims synchronously
+      // before returning 202 and passes that ownership into this execution.
+      if (!existingClaim || existingClaim.taskId !== taskId) {
+        const claim = claimTaskForExecution(db, taskId);
+        if (!claim.claimed) {
+          throw new Error(`${claim.error} — skipping duplicate execution`);
+        }
       }
       // 전체 row 를 보낸다 — 부분 페이로드({taskId, status})는 대시보드 스토어가
       // id 없는 유령 태스크로 append 해 렌더 크래시를 유발했다
@@ -405,10 +551,32 @@ export function createOrchestrationEngine(
       const agent = db.prepare("SELECT name, role, needs_worktree FROM agents WHERE id = ?").get(task.assignee_id) as { name: string; role: string; needs_worktree: number } | undefined;
       const agentName = agent?.name ?? "";
       const needsWorktree = agent?.needs_worktree ?? 1; // 기본값: 워크트리 생성
-      const workdir = project.workdir || (() => { throw new Error("Project has no workdir configured"); })();
+
+      // 클레임 성공 후 · 세션 spawn 전 setup 단계(workdir 확인·goal worktree 준비 등)의
+      // 오류는 아래 실행 try 의 catch 범위 밖이라, 그냥 throw 하면 태스크가 영구히
+      // in_progress 에 방치된다(스케줄러도 사용자도 다시 집지 못함). 여기서 클레임을
+      // 해제해 task_error 는 blocked(재시도 예산 소모), 그 외(env/rate limit)는 todo 로
+      // 되돌린 뒤 재던진다. 이미 실행 try 의 catch 가 전이시킨 경우(status!=in_progress)엔
+      // no-op 이라 이중 전이가 없다.
+      const releaseClaimOnSetupFailure = (err: Error): never => {
+        const cur = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string } | undefined;
+        if (cur?.status === "in_progress") {
+          const cls = classifyAgentFailure(err);
+          transitionTask(db, broadcast, task, cls === "task_error" ? "blocked" : "todo");
+          db.prepare("UPDATE agents SET status = 'idle', current_task_id = NULL, current_activity = NULL WHERE id = ?")
+            .run(task.assignee_id);
+          broadcast("agent:status", { id: task.assignee_id, name: agentName, status: "idle" });
+        }
+        throw err;
+      };
+
+      const workdir = project.workdir;
+      if (!workdir) {
+        releaseClaimOnSetupFailure(new Error("Project has no workdir configured"));
+      }
       const { existsSync } = await import("node:fs");
       if (!existsSync(workdir)) {
-        throw new Error(`Working directory does not exist: ${workdir}`);
+        releaseClaimOnSetupFailure(new Error(`Working directory does not exist: ${workdir}`));
       }
 
       // Phase 0: Attempt delegation to subordinates (only for root tasks)
@@ -457,7 +625,7 @@ export function createOrchestrationEngine(
           log.info(`Goal-as-Unit: using shared worktree ${goalWorktree.path}`);
         } catch (err: any) {
           log.error(`Goal-as-Unit worktree setup failed for goal ${task.goal_id}: ${err.message}`);
-          throw err;
+          releaseClaimOnSetupFailure(err);
         }
       } else if (!needsWorktree) {
         log.info(`Skipping worktree for agent "${agentName}" (needs_worktree=0) — using project root`);
@@ -683,13 +851,31 @@ export function createOrchestrationEngine(
 
       // Phase 1: in_progress transition already done by atomic CAS guard above
 
+      // Goal 취소 가드: DELETE /goals/:id 가 이 goal 을 지우면 tasks 는 CASCADE 로
+      // 사라진다. architect phase 가 도는 사이 삭제가 들어온 경우 여기서 멈추지 않으면
+      // 이미 없어진 goal 을 위해 구현 세션을 새로 spawn 하게 된다 (orchestration 잔여).
+      // 새 세션 spawn 직전에 태스크 존재를 재확인해 조용히 중단한다.
+      const taskStillExists = db.prepare("SELECT id FROM tasks WHERE id = ?").get(taskId);
+      if (!taskStillExists) {
+        log.info(`Task ${taskId} deleted mid-execution (goal cancelled) — aborting before implementation spawn`);
+        db.prepare("UPDATE agents SET status = 'idle', current_task_id = NULL, current_activity = NULL WHERE id = ?")
+          .run(task.assignee_id);
+        broadcast("agent:status", { id: task.assignee_id, name: agentName, status: "idle" });
+        return { success: false, verdict: "aborted" };
+      }
+
       // Phase 2: Execute via assigned agent
       let session;
       try {
-        session = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir);
+        // taskId를 넘겨 sessions.task_id를 찍는다 — failover 재디스패치 backfill이
+        // 이 세션을 task에 정확히 귀속하려면 agent+provider+rowid만으론 부족하다.
+        session = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir, undefined, taskId);
       } catch (spawnErr: any) {
         log.error(`Failed to spawn agent for task "${task.title}"`, spawnErr);
-        throw new Error(`Agent spawn failed: ${spawnErr.message}`);
+        const error = spawnErr instanceof AgentError
+          ? spawnErr
+          : new Error(`Agent spawn failed: ${spawnErr.message}`);
+        return releaseClaimOnSetupFailure(error);
       }
 
       // Stream agent output to WebSocket
@@ -979,6 +1165,13 @@ When complete, provide a summary of changes made.
           let prevIssueSig = issueSetSignature(verification.issues);
           let noProgressRounds = 0;
           while (reVerification.verdict === "fail" && round < MAX_FIX_ROUNDS) {
+            // Goal DELETE can terminate the evaluator/fix subprocess while its
+            // send Promise is settling. Never spawn the next auto-fix session
+            // or re-verifier after the task has been CASCADE-deleted.
+            if (!db.prepare("SELECT 1 FROM tasks WHERE id = ?").get(taskId)) {
+              log.info(`Task ${taskId} deleted during verification — aborting auto-fix`);
+              return { success: false, verdict: "aborted" };
+            }
             round++;
             log.info(`Verification FAIL — auto-fix round ${round}/${MAX_FIX_ROUNDS}`);
 
@@ -1008,7 +1201,7 @@ Fix ONLY these issues. Do not modify other code.
             // Spawn a NEW session for fix (prevent context pollution — Crewdeck rule)
             db.prepare("UPDATE agents SET status = 'working', current_task_id = ?, current_activity = ? WHERE id = ?")
               .run(taskId, `fix(${round}): ${task.title?.slice(0, 72) ?? ""}`, task.assignee_id);
-            const fixSession = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir);
+            const fixSession = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir, undefined, taskId);
             fixSession.on("rate-limit", (info: { waitMs: number; stderr: string }) => {
               broadcast("system:rate-limit", { agentId: task.assignee_id, agentName, taskId, waitMs: info.waitMs, message: info.stderr });
             });
@@ -1038,6 +1231,10 @@ Fix ONLY these issues. Do not modify other code.
             }
 
             // Re-verify (worktree 경로 전달)
+            if (!db.prepare("SELECT 1 FROM tasks WHERE id = ?").get(taskId)) {
+              log.info(`Task ${taskId} deleted during auto-fix — aborting re-verification`);
+              return { success: false, verdict: "aborted" };
+            }
             reVerification = await qualityGate.verify(taskId, {
               scope: effectiveVerificationScope,
               workdir: effectiveWorkdir,
@@ -1198,6 +1395,14 @@ Fix ONLY these issues. Do not modify other code.
         };
       } catch (err: any) {
         log.error(`Task execution failed: ${task.title}`, err);
+
+        // Goal cancellation CASCADE-deletes the task. Treat any subprocess
+        // completion racing with that delete as an expected abort and avoid
+        // resurrecting task state or entering retry/failover handling.
+        if (!db.prepare("SELECT 1 FROM tasks WHERE id = ?").get(task.id)) {
+          log.info(`Task ${taskId} deleted mid-execution (goal cancelled) — aborting`);
+          return { success: false, verdict: "aborted" };
+        }
 
         // Duplicate execution guard — CAS failed, another caller already claimed it.
         // Do NOT transition or retry — the other execution is handling it.

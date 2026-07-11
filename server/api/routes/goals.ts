@@ -19,7 +19,7 @@ import {
   type GitHubConfig,
 } from "../../core/project/git-workflow.js";
 import { runAcceptanceScript } from "../../core/orchestration/engine.js";
-import { removeWorktree } from "../../core/project/worktree.js";
+import { removeWorktree, dropCheckpoint } from "../../core/project/worktree.js";
 import { MAX_TITLE_LEN, MAX_DESC_LEN } from "../../utils/constants.js";
 import type { GoalE2EActivityEvent, GoalE2EStatus, GoalE2EStatusResponse } from "../../../shared/types.js";
 
@@ -515,29 +515,88 @@ export function createGoalRoutes(ctx: AppContext): Router {
     }
   });
 
-  // Delete goal — kill sessions for in-progress tasks before CASCADE delete
+  // Delete goal — fully release in-flight ownership before CASCADE delete:
+  // task-phase sessions, scheduler flight/retry state, and the goal worktree.
   router.delete("/:id", (req, res) => {
     const goalId = req.params.id;
-    // Collect info atomically before delete to hand off session cleanup
-    type DeleteInfo = { projectId: string; assigneeIds: string[] } | null;
+    // Collect info atomically before delete to hand off session/worktree cleanup.
+    // tasks are CASCADE-deleted with the goal, so every id we need for post-commit
+    // teardown must be captured inside this transaction.
+    type DeleteInfo = {
+      projectId: string;
+      projectWorkdir: string | null;
+      assigneeIds: string[];
+      taskIds: string[];
+      worktreePath: string | null;
+      worktreeBranch: string | null;
+    } | null;
     const deleteInfo = db.transaction((): DeleteInfo => {
-      const goal = db.prepare("SELECT project_id FROM goals WHERE id = ?").get(goalId) as { project_id: string } | undefined;
+      const goal = db.prepare(
+        "SELECT project_id, worktree_path, worktree_branch FROM goals WHERE id = ?",
+      ).get(goalId) as { project_id: string; worktree_path: string | null; worktree_branch: string | null } | undefined;
       if (!goal) return null;
-      const activeTasks = db.prepare(
-        "SELECT assignee_id FROM tasks WHERE goal_id = ? AND status IN ('in_progress', 'in_review') AND assignee_id IS NOT NULL",
-      ).all(goalId) as { assignee_id: string }[];
+      const tasks = db.prepare(
+        "SELECT id, assignee_id, status FROM tasks WHERE goal_id = ?",
+      ).all(goalId) as { id: string; assignee_id: string | null; status: string }[];
+      const project = db.prepare("SELECT workdir FROM projects WHERE id = ?")
+        .get(goal.project_id) as { workdir: string | null } | undefined;
       db.prepare("DELETE FROM goals WHERE id = ?").run(goalId);
-      return { projectId: goal.project_id, assigneeIds: activeTasks.map((t) => t.assignee_id) };
+      return {
+        projectId: goal.project_id,
+        projectWorkdir: project?.workdir ?? null,
+        assigneeIds: tasks
+          .filter((t) => (t.status === "in_progress" || t.status === "in_review") && t.assignee_id)
+          .map((t) => t.assignee_id as string),
+        taskIds: tasks.map((t) => t.id),
+        worktreePath: goal.worktree_path,
+        worktreeBranch: goal.worktree_branch,
+      };
     })();
 
     if (!deleteInfo) return res.status(404).json({ error: "Goal not found" });
     // Kill sessions after commit — side-effects must not run inside the txn
     for (const assigneeId of deleteInfo.assigneeIds) {
+      // assignee_id는 이 goal의 (이제 삭제된) task 기준 스냅샷일 뿐 — 위임 대기 부모처럼
+      // DB상 in_progress로 남아있는 사이 그 agent가 다른 goal의 새 task를 정상 실행 중일
+      // 수 있다. sessionKey가 agentId를 공유하므로, 그 살아있는 세션이 실제로 이 goal의
+      // task를 실행 중인지 확인 후에만 죽인다. task_id가 NULL이면(delegation 등 taskId를
+      // 안 넘기는 spawn 경로) 이 goal 소속인지 증명할 수 없다 — 증명 안 되면 죽이지 않는다
+      // (활성 세션이 없으면 어차피 killSession이 no-op이므로 이 판단에서 제외).
+      const activeSession = db.prepare(
+        "SELECT task_id FROM sessions WHERE agent_id = ? AND status = 'active' ORDER BY rowid DESC LIMIT 1",
+      ).get(assigneeId) as { task_id: string | null } | undefined;
+      if (activeSession && (!activeSession.task_id || !deleteInfo.taskIds.includes(activeSession.task_id))) continue;
       try { ctx.sessionManager?.killSession(assigneeId); } catch { /* ignore */ }
     }
-    // Also kill any spec-generation or decompose session for this goal
+    // Kill spec-generation and decompose sessions for this goal
     try { ctx.sessionManager?.killSession(`spec-${goalId}`); } catch { /* ignore */ }
     try { ctx.sessionManager?.killSession(`decompose-${goalId}`); } catch { /* ignore */ }
+    // Kill task-phase sessions (architect/evaluator). These use taskId-scoped
+    // keys — NOT the assignee agent id — so the assignee kill above misses them.
+    // An architect session mid-run keeps the engine spawning the impl session
+    // for an already-deleted goal unless we terminate it here.
+    for (const taskId of deleteInfo.taskIds) {
+      try { ctx.sessionManager?.killSession(`architect-${taskId}`); } catch { /* ignore */ }
+      try { ctx.sessionManager?.killSession(`evaluator-${taskId}`); } catch { /* ignore */ }
+    }
+    // Release scheduler in-flight ownership: spec/decompose lookahead flight,
+    // decompose retry backoff, and per-task failover/backfill state.
+    try { ctx.scheduler?.cancelGoal(deleteInfo.projectId, goalId, deleteInfo.taskIds); } catch { /* ignore */ }
+    // Tear down the goal worktree + its task checkpoints (best-effort, synchronous
+    // so the row and its Git residue disappear together). Drop checkpoints BEFORE
+    // removing the worktree — dropCheckpoint reads `git stash list` from inside it.
+    if (deleteInfo.worktreePath && deleteInfo.projectWorkdir) {
+      try {
+        if (existsSync(deleteInfo.worktreePath)) {
+          for (const taskId of deleteInfo.taskIds) {
+            try { dropCheckpoint(deleteInfo.worktreePath, taskId); } catch { /* ignore */ }
+          }
+        }
+        removeWorktree(deleteInfo.projectWorkdir, deleteInfo.worktreePath, deleteInfo.worktreeBranch ?? undefined);
+      } catch (err: any) {
+        log.warn(`Goal ${goalId} worktree cleanup failed: ${err?.message ?? err}`);
+      }
+    }
     broadcast("project:updated", { projectId: deleteInfo.projectId });
     res.json({ success: true });
   });

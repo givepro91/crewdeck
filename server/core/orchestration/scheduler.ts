@@ -1,6 +1,10 @@
 import type { Database } from "better-sqlite3";
 import type { SessionManager } from "../agent/session.js";
-import { createOrchestrationEngine } from "./engine.js";
+import {
+  claimTaskForExecution,
+  createOrchestrationEngine,
+  type TaskExecutionClaim,
+} from "./engine.js";
 import { createDelegationEngine } from "./delegation.js";
 import { createQualityGate } from "../quality-gate/evaluator.js";
 import { createLogger } from "../../utils/logger.js";
@@ -37,6 +41,14 @@ export interface Scheduler {
   notifyGoalReady: (projectId: string) => void;
   /** Clear all task assignees and re-run auto-assignment. Returns count of assigned tasks. */
   reassignAll: (projectId: string) => number;
+  /**
+   * Release all in-flight scheduler ownership for a goal that was just deleted.
+   * Clears the spec/decompose lookahead flight, decompose retry backoff, and the
+   * per-task failover/backfill state so a cancelled goal cannot keep the project
+   * "busy" or re-dispatch its (now CASCADE-deleted) tasks. Call AFTER the goal row
+   * is gone, passing the ids of the tasks it owned.
+   */
+  cancelGoal: (projectId: string, goalId: string, taskIds: string[]) => void;
 }
 
 export interface QueueState {
@@ -97,6 +109,18 @@ export function pickParallelGoals(db: Database, projectId: string, maxGoals: num
               AND s.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
           )
       )
+      AND NOT EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.goal_id = g.id
+          AND t.status = 'todo'
+          AND julianday(t.started_at) > julianday('now', '-5 seconds')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM tasks retrying
+        WHERE retrying.goal_id = g.id
+          AND retrying.status = 'blocked'
+          AND NOT (retrying.retry_count >= ? AND retrying.reassign_count >= ?)
+      )
       AND EXISTS (
         SELECT 1 FROM tasks t
         WHERE t.goal_id = g.id
@@ -105,8 +129,50 @@ export function pickParallelGoals(db: Database, projectId: string, maxGoals: num
       )
     ORDER BY ${GOAL_PRIORITY_ORDER}
     LIMIT ?
-  `).all(projectId, maxGoals) as { id: string }[];
+  `).all(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS, maxGoals) as { id: string }[];
   return rows.map((r) => r.id);
+}
+
+/**
+ * DB 상 "live execution lane" 을 점유한 agent id 집합.
+ *
+ * 실행 경로(스케줄러 executeOne vs 수동 POST /tasks/:id/execute)와 무관하게,
+ * in_progress/in_review 태스크의 assignee 는 세션을 하나 점유 중이다. 스케줄러의
+ * in-memory busyAgents 는 스케줄러 자신이 스폰한 세션만 알기 때문에, 수동 실행이
+ * DB claim(in_progress)만 얻고 busyAgents 에는 등록되지 않는 경우 poll 이 같은
+ * agent 의 다른 goal 태스크를 뽑아 spawnAgent 가 정상 세션을 cleanup(SIGTERM)한다.
+ * DB 를 진실원으로 삼아 그 갭을 메운다.
+ *
+ * 위임 대기 부모(미종결 하위 작업을 가진 in_progress 태스크)는 라이브 세션 없이
+ * 하위 작업 완료를 기다리는 상태라 세션을 점유하지 않으므로 제외한다 — pickParallelGoals
+ * 의 in-flight 판정과 동일한 계약.
+ */
+export function getActiveAgentIds(db: Database, projectId: string): Set<string> {
+  const rows = db.prepare(`
+    SELECT DISTINCT t.assignee_id FROM tasks t
+    WHERE t.project_id = ?
+      AND t.assignee_id IS NOT NULL
+      AND t.status IN ('in_progress', 'in_review')
+      AND NOT EXISTS (
+        SELECT 1 FROM tasks s
+        WHERE s.parent_task_id = t.id
+          AND s.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
+      )
+  `).all(projectId) as { assignee_id: string }[];
+  const active = new Set(rows.map((r) => r.assignee_id));
+  for (const agentId of getActiveSessionAgentIds(db, projectId)) active.add(agentId);
+  return active;
+}
+
+function getActiveSessionAgentIds(db: Database, projectId: string): Set<string> {
+  const rows = db.prepare(`
+    SELECT DISTINCT s.agent_id
+    FROM sessions s
+    JOIN agents a ON a.id = s.agent_id
+    WHERE a.project_id = ?
+      AND s.status = 'active'
+  `).all(projectId) as { agent_id: string }[];
+  return new Set(rows.map((row) => row.agent_id));
 }
 
 interface ProviderFailoverDecisionRecord {
@@ -344,14 +410,111 @@ export function createScheduler(
   // failover 관측성 브리지: 재디스패치된 taskId → 원본(실패) 세션 id + 기대 provider.
   // 재실행이 새 세션을 만든 뒤(다음 poll의 executeOne) redispatched_session_id를 backfill한다.
   const pendingFailoverByTask = new Map<string, {
-    originalSessionId: string;
+    originalSessionId: string | null;
     toProvider: AgentProvider;
+    afterSessionRowId: number;
+    // 재디스패치 재실행이 실제로 시작된 시점의 세션 rowid boundary. failover 예약 시엔
+    // null이며, executeOne이 이 task를 재실행할 때 세팅된다. backfill은 이 값이 세팅된
+    // 뒤에만(=재실행이 시작된 뒤) 그 이후 rowid의 세션을 재디스패치 세션으로 귀속한다.
+    // afterSessionRowId(원본 실패 세션 기준)만 쓰면 failover 예약~재실행 사이에 낀 무관한
+    // 세션이 오귀속되므로 task 식별 대용으로 재실행 boundary를 별도로 고정한다.
+    redispatchAfterRowId: number | null;
   }>();
 
   const pendingBackfillTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   function getEffectiveConcurrency(projectId: string): number {
     return effectiveConcurrency.get(projectId) ?? DEFAULT_MAX_CONCURRENCY;
+  }
+
+  /**
+   * Project concurrency is a goal-slot contract, not an agent count.
+   *
+   * A live task occupies its goal's single execution lane. A recently released
+   * claim also occupies it for the same short settle window enforced by
+   * claimTaskForExecution, so a nested poll cannot fill that lane while a
+   * concurrent dispatch is still settling.
+   */
+  function getOccupiedGoalIds(projectId: string): Set<string> {
+    const staleThresholdSeconds = Math.ceil((TASK_TIMEOUT_MS * 3) / 1000);
+    const rows = db.prepare(`
+      SELECT t.goal_id, t.status, t.assignee_id,
+        CASE
+          WHEN t.status IN ('in_progress', 'in_review')
+            AND (strftime('%s', 'now') - strftime('%s', t.updated_at)) > ?
+          THEN 1 ELSE 0
+        END AS is_stale
+      FROM tasks t
+      WHERE t.project_id = ?
+        AND t.goal_id IS NOT NULL
+        AND (
+          (
+            t.status IN ('in_progress', 'in_review')
+            AND NOT EXISTS (
+              SELECT 1 FROM tasks child
+              WHERE child.parent_task_id = t.id
+                AND child.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
+            )
+          )
+          OR (
+            t.status = 'todo'
+            AND julianday(t.started_at) > julianday('now', '-5 seconds')
+          )
+        )
+    `).all(staleThresholdSeconds, projectId) as {
+      goal_id: string;
+      status: string;
+      assignee_id: string | null;
+      is_stale: number;
+    }[];
+
+    const busy = getBusyAgents(projectId);
+    const activeSessionAgents = getActiveSessionAgentIds(db, projectId);
+    return new Set(
+      rows
+        // Let pickNextTasks reach its ghost recovery when a stale DB state has
+        // no live scheduler owner. A genuinely running long task still owns
+        // its lane through busyAgents or an active manual session even if its
+        // task row is old.
+        .filter((row) => row.is_stale === 0 || (row.assignee_id !== null
+          && (busy.has(row.assignee_id) || activeSessionAgents.has(row.assignee_id))))
+        .map((row) => row.goal_id),
+    );
+  }
+
+  /**
+   * A recoverable failure keeps ownership of its existing project goal slot.
+   *
+   * `blocked` rows reserve the lane while their cooldown runs. Once promoted
+   * to `todo`, retry/reassign counters (or an unlinked failover trace) keep the
+   * reservation until the exact same task is atomically reclaimed. This is
+   * deliberately separate from getOccupiedGoalIds: a continuation owns a
+   * slot, but must still be allowed to start inside that owned slot.
+   */
+  function getRetryReservedGoalIds(projectId: string): Set<string> {
+    const rows = db.prepare(`
+      SELECT DISTINCT goal_id FROM tasks
+      WHERE project_id = ?
+        AND goal_id IS NOT NULL
+        AND (
+          (
+            status = 'blocked'
+            AND NOT (retry_count >= ? AND reassign_count >= ?)
+          )
+          OR (
+            status = 'todo'
+            AND (
+              retry_count > 0
+              OR reassign_count > 0
+              OR (
+                provider_failover_redispatched = 1
+                AND provider_failover_redispatched_session_id IS NULL
+              )
+            )
+          )
+        )
+    `).all(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS) as { goal_id: string }[];
+    return new Set(rows.map((row) => row.goal_id));
   }
 
   function recordActivity(input: {
@@ -529,15 +692,14 @@ export function createScheduler(
     broadcast("provider:redispatched", payload);
   }
 
-  /**
-   * Prevent duplicate pipeline work. Two disjoint key namespaces share this
-   * Set intentionally:
-   * - `${projectId}`       → mission → goals generation (full autopilot)
-   * - `process-${projectId}` → sequential goal processing (processNextGoal)
-   * They gate different operations, so using one Set with prefixed keys keeps
-   * them independent without extra state.
-   */
+  /** Prevent duplicate mission → goals generation in full autopilot. */
   const fullAutopilotLock = new Set<string>();
+
+  // projectId → the single goal currently occupying the spec/decompose
+  // lookahead slot. Reserving this synchronously before the async pipeline
+  // starts makes nested polls, notify callbacks, and completion callbacks
+  // contend on one project-level flight.
+  const goalPreparationFlights = new Map<string, string>();
   const decomposRetryCount = new Map<string, number>();
 
   // 사용자가 명시적으로 정지한 큐 (stopQueue API). 자동 완료 정지(stopQueueInternal)와
@@ -547,6 +709,11 @@ export function createScheduler(
 
   // projectId → set of currently busy agent IDs
   const busyAgents = new Map<string, Set<string>>();
+  // taskId → scheduler-owned execution lane. Keeping task ownership separate
+  // lets goal cancellation release a lane without waiting for a stuck send()
+  // Promise, while preventing that old Promise's finally from releasing a
+  // newer task that reused the same agent.
+  const activeExecutionOwners = new Map<string, { projectId: string; agentId: string }>();
   // Dedup repeated log warnings (e.g., "permanently blocked" on every poll)
   const loggedProgressWarnings = new Set<string>();
 
@@ -696,6 +863,21 @@ export function createScheduler(
   function getBusyAgents(projectId: string): Set<string> {
     if (!busyAgents.has(projectId)) busyAgents.set(projectId, new Set());
     return busyAgents.get(projectId)!;
+  }
+
+  function acquireExecutionOwnership(projectId: string, taskId: string, agentId: string): void {
+    activeExecutionOwners.set(taskId, { projectId, agentId });
+    getBusyAgents(projectId).add(agentId);
+  }
+
+  function releaseExecutionOwnership(taskId: string): void {
+    const owner = activeExecutionOwners.get(taskId);
+    if (!owner) return;
+    activeExecutionOwners.delete(taskId);
+    const agentStillOwned = [...activeExecutionOwners.values()].some(
+      (candidate) => candidate.projectId === owner.projectId && candidate.agentId === owner.agentId,
+    );
+    if (!agentStillOwned) getBusyAgents(owner.projectId).delete(owner.agentId);
   }
 
   function getPauseState(projectId: string) {
@@ -1041,19 +1223,15 @@ export function createScheduler(
   }
 
   /**
-   * Pick next executable tasks — sequential goal processing.
-   *
-   * Goal-level sequencing: only ONE goal is active at a time within a project.
-   *   1) If any goal already has in_progress/in_review tasks → that goal stays active
-   *   2) Otherwise → highest-priority goal with todo tasks becomes active
-   *   3) Tasks within the active goal can still run in parallel (up to maxSlots)
-   *
-   * This prevents the previous behavior where multiple goals' tasks would
-   * interleave by global priority, making it hard to finish anything.
+   * Pick next executable tasks: goals run in parallel, each goal has one lane.
+   * Active/settling goals are excluded and every selected goal contributes at
+   * most one task, ordered by goal priority.
    */
-  function pickNextTasks(projectId: string, maxSlots: number): any[] {
-    if (maxSlots <= 0) return [];
-
+  function pickNextTasks(
+    projectId: string,
+    maxContinuationSlots: number,
+    maxNewGoalSlots: number,
+  ): any[] {
     // Auto-retry blocked tasks that haven't exceeded retry limit
     retryBlockedTasks(projectId);
 
@@ -1097,8 +1275,12 @@ export function createScheduler(
             AND s.status IN ('todo', 'pending_approval', 'in_progress', 'in_review')
         )
     `).all(projectId, STALE_THRESHOLD_SECONDS) as { id: string; assignee_id: string | null; status: string; retry_count: number; reassign_count: number }[];
+    const activeSessionAgents = getActiveSessionAgentIds(db, projectId);
     for (const ghost of staleCandidates) {
-      if (ghost.assignee_id && busy.has(ghost.assignee_id)) continue; // really running
+      if (ghost.assignee_id
+        && (busy.has(ghost.assignee_id) || activeSessionAgents.has(ghost.assignee_id))) {
+        continue; // really running (scheduler or manual execution)
+      }
 
       // Respect retry/reassign limits — don't revive permanently exhausted tasks
       if (ghost.retry_count >= MAX_TASK_RETRIES && ghost.reassign_count >= MAX_REASSIGNS) {
@@ -1127,7 +1309,14 @@ export function createScheduler(
     );
 
     const picked: any[] = [];
-    const usedAgents = new Set(busy);
+    // busy(in-memory, 스케줄러가 스폰한 세션)만으로 seed 하면 수동 실행
+    // (POST /tasks/:id/execute, DB claim 만 얻고 busyAgents 미등록)이 점유한
+    // agent 를 놓쳐, 같은 agent 에 배정된 다른 goal 태스크를 뽑아 spawnAgent 가
+    // 정상 세션을 cleanup(SIGTERM)한다. DB 상 live lane 을 가진 agent 를 합쳐
+    // 실행 경로와 무관하게 agent 당 1 세션 불변식을 지킨다.
+    const usedAgents = new Set([...busy, ...getActiveAgentIds(db, projectId)]);
+    const occupiedGoalIds = getOccupiedGoalIds(projectId);
+    const pickedGoalIds = new Set<string>();
 
     // Failover redispatch는 같은 태스크가 같은 agent에서 즉시 재실행되어야
     // original_session_id ↔ redispatched_session_id 연결이 정확하다. 일반 goal
@@ -1138,7 +1327,6 @@ export function createScheduler(
         AND t.status = 'todo'
         AND t.assignee_id IS NOT NULL
         AND t.provider_failover_redispatched = 1
-        AND t.provider_failover_original_session_id IS NOT NULL
         AND t.provider_failover_redispatched_session_id IS NULL
         AND t.provider_failover_to_provider IN ('claude', 'codex')
       ORDER BY t.updated_at DESC, t.created_at ASC
@@ -1149,24 +1337,55 @@ export function createScheduler(
         .filter((agentId: unknown): agentId is string => typeof agentId === "string"),
     );
     for (const task of pendingRedispatches) {
-      if (picked.length >= maxSlots) break;
+      if (picked.length >= maxContinuationSlots) break;
       if (usedAgents.has(task.assignee_id)) continue;
+      if (occupiedGoalIds.has(task.goal_id) || pickedGoalIds.has(task.goal_id)) continue;
       picked.push(task);
       usedAgents.add(task.assignee_id);
+      pickedGoalIds.add(task.goal_id);
+    }
+
+    // Ordinary retries/reassigns are continuations of the failed goal lane,
+    // not fresh work. Pick the exact failed task before any later sibling or
+    // reviewer. retryBlockedTasks above promotes only cooldown-eligible rows,
+    // so a still-blocked task continues to reserve its slot without spawning.
+    const pendingRetries = db.prepare(`
+      SELECT t.* FROM tasks t
+      JOIN goals g ON g.id = t.goal_id
+      WHERE t.project_id = ?
+        AND t.status = 'todo'
+        AND t.assignee_id IS NOT NULL
+        AND (t.retry_count > 0 OR t.reassign_count > 0)
+        AND NOT (
+          t.provider_failover_redispatched = 1
+          AND t.provider_failover_redispatched_session_id IS NULL
+        )
+      ORDER BY ${GOAL_PRIORITY_ORDER}, t.updated_at ASC, t.created_at ASC
+    `).all(projectId) as any[];
+    for (const task of pendingRetries) {
+      if (picked.length >= maxContinuationSlots) break;
+      if (usedAgents.has(task.assignee_id)) continue;
+      if (occupiedGoalIds.has(task.goal_id) || pickedGoalIds.has(task.goal_id)) continue;
+      picked.push(task);
+      usedAgents.add(task.assignee_id);
+      pickedGoalIds.add(task.goal_id);
     }
 
     // Step 1: goal 간 병렬 — 이번 라운드에 태스크를 뽑을 goal 들을 고른다.
     // in-flight 태스크가 있는 goal 은 "goal 내부 순차 1" 원칙상 이미 슬롯을
     // 점유 중이라 제외되고, 남은 goal 중 ready 태스크가 있는 것을 우선순위
-    // 순으로 최대 maxSlots 개. goal 간에는 worktree 격리로 병렬이 안전하다.
-    const pickedGoalIds = new Set(picked.map((task) => task.goal_id));
-    const activeGoalIds = pickParallelGoals(db, projectId, maxSlots)
+    // 순으로 순회한다. 상위 goal이 dependency/reviewer gate로 실행 불가능해도
+    // 하위 goal로 슬롯을 채우기 위해 후보는 모두 읽고, 실제 선택만 maxSlots에서
+    // 끊는다. goal 간에는 worktree 격리로 병렬이 안전하다.
+    const activeGoalIds = pickParallelGoals(db, projectId, Number.MAX_SAFE_INTEGER)
+      .filter((goalId) => !occupiedGoalIds.has(goalId))
       .filter((goalId) => !pickedGoalIds.has(goalId));
-    if (activeGoalIds.length === 0) return picked;
+    if (activeGoalIds.length === 0 || maxNewGoalSlots <= 0) return picked;
 
     // Step 2: goal 마다 실행 가능한 첫 태스크 1개만 뽑는다 (goal 내부 순차 1)
+    let pickedNewGoals = 0;
     for (const activeGoalId of activeGoalIds) {
-      if (picked.length >= maxSlots) break;
+      if (pickedNewGoals >= maxNewGoalSlots) break;
 
       // Sprint 5: status = 'todo' naturally excludes 'pending_approval' tasks.
       // pending_approval tasks must be explicitly approved (→ todo) via the
@@ -1259,6 +1478,8 @@ export function createScheduler(
 
         picked.push(task);
         usedAgents.add(task.assignee_id);
+        pickedGoalIds.add(task.goal_id);
+        pickedNewGoals++;
         break; // goal 내부 순차 1 — 이 goal 은 이번 라운드 종료
       }
     }
@@ -1287,8 +1508,14 @@ export function createScheduler(
    * Does NOT stop the queue — current todo tasks keep running.
    */
   function triggerGoalProcessingIfNeeded(projectId: string): void {
+    // Goal preparation belongs to a running queue. Notifications and delayed
+    // callbacks may arrive after stopQueue(), but they must not start a new
+    // spec/decompose session or revive the queue.
+    if (!timers.has(projectId) || userStoppedQueues.has(projectId)) return;
+
     const project = db.prepare("SELECT autopilot FROM projects WHERE id = ?").get(projectId) as { autopilot: string } | undefined;
     if (!project || (project.autopilot !== "goal" && project.autopilot !== "full")) return;
+    if (goalPreparationFlights.has(projectId)) return;
 
     // Pipeline lookahead: "실행 중인 goal 수 < 동시성 + 1" 일 때만 다음 goal 의
     // spec/decompose 를 미리 돌린다. 예전에는 모든 작업이 끝나야 다음 goal 을
@@ -1298,13 +1525,12 @@ export function createScheduler(
     //
     // "실행 중" 판정은 기존 2-layer check 유지:
     // 1. non-terminal 태스크(in_progress, in_review, todo, pending_approval)가 있거나
-    // 2. progress < 100 이면서 재시도 여지가 있는 blocked 태스크가 있는 goal
-    // (모두 blocked/done 인 순간의 progress 재계산 지연을 흡수해, 아직 일이 남은
-    //  goal 을 완료로 오판해 다음 goal 이 끼어드는 것을 막는다.)
+    // 2. 재시도 여지가 있는 blocked 태스크가 있는 goal
+    // progress는 파생 캐시이므로 실제 task 상태와 잠시 드리프트할 수 있다.
+    // 준비 슬롯은 task 상태를 진실원으로 계산해 live goal을 누락하지 않는다.
     const activeGoalCount = (db.prepare(`
       SELECT COUNT(*) AS cnt FROM goals g
       WHERE g.project_id = ?
-        AND g.progress < 100
         AND (SELECT COUNT(*) FROM tasks t WHERE t.goal_id = g.id) > 0
         AND (
           (SELECT COUNT(*) FROM tasks t WHERE t.goal_id = g.id AND t.status NOT IN ('done', 'blocked')) > 0
@@ -1336,6 +1562,29 @@ export function createScheduler(
    * No todo, in_progress, in_review, pending_approval, or retryable blocked tasks remain.
    */
   function shouldAutoStop(projectId: string): boolean {
+    // A zero-task goal whose spec is still '{"_status":"generating"}' is
+    // pending work, not completion. The marker is owned by an in-flight spec
+    // generation (POST /goals/:id/generate-spec, rescue path) that will call
+    // notifyGoalReady when done — but that callback is gated on the queue
+    // still running (timers.has). processNextGoal's isGenerating branch
+    // releases the preparation flight and defers, so without this guard the
+    // same poll would see no remaining tasks and auto-stop with reason
+    // "completed", after which the completion callback is dropped and
+    // decompose never starts. Treat any generating spec as outstanding work.
+    // Match the generating marker as an exact literal instead of json_extract:
+    // prd_summary can hold a plain-text summary (non-JSON), on which
+    // json_extract throws SqliteError: malformed JSON and strands the poll.
+    // The marker is always written as this exact string (recovery.ts uses the
+    // same literal equality); processNextGoal likewise substring-matches it.
+    const generating = db.prepare(`
+      SELECT COUNT(*) as cnt FROM goal_specs gs
+      JOIN goals g ON g.id = gs.goal_id
+      WHERE g.project_id = ?
+        AND gs.prd_summary = '{"_status":"generating"}'
+    `).get(projectId) as { cnt: number };
+
+    if (generating.cnt > 0) return false;
+
     const remaining = db.prepare(`
       SELECT COUNT(*) as cnt FROM tasks
       WHERE project_id = ?
@@ -1365,8 +1614,9 @@ export function createScheduler(
    * After this goal's tasks complete, shouldAutoStop picks the next goal.
    */
   function processNextGoal(projectId: string, goalId: string): void {
-    if (fullAutopilotLock.has(`process-${projectId}`)) return;
-    fullAutopilotLock.add(`process-${projectId}`);
+    if (!timers.has(projectId) || userStoppedQueues.has(projectId)) return;
+    if (goalPreparationFlights.has(projectId)) return;
+    goalPreparationFlights.set(projectId, goalId);
 
     const ctoAgent = db.prepare(
       "SELECT id FROM agents WHERE project_id = ? AND role = 'cto' LIMIT 1"
@@ -1386,7 +1636,7 @@ export function createScheduler(
     };
 
     const goalRow = db.prepare("SELECT id, title FROM goals WHERE id = ?").get(goalId) as { id: string; title: string } | undefined;
-    if (!goalRow) { fullAutopilotLock.delete(`process-${projectId}`); return; }
+    if (!goalRow) { goalPreparationFlights.delete(projectId); return; }
     const goalTitle = goalRow.title || goalId;
 
     const spec = db.prepare("SELECT prd_summary FROM goal_specs WHERE goal_id = ?").get(goalId) as { prd_summary: string } | undefined;
@@ -1395,8 +1645,10 @@ export function createScheduler(
     const hasSpec = prd && !isGenerating && !prd.includes('"_status":"failed"');
 
     if (isGenerating) {
-      fullAutopilotLock.delete(`process-${projectId}`);
-      scheduleNextPoll(projectId);
+      goalPreparationFlights.delete(projectId);
+      if (timers.has(projectId) && !userStoppedQueues.has(projectId)) {
+        scheduleNextPoll(projectId);
+      }
       return;
     }
 
@@ -1416,6 +1668,11 @@ export function createScheduler(
           ).run(goalId);
           await generateGoalSpec(goalId);
           broadcast("project:updated", { projectId });
+
+          // stopQueue may have been called while spec generation was in
+          // flight. Finishing that already-started session is allowed, but it
+          // must not launch the next decompose session after the stop boundary.
+          if (!timers.has(projectId) || userStoppedQueues.has(projectId)) return;
         }
 
         // Step 2: Decompose (skip if tasks already exist — decomposeGoal guards this too)
@@ -1440,16 +1697,12 @@ export function createScheduler(
           log.info(`processNextGoal: goal ${goalId} already has ${existingTasks} task(s), skipping decompose`);
         }
 
-        // Resume queue — will pick up new tasks for THIS goal only.
-        // 단, 사용자가 명시적으로 정지한 큐는 되살리지 않는다. lookahead 덕에
-        // decompose가 태스크 실행과 겹치면서, 정지 버튼 이후 완료된 decompose가
-        // 이 코드로 큐를 침묵 재시작하던 실측 버그 (07-08, stop-queue 무시).
-        if (!timers.has(projectId) && !userStoppedQueues.has(projectId)) {
-          // busyAgents는 보존 — 빈 Set으로 리셋하면 실행 중인 executeOne이 보이지
-          // 않게 되어, 같은 에이전트에 이중 스폰 → 기존 세션 SIGTERM(exit 143) 살해
-          // → 무고한 태스크 재시도 소모 (07-08 실측: 세이브 v12가 전투 이벤트 스폰에 살해됨).
-          if (!busyAgents.has(projectId)) busyAgents.set(projectId, new Set());
-          pauseState.delete(projectId);
+        // Wake an already-running queue so it can consume the prepared goal.
+        // Never recreate a missing timer here: a missing timer means the queue
+        // was stopped while this async preparation was in flight.
+        if (timers.has(projectId) && !userStoppedQueues.has(projectId)) {
+          const existing = timers.get(projectId);
+          if (existing) clearTimeout(existing);
           timers.set(projectId, setTimeout(() => poll(projectId), 0));
         }
       } catch (err: any) {
@@ -1486,7 +1739,8 @@ export function createScheduler(
           "SELECT COUNT(*) as count FROM tasks WHERE goal_id = ?"
         ).get(goalId) as { count: number }).count;
 
-        if (retryCount <= 2 && existingAfterError === 0) {
+        if (retryCount <= 2 && existingAfterError === 0
+          && timers.has(projectId) && !userStoppedQueues.has(projectId)) {
           const retryDelayMs = 60_000 * retryCount; // 60s, 120s
           log.info(`Decompose retry ${retryCount}/2 for goal "${goalTitle}" in ${retryDelayMs / 1000}s`);
           db.prepare("INSERT INTO activities (project_id, type, message) VALUES (?, 'autopilot', ?)").run(
@@ -1495,6 +1749,7 @@ export function createScheduler(
           broadcast("project:updated", { projectId });
           setTimeout(() => {
             decomposRetryCount.delete(retryKey);
+            if (!timers.has(projectId) || userStoppedQueues.has(projectId)) return;
             // Guard: goal may have been deleted during the retry delay
             const stillExists = db.prepare("SELECT id FROM goals WHERE id = ?").get(goalId);
             if (stillExists) {
@@ -1514,7 +1769,9 @@ export function createScheduler(
         }
       } finally {
         clearActivity();
-        fullAutopilotLock.delete(`process-${projectId}`);
+        if (goalPreparationFlights.get(projectId) === goalId) {
+          goalPreparationFlights.delete(projectId);
+        }
       }
     })();
   }
@@ -1692,30 +1949,45 @@ export function createScheduler(
    * 원본(실패) 세션과 아직 같은 세션이면(= 새 세션 미생성) no-op으로 다음 실행을 기다린다.
    */
   function getPendingFailover(taskId: string): {
-    originalSessionId: string;
+    originalSessionId: string | null;
     toProvider: AgentProvider;
+    afterSessionRowId: number;
+    redispatchAfterRowId: number | null;
   } | undefined {
     const inMemory = pendingFailoverByTask.get(taskId);
     if (inMemory) return inMemory;
 
     const row = db.prepare(
-      `SELECT provider_failover_original_session_id, provider_failover_to_provider
-       FROM tasks
+      `SELECT t.provider_failover_original_session_id, t.provider_failover_to_provider,
+              t.assignee_id
+       FROM tasks t
        WHERE id = ?
          AND provider_failover_redispatched = 1
-         AND provider_failover_original_session_id IS NOT NULL
          AND provider_failover_redispatched_session_id IS NULL`,
     ).get(taskId) as {
       provider_failover_original_session_id: string | null;
       provider_failover_to_provider: string | null;
+      assignee_id: string | null;
     } | undefined;
-    if (!row?.provider_failover_original_session_id || !isAgentProvider(row.provider_failover_to_provider)) {
+    if (!row || !isAgentProvider(row.provider_failover_to_provider)) {
       return undefined;
     }
+
+    const boundary = row.provider_failover_original_session_id
+      ? db.prepare("SELECT rowid FROM sessions WHERE id = ?")
+        .get(row.provider_failover_original_session_id) as { rowid: number } | undefined
+      : row.assignee_id
+        ? db.prepare("SELECT COALESCE(MAX(rowid), 0) AS rowid FROM sessions WHERE agent_id = ?")
+          .get(row.assignee_id) as { rowid: number }
+        : { rowid: 0 };
 
     const recovered = {
       originalSessionId: row.provider_failover_original_session_id,
       toProvider: row.provider_failover_to_provider,
+      afterSessionRowId: boundary?.rowid ?? 0,
+      // 재시작으로 인메모리가 비어 복원된 경우엔 재실행 boundary를 모른다 → null로 두고,
+      // executeOne이 이 task를 재실행할 때 세팅되길 기다린다(그때까지 backfill 보류).
+      redispatchAfterRowId: null,
     };
     pendingFailoverByTask.set(taskId, recovered);
     return recovered;
@@ -1770,26 +2042,47 @@ export function createScheduler(
   function backfillRedispatchSession(taskId: string): boolean {
     const pending = getPendingFailover(taskId);
     if (pending === undefined) return false;
-    const row = db.prepare("SELECT project_id, assignee_id, title FROM tasks WHERE id = ?").get(taskId) as
-      | { project_id: string; assignee_id: string | null; title: string | null }
+    const row = db.prepare(`
+      SELECT project_id, assignee_id, title,
+             provider_failover_reason_code, provider_failover_user_message,
+             provider_failover_from_provider, provider_failover_to_provider,
+             provider_failover_redispatched
+      FROM tasks WHERE id = ?
+    `).get(taskId) as
+      | {
+          project_id: string;
+          assignee_id: string | null;
+          title: string | null;
+          provider_failover_reason_code: string | null;
+          provider_failover_user_message: string | null;
+          provider_failover_from_provider: string | null;
+          provider_failover_to_provider: string | null;
+          provider_failover_redispatched: number;
+        }
       | undefined;
     if (!row?.assignee_id) {
       pendingFailoverByTask.delete(taskId);
       return false;
     }
+    // 재디스패치 재실행이 아직 시작되지 않았으면(=boundary 미확정) 귀속하지 않는다.
+    // 재디스패치 세션은 task_id로 이 task에 정확히 귀속된다(spawn 시 sessions.task_id 기록).
+    // rowid boundary는 같은 task의 이전 failover 라운드가 만든 toProvider 세션과 이번
+    // 재실행의 세션을 구분하는 보조 조건이다 — 재실행 시작 이후 rowid만 이번 재디스패치로 본다.
+    if (pending.redispatchAfterRowId === null) return false; // 재실행 미시작 — 조기 backfill 금지
     // status로 재디스패치 세션 생성 여부를 판정하지 않는다. 재디스패치 세션이 생겼다가
     // 즉시 실패하면(env_error 등) engine이 태스크를 다시 todo로 되돌리는데, 이때 status
     // 가드로 막으면 이미 생성된 세션의 링크를 영영 backfill하지 못한다. 세션 존재 여부는
-    // 아래 newest 쿼리(원본 이후 생성된 toProvider 세션)가 단독으로 판정한다 — 없으면
-    // false를 반환하므로 생성 전 조기 backfill도 자연히 방지된다.
+    // 아래 newest 쿼리(이 task의, 재실행 boundary 이후 생성된 toProvider 세션)가 단독으로
+    // 판정한다 — 없으면 false를 반환하므로 생성 전 조기 backfill도 자연히 방지된다.
+    // task_id 필터가 있으므로 boundary 이후 끼어든 무관한(다른 task의) 세션은 오귀속되지 않는다.
     const newest = db.prepare(
       `SELECT id FROM sessions
-       WHERE agent_id = ?
+       WHERE task_id = ?
          AND provider = ?
-         AND rowid > COALESCE((SELECT rowid FROM sessions WHERE id = ?), -1)
+         AND rowid > ?
        ORDER BY rowid ASC
        LIMIT 1`,
-    ).get(row.assignee_id, pending.toProvider, pending.originalSessionId) as { id: string } | undefined;
+    ).get(taskId, pending.toProvider, pending.redispatchAfterRowId) as { id: string } | undefined;
     if (!newest || newest.id === pending.originalSessionId) return false; // 재디스패치 세션 아직 미생성
 
     const originalTrace = db.prepare(
@@ -1804,6 +2097,7 @@ export function createScheduler(
       provider_failover_to_provider: string | null;
       provider_failover_redispatched: number;
     } | undefined;
+    const trace = originalTrace ?? row;
 
     db.prepare(
       `UPDATE tasks SET
@@ -1830,10 +2124,10 @@ export function createScheduler(
          provider_failover_redispatched_session_id = ?
        WHERE id = ?`,
     ).run(
-      originalTrace?.provider_failover_reason_code ?? null,
-      originalTrace?.provider_failover_user_message ?? null,
-      originalTrace?.provider_failover_from_provider ?? null,
-      originalTrace?.provider_failover_to_provider ?? null,
+      trace.provider_failover_reason_code ?? null,
+      trace.provider_failover_user_message ?? null,
+      trace.provider_failover_from_provider ?? null,
+      trace.provider_failover_to_provider ?? null,
       1,
       pending.originalSessionId,
       newest.id,
@@ -1848,9 +2142,9 @@ export function createScheduler(
       taskId,
       agentId: row.assignee_id,
       taskTitle: row.title ?? "",
-      reasonCode: asFailoverReasonCode(originalTrace?.provider_failover_reason_code),
-      fromProvider: isAgentProvider(originalTrace?.provider_failover_from_provider)
-        ? originalTrace.provider_failover_from_provider
+      reasonCode: asFailoverReasonCode(trace.provider_failover_reason_code),
+      fromProvider: isAgentProvider(trace.provider_failover_from_provider)
+        ? trace.provider_failover_from_provider
         : null,
       toProvider: pending.toProvider,
       redispatched: true,
@@ -1866,7 +2160,6 @@ export function createScheduler(
       `SELECT id FROM tasks
        WHERE project_id = ?
          AND provider_failover_redispatched = 1
-         AND provider_failover_original_session_id IS NOT NULL
          AND provider_failover_redispatched_session_id IS NULL`,
     ).all(projectId) as { id: string }[];
     for (const row of rows) {
@@ -1877,16 +2170,31 @@ export function createScheduler(
   }
 
   /** Execute a single task, handling completion and delegation. */
-  async function executeOne(projectId: string, task: any): Promise<void> {
-    const busy = getBusyAgents(projectId);
-    busy.add(task.assignee_id);
+  async function executeOne(
+    projectId: string,
+    task: any,
+    claim: Extract<TaskExecutionClaim, { claimed: true }>,
+  ): Promise<void> {
+    acquireExecutionOwnership(projectId, task.id, task.assignee_id);
     const state = getPauseState(projectId);
+    const sessionRowIdBeforeExecution = (db.prepare(
+      "SELECT COALESCE(MAX(rowid), 0) AS rowid FROM sessions WHERE agent_id = ?",
+    ).get(task.assignee_id) as { rowid: number }).rowid;
+
+    // 이 실행이 failover 재디스패치의 재실행이면, 재실행 시작 시점의 세션 boundary를
+    // pending에 고정한다. 이 boundary 이후에 생성된 toProvider 세션만 이 task의 재디스패치
+    // 세션으로 귀속돼(backfillRedispatchSession), failover 예약~재실행 사이에 낀 무관한
+    // 세션의 오귀속을 막는다. (sessions엔 task_id가 없어 rowid boundary를 task 식별에 쓴다.)
+    const pendingForRedispatch = getPendingFailover(task.id);
+    if (pendingForRedispatch && pendingForRedispatch.redispatchAfterRowId === null) {
+      pendingForRedispatch.redispatchAfterRowId = sessionRowIdBeforeExecution;
+    }
 
     log.info(`Scheduler: executing "${task.title}" via agent ${task.assignee_id}`);
 
     try {
       recordProviderResolved(task);
-      const result = await engine.executeTask(task.id);
+      const result = await engine.executeTask(task.id, {}, claim);
       broadcast("task:updated", { taskId: task.id, ...result });
 
       // Success — reset rate limit counter
@@ -1910,7 +2218,6 @@ export function createScheduler(
     } catch (err: any) {
       // Duplicate execution — another caller owns this task, nothing to do
       if (err.message?.includes("skipping duplicate execution")) {
-        busy.delete(task.assignee_id);
         return;
       }
 
@@ -1920,9 +2227,19 @@ export function createScheduler(
       // 방금 실패한 세션이 실제 돈 provider (sessions.provider) — 분류·failover 공용.
       // codex 세션의 "빈 stderr non-zero"를 claude 세션소진으로 오분류하지 않도록 provider를 넘긴다.
       const lastSess = db.prepare(
-        "SELECT id, provider FROM sessions WHERE agent_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
-      ).get(task.assignee_id) as { id: string; provider: string | null } | undefined;
-      const currentProvider: AgentProvider = lastSess?.provider === "codex" ? "codex" : "claude";
+        `SELECT id, provider, rowid FROM sessions
+         WHERE task_id = ? AND agent_id = ? AND rowid > ?
+         ORDER BY rowid DESC LIMIT 1`,
+      ).get(task.id, task.assignee_id, sessionRowIdBeforeExecution) as
+        | { id: string; provider: string | null; rowid: number }
+        | undefined;
+      const taskTrace = db.prepare(
+        "SELECT provider_trace_resolved_provider FROM tasks WHERE id = ?",
+      ).get(task.id) as { provider_trace_resolved_provider: string | null } | undefined;
+      const currentProvider: AgentProvider = lastSess?.provider === "codex"
+        || (!lastSess && taskTrace?.provider_trace_resolved_provider === "codex")
+        ? "codex"
+        : "claude";
 
       const failureClass = classifyAgentFailure(err, { provider: currentProvider });
 
@@ -1956,6 +2273,7 @@ export function createScheduler(
           db.prepare(
             `UPDATE tasks SET
                status = 'todo',
+               started_at = NULL,
                provider_failover_original_session_id = ?,
                updated_at = datetime('now')
              WHERE id = ?`,
@@ -1966,11 +2284,15 @@ export function createScheduler(
                  provider_failover_original_session_id = ?
                WHERE id = ?`,
             ).run(originalSessionId, originalSessionId);
-            pendingFailoverByTask.set(task.id, {
-              originalSessionId,
-              toProvider: decision.toProvider,
-            });
           }
+          pendingFailoverByTask.set(task.id, {
+            originalSessionId,
+            toProvider: decision.toProvider,
+            afterSessionRowId: lastSess?.rowid ?? sessionRowIdBeforeExecution,
+            // 재실행 boundary는 아직 모른다 — 다음 poll의 executeOne이 이 task를
+            // 재실행할 때 세팅한다. 그 전까진 backfill이 보류돼 무관한 세션을 막는다.
+            redispatchAfterRowId: null,
+          });
           // 방금 기록한 failover trace가 담긴 완전한 task를 broadcast한다. 부분 페이로드
           // ({taskId, status})만 보내면 dashboard store가 providerTrace.failover를 merge하지
           // 못해 refetch 전까지 화면이 갱신되지 않는다.
@@ -2046,7 +2368,7 @@ export function createScheduler(
       if (backfillRedispatchSession(task.id)) {
         broadcastTaskSnapshot(task.id);
       }
-      busy.delete(task.assignee_id);
+      releaseExecutionOwnership(task.id);
       // Trigger next poll to fill the freed slot — cancel existing timer to avoid double-poll
       if (timers.has(projectId) && !getPauseState(projectId).paused) {
         const existing = timers.get(projectId);
@@ -2067,16 +2389,19 @@ export function createScheduler(
       return;
     }
 
+    // Preparation has its own lookahead slot and must continue even when all
+    // execution slots are occupied. The project-level preparation flight
+    // makes this safe when this poll overlaps notifications or callbacks.
+    triggerGoalProcessingIfNeeded(projectId);
+
     const busy = getBusyAgents(projectId);
-    const availableSlots = getEffectiveConcurrency(projectId) - busy.size;
-
-    if (availableSlots <= 0) {
-      // All slots occupied — wait for a task to finish
-      scheduleNextPoll(projectId);
-      return;
-    }
-
-    const tasks = pickNextTasks(projectId, availableSlots);
+    const occupiedGoalIds = getOccupiedGoalIds(projectId);
+    const retryReservedGoalIds = getRetryReservedGoalIds(projectId);
+    const occupiedOrReservedGoalIds = new Set([...occupiedGoalIds, ...retryReservedGoalIds]);
+    const concurrency = getEffectiveConcurrency(projectId);
+    const maxContinuationSlots = Math.max(0, concurrency - occupiedGoalIds.size);
+    const maxNewGoalSlots = Math.max(0, concurrency - occupiedOrReservedGoalIds.size);
+    const tasks = pickNextTasks(projectId, maxContinuationSlots, maxNewGoalSlots);
 
     // Surface stuck state: if we keep polling with nothing executable but
     // there IS outstanding work, the user needs to know why. Only count
@@ -2090,11 +2415,8 @@ export function createScheduler(
     }
 
     if (tasks.length === 0) {
-      // No tasks to pick — try to process unhandled goals in background (non-blocking)
-      triggerGoalProcessingIfNeeded(projectId);
-
       // Check if queue should auto-stop
-      if (busy.size === 0 && shouldAutoStop(projectId)) {
+      if (busy.size === 0 && !goalPreparationFlights.has(projectId) && shouldAutoStop(projectId)) {
         log.info(`Queue auto-stopped for project ${projectId} — no remaining work`);
         stopQueueInternal(projectId);
         broadcast("queue:stopped", { projectId, reason: "completed" });
@@ -2164,11 +2486,19 @@ export function createScheduler(
 
     // Launch all picked tasks in parallel (fire-and-forget, each manages its own lifecycle)
     for (const task of tasks) {
+      // Reserve the goal lane before any asynchronous setup/spawn work. This
+      // makes overlapping polls and manual execution contend on the same DB
+      // claim instead of relying on the in-memory busy-agent snapshot.
+      const claim = claimTaskForExecution(db, task.id);
+      if (!claim.claimed) {
+        log.debug(`Scheduler: claim rejected for task ${task.id}: ${claim.error}`);
+        continue;
+      }
       const pendingFailover = getPendingFailover(task.id);
       if (pendingFailover) {
         sessionManager.setProviderOverride(task.assignee_id, pendingFailover.toProvider);
       }
-      executeOne(projectId, task); // intentionally not awaited
+      executeOne(projectId, task, claim); // intentionally not awaited
       scheduleRedispatchBackfill(task.id);
     }
 
@@ -2267,6 +2597,34 @@ export function createScheduler(
      */
     notifyGoalReady(projectId: string): void {
       triggerGoalProcessingIfNeeded(projectId);
+    },
+
+    /**
+     * Release all in-flight scheduler ownership for a just-deleted goal so it
+     * cannot keep the project "busy" or re-dispatch its tasks after the DELETE.
+     */
+    cancelGoal(projectId: string, goalId: string, taskIds: string[]): void {
+      // Spec/decompose lookahead slot — only clear if THIS goal holds it, so we
+      // never yank a flight another goal already claimed.
+      if (goalPreparationFlights.get(projectId) === goalId) {
+        goalPreparationFlights.delete(projectId);
+      }
+      // Decompose retry backoff for this goal. The retry setTimeout itself already
+      // guards on goal existence, so we only drop the accumulated count here.
+      decomposRetryCount.delete(`decompose-retry-${goalId}`);
+      // Per-task failover/backfill state (tasks are CASCADE-deleted with the goal).
+      // A live backfill timer would otherwise re-dispatch a vanished task.
+      for (const taskId of taskIds) {
+        releaseExecutionOwnership(taskId);
+        const timer = pendingBackfillTimers.get(taskId);
+        if (timer) {
+          clearTimeout(timer);
+          pendingBackfillTimers.delete(taskId);
+        }
+        pendingFailoverByTask.delete(taskId);
+        triedProvidersByTask.delete(taskId);
+      }
+      log.info(`cancelGoal: released in-flight ownership for goal ${goalId} (${taskIds.length} task(s))`);
     },
 
     /**

@@ -17,6 +17,7 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 let repo: string;
+const GIT_TEST_TIMEOUT_MS = 20_000;
 
 beforeEach(() => {
   repo = mkdtempSync(join(tmpdir(), 'crewdeck-ckpt-'));
@@ -26,13 +27,13 @@ beforeEach(() => {
   writeFileSync(join(repo, 'a.txt'), 'base\n');
   git(repo, 'add', 'a.txt');
   git(repo, 'commit', '-m', 'base');
-});
+}, GIT_TEST_TIMEOUT_MS);
 
 afterEach(() => {
   rmSync(repo, { recursive: true, force: true });
-});
+}, GIT_TEST_TIMEOUT_MS);
 
-describe('stashCheckpoint — goal WIP 보존', () => {
+describe('stashCheckpoint — goal WIP 보존', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('체크포인트 생성 후에도 작업 트리의 WIP가 유지된다 (tracked + untracked)', () => {
     writeFileSync(join(repo, 'a.txt'), 'wip\n'); // 이전 태스크의 미커밋 산출물
     writeFileSync(join(repo, 'new.txt'), 'untracked wip\n');
@@ -68,7 +69,7 @@ describe('stashCheckpoint — goal WIP 보존', () => {
   });
 });
 
-describe('restoreCheckpoint — 실패 롤백', () => {
+describe('restoreCheckpoint — 실패 롤백', { timeout: GIT_TEST_TIMEOUT_MS }, () => {
   it('실패한 태스크의 변경만 폐기하고 pre-task WIP를 복원한다', () => {
     writeFileSync(join(repo, 'a.txt'), 'wip\n');
     writeFileSync(join(repo, 'new.txt'), 'untracked wip\n');

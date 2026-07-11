@@ -12,8 +12,9 @@ import { ROLE_DEFAULT_MODEL } from "../../utils/constants.js";
 const log = createLogger("session-manager");
 
 export interface SessionManager {
-  /** Spawn a session. sessionKey defaults to agentId; use a unique key for concurrent sessions on the same agent. */
-  spawnAgent: (agentId: string, projectWorkdir: string, sessionKey?: string) => AgentSession;
+  /** Spawn a session. sessionKey defaults to agentId; use a unique key for concurrent sessions on the same agent.
+   *  taskId stamps sessions.task_id so failover redispatch backfill can correlate the session to its task. */
+  spawnAgent: (agentId: string, projectWorkdir: string, sessionKey?: string, taskId?: string | null) => AgentSession;
   getSession: (agentId: string) => AgentSession | undefined;
   getSessionRecord: (sessionKey: string) => SessionRecord | undefined;
   killSession: (agentId: string) => void;
@@ -48,7 +49,7 @@ export function createSessionManager(db: Database): SessionManager {
   const providerOverrides = new Map<string, AgentProvider>();
 
   return {
-    spawnAgent(agentId: string, projectWorkdir: string, sessionKey?: string): AgentSession {
+    spawnAgent(agentId: string, projectWorkdir: string, sessionKey?: string, taskId?: string | null): AgentSession {
       const key = sessionKey ?? agentId;
 
       // Cleanup existing session for this key (memory map + DB)
@@ -168,13 +169,14 @@ export function createSessionManager(db: Database): SessionManager {
         .prepare(`
           INSERT INTO sessions (
             agent_id, status, provider,
-            provider_trace_resolved_provider, provider_trace_resolution_source
-          ) VALUES (?, 'active', ?, ?, ?) RETURNING id
+            provider_trace_resolved_provider, provider_trace_resolution_source, task_id
+          ) VALUES (?, 'active', ?, ?, ?, ?) RETURNING id
         `)
         // resolved_provider = 실제로 실행된 provider(failover override 반영). 기본 해석과
         // override가 갈릴 때 sessions.provider와 provider_trace_resolved_provider가 어긋나지
         // 않도록 override를 포함한 `provider`를 기록한다.
-        .get(agentId, provider, provider, providerResolution.source) as { id: string };
+        // task_id: 이 세션이 실행하는 task — failover 재디스패치 backfill의 세션↔task 귀속에 쓴다.
+        .get(agentId, provider, provider, providerResolution.source, taskId ?? null) as { id: string };
       keyToSessionRecord.set(key, {
         sessionKey: key,
         agentId,

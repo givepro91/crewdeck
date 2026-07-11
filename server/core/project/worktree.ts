@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, appendFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, appendFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createLogger } from "../../utils/logger.js";
 import { ensureGitIdentity } from "./git-workflow.js";
@@ -116,18 +116,54 @@ export function createWorktree(
 /**
  * Worktree 디렉토리 + branch 정리.
  * branch 파라미터가 있으면 worktree 제거 후 branch도 삭제.
+ *
+ * @returns worktree 디렉토리가 실제로 제거됐으면 true.
+ *   이전엔 `spawnSync` status를 확인하지 않아 locked worktree 제거 실패를
+ *   성공(`Removed worktree`)으로 보고했다 — 실제 디렉토리 존재로 결과를 검증한다.
  */
-export function removeWorktree(projectWorkdir: string, worktreePath: string, branch?: string): void {
-  // 1. worktree 제거
+export function removeWorktree(projectWorkdir: string, worktreePath: string, branch?: string): boolean {
+  // 1. worktree 제거 — status를 반드시 확인하고, 결과는 디렉토리 존재로 최종 검증한다.
+  let removeErr = "";
   try {
-    spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
+    // locked worktree는 `--force` 1회를 거부한다(git: "use 'remove -f -f'").
+    // 실패 시 `--force` 2회로 강제 제거를 재시도한다.
+    let result = spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
       cwd: projectWorkdir,
       stdio: "pipe",
       timeout: 15_000,
     });
-    log.info(`Removed worktree: ${worktreePath}`);
+    if (result.status !== 0) {
+      result = spawnSync("git", ["worktree", "remove", "--force", "--force", worktreePath], {
+        cwd: projectWorkdir,
+        stdio: "pipe",
+        timeout: 15_000,
+      });
+    }
+    if (result.status !== 0) {
+      removeErr = result.stderr?.toString().trim() || `exit ${result.status}`;
+    }
   } catch (err: any) {
-    log.warn(`Failed to remove worktree: ${err.message}`);
+    removeErr = err.message;
+  }
+
+  // git이 디렉토리를 지우지 못했으면 파일시스템에서 직접 제거 후 prune으로
+  // git 메타데이터를 정리한다 — DELETE가 success로 보고했는데 디렉토리가 남던 문제 방지.
+  // (locked worktree는 prune이 스킵하므로 unlock을 먼저 시도)
+  if (existsSync(worktreePath)) {
+    spawnSync("git", ["worktree", "unlock", worktreePath], { cwd: projectWorkdir, stdio: "pipe", timeout: 10_000 });
+    try {
+      rmSync(worktreePath, { recursive: true, force: true });
+    } catch (err: any) {
+      log.warn(`Filesystem removal of worktree failed: ${err.message}`);
+    }
+    spawnSync("git", ["worktree", "prune"], { cwd: projectWorkdir, stdio: "pipe", timeout: 10_000 });
+  }
+
+  const removed = !existsSync(worktreePath);
+  if (removed) {
+    log.info(`Removed worktree: ${worktreePath}`);
+  } else {
+    log.warn(`Failed to remove worktree ${worktreePath}: ${removeErr || "directory still present"}`);
   }
 
   // 2. branch 정리 — 재시도 시 새 브랜치를 생성하므로 실패 브랜치도 강제 삭제
@@ -147,6 +183,8 @@ export function removeWorktree(projectWorkdir: string, worktreePath: string, bra
       log.warn(`Failed to delete branch ${branch}: ${err.message}`);
     }
   }
+
+  return removed;
 }
 
 /**
@@ -158,14 +196,25 @@ export function removeWorktree(projectWorkdir: string, worktreePath: string, bra
 export function cleanupStaleWorktrees(projectWorkdir: string, excludePaths: string[] = []): number {
   if (!existsSync(join(projectWorkdir, ".git"))) return 0;
 
+  // macOS maps /var to /private/var. `git worktree list` reports the
+  // canonical path while SQLite may contain the original alias, so raw string
+  // comparison can delete an active goal worktree (and its WIP) on restart.
+  const canonicalPath = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
   let cleaned = 0;
   const worktrees = listWorktrees(projectWorkdir);
-  const mainWorktree = projectWorkdir;
-  const excludeSet = new Set(excludePaths);
+  const mainWorktree = canonicalPath(projectWorkdir);
+  const excludeSet = new Set(excludePaths.map(canonicalPath));
 
   for (const wt of worktrees) {
-    if (wt === mainWorktree) continue; // main worktree는 건드리지 않음
-    if (excludeSet.has(wt)) {
+    const canonicalWorktree = canonicalPath(wt);
+    if (canonicalWorktree === mainWorktree) continue; // main worktree는 건드리지 않음
+    if (excludeSet.has(canonicalWorktree)) {
       log.info(`Skipping active goal worktree: ${wt}`);
       continue; // Goal-as-Unit: 진행 중 goal worktree는 보존
     }
