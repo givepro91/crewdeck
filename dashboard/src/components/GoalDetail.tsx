@@ -9,6 +9,7 @@ import {
 import type {
   VerificationIssueStatus,
   VerificationRoundVerdict,
+  VerificationTimelineRound,
   VerificationTimelineStatus,
 } from "../lib/api";
 
@@ -128,6 +129,43 @@ const ISSUE_STATUS_TONES: Record<VerificationIssueStatus, string> = {
   regression: "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400",
 };
 
+const VERDICT_DOT_TONES: Record<VerificationRoundVerdict, string> = {
+  pass: "bg-green-500",
+  fail: "bg-red-400",
+  stopped: "bg-gray-400",
+  manual_approval: "bg-amber-500",
+};
+
+interface TimelineTaskGroup {
+  taskId: string;
+  taskTitle: string;
+  rounds: VerificationTimelineRound[];
+  latest: VerificationTimelineRound;
+}
+
+// 라운드(재시도 포함)를 task 단위로 묶는다 — auto-fix 루프가 같은 task를 여러 번 재시도해
+// 라운드 행이 폭증하는 문제를 완화. task별 등장 순서 유지, 라운드는 round 번호 오름차순.
+function groupRoundsByTask(rounds: VerificationTimelineRound[]): TimelineTaskGroup[] {
+  const byTask = new Map<string, VerificationTimelineRound[]>();
+  const order: string[] = [];
+  for (const round of rounds) {
+    if (!byTask.has(round.task_id)) {
+      byTask.set(round.task_id, []);
+      order.push(round.task_id);
+    }
+    byTask.get(round.task_id)!.push(round);
+  }
+  return order.map((taskId) => {
+    const grouped = [...byTask.get(taskId)!].sort((a, b) => a.round - b.round);
+    const latest = grouped[grouped.length - 1];
+    return { taskId, taskTitle: latest.task_title, rounds: grouped, latest };
+  });
+}
+
+function attemptsLabel(count: number, ko: boolean): string {
+  return ko ? `${count}회 시도` : `×${count}`;
+}
+
 function getCopy(language: string) {
   return language.startsWith("ko") ? COPY.ko : COPY.en;
 }
@@ -185,9 +223,10 @@ export function GoalDetail({
   const { t, i18n } = useTranslation();
   const copy = getCopy(i18n.language);
   const [localError, setLocalError] = useState<string | null>(null);
-  const [roundSelection, setRoundSelection] = useState<{
+  const [selection, setSelection] = useState<{
     goalId: string;
-    verificationId: string | null;
+    openTaskId: string | null;
+    roundByTask: Record<string, string>;
   } | null>(null);
   const storeStatus = useGoalStatusStore((state) => state.byGoalId[goalId]);
   const loading = useGoalStatusStore((state) => Boolean(state.loadingByGoalId[goalId]));
@@ -199,9 +238,41 @@ export function GoalDetail({
   const timelineError = useGoalStatusStore((state) => state.timelineErrorByGoalId[goalId]);
   const fetchVerificationTimeline = useGoalStatusStore((state) => state.fetchVerificationTimeline);
   const status = storeStatus ?? initialStatus;
-  const expandedRound = roundSelection?.goalId === goalId
-    ? roundSelection.verificationId
-    : timeline?.rounds.at(-1)?.verification_id ?? null;
+  const lang = i18n.language.startsWith("ko") ? "ko" : "en";
+
+  const groups = useMemo(
+    () => groupRoundsByTask(timeline?.rounds ?? []),
+    [timeline],
+  );
+  const timelineStatus = timeline?.status;
+  // 기본으로 펼칠 task = 현재 수정 중(가장 최신 라운드를 가진 그룹). 전부 끝났으면 마지막이 실패일 때만.
+  const activeTaskId = (() => {
+    if (groups.length === 0) return null;
+    if (timelineStatus === "fixing" || timelineStatus === "manual_approval") {
+      return groups.reduce((a, b) => (b.latest.round > a.latest.round ? b : a)).taskId;
+    }
+    const last = groups[groups.length - 1];
+    return last.latest.verdict === "fail" ? last.taskId : null;
+  })();
+  const sel = selection?.goalId === goalId ? selection : null;
+  const openTaskId = sel ? sel.openTaskId : activeTaskId;
+  const roundByTask = sel?.roundByTask ?? {};
+  const totalTasks = groups.length;
+  const passedTasks = groups.filter((g) => g.latest.verdict === "pass").length;
+  const fixingTasks = groups.filter((g) => g.latest.verdict === "fail").length;
+
+  const toggleTask = (taskId: string) =>
+    setSelection({
+      goalId,
+      openTaskId: openTaskId === taskId ? null : taskId,
+      roundByTask,
+    });
+  const selectRound = (taskId: string, verificationId: string) =>
+    setSelection({
+      goalId,
+      openTaskId: taskId,
+      roundByTask: { ...roundByTask, [taskId]: verificationId },
+    });
 
   useEffect(() => {
     if (initialStatus) setGoalStatus(initialStatus);
@@ -326,9 +397,23 @@ export function GoalDetail({
             </div>
           </div>
 
-          {timeline && (
-            <div className="mt-1.5 flex min-w-0 items-start gap-1.5 text-[11px] text-gray-500 dark:text-gray-400">
-              <span className="shrink-0 font-medium">{copy.reason}</span>
+          {timeline && totalTasks > 0 && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+              <span className="font-semibold text-gray-700 dark:text-gray-200 tabular-nums">
+                {passedTasks}/{totalTasks} {TIMELINE_STATUS_LABELS.passed[lang]}
+              </span>
+              {fixingTasks > 0 && (
+                <span className="inline-flex items-center gap-1 text-blue-600 dark:text-blue-400">
+                  <span className="h-1.5 w-1.5 rounded-full bg-blue-500" />
+                  {fixingTasks} {TIMELINE_STATUS_LABELS.fixing[lang]}
+                </span>
+              )}
+            </div>
+          )}
+
+          {timeline && timeline.reason && (
+            <div className="mt-1 flex min-w-0 items-start gap-1.5 text-[10px] text-gray-400 dark:text-gray-500">
+              <span className="shrink-0">{copy.reason}</span>
               <span className="min-w-0 break-words">{readableCode(timeline.reason)}</span>
             </div>
           )}
@@ -343,24 +428,33 @@ export function GoalDetail({
             <p className="mt-2 text-[11px] text-gray-400 dark:text-gray-500">{copy.noRounds}</p>
           )}
 
-          {timeline && timeline.rounds.length > 0 && (
-            <div className="mt-2 space-y-2">
-              {timeline.rounds.map((round) => {
-                const isExpanded = expandedRound === round.verification_id;
-                const language = i18n.language.startsWith("ko") ? "ko" : "en";
+          {timeline && groups.length > 0 && (
+            <div className="mt-2 space-y-1.5">
+              {groups.map((group) => {
+                const isOpen = openTaskId === group.taskId;
+                const isActiveFixing =
+                  activeTaskId === group.taskId &&
+                  (timelineStatus === "fixing" || timelineStatus === "manual_approval");
+                const showFixing = isActiveFixing && group.latest.verdict === "fail";
+                const badgeLabel = showFixing
+                  ? TIMELINE_STATUS_LABELS.fixing[lang]
+                  : VERDICT_LABELS[group.latest.verdict][lang];
+                const badgeTone = showFixing
+                  ? TIMELINE_STATUS_TONES.fixing
+                  : VERDICT_TONES[group.latest.verdict];
+                const shownId = roundByTask[group.taskId] ?? group.latest.verification_id;
+                const shown = group.rounds.find((r) => r.verification_id === shownId) ?? group.latest;
                 return (
-                  <div key={round.verification_id} className="overflow-hidden rounded-md border border-gray-200 dark:border-gray-700">
-                    <button type="button"
-                      aria-expanded={isExpanded}
-                      aria-controls={`verification-round-${round.verification_id}`}
-                      onClick={() => setRoundSelection({
-                        goalId,
-                        verificationId: isExpanded ? null : round.verification_id,
-                      })}
+                  <div key={group.taskId} className="overflow-hidden rounded-md border border-gray-200 dark:border-gray-700">
+                    <button
+                      type="button"
+                      aria-expanded={isOpen}
+                      aria-controls={`verification-task-${group.taskId}`}
+                      onClick={() => toggleTask(group.taskId)}
                       className="flex w-full min-w-0 items-center gap-2 bg-gray-50 px-2.5 py-2 text-left hover:bg-gray-100 focus-visible:ring-2 focus-visible:ring-blue-500 dark:bg-gray-800/50 dark:hover:bg-gray-800"
                     >
                       <svg
-                        className={`h-3 w-3 shrink-0 text-gray-400 transition-transform ${isExpanded ? "rotate-90" : ""}`}
+                        className={`h-3 w-3 shrink-0 text-gray-400 transition-transform ${isOpen ? "rotate-90" : ""}`}
                         viewBox="0 0 24 24"
                         fill="none"
                         stroke="currentColor"
@@ -369,68 +463,79 @@ export function GoalDetail({
                       >
                         <path d="m9 18 6-6-6-6" />
                       </svg>
-                      <span className="shrink-0 text-[11px] font-semibold text-gray-700 dark:text-gray-200">
-                        {copy.round} {round.round}
+                      <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-gray-700 dark:text-gray-200" title={group.taskTitle}>
+                        {group.taskTitle}
                       </span>
-                      <span className="min-w-0 flex-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
-                        {round.task_title}
+                      <span className="hidden shrink-0 items-center gap-1 sm:flex" aria-hidden="true">
+                        {group.rounds.map((r) => (
+                          <span
+                            key={r.verification_id}
+                            className={`h-1.5 w-1.5 rounded-full ${VERDICT_DOT_TONES[r.verdict]}`}
+                            title={`${copy.round} ${r.round}`}
+                          />
+                        ))}
                       </span>
-                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${VERDICT_TONES[round.verdict]}`}>
-                        {VERDICT_LABELS[round.verdict][language]}
+                      {group.rounds.length > 1 && (
+                        <span className="shrink-0 text-[10px] tabular-nums text-gray-400 dark:text-gray-500">
+                          {attemptsLabel(group.rounds.length, lang === "ko")}
+                        </span>
+                      )}
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${badgeTone}`}>
+                        {badgeLabel}
                       </span>
                     </button>
 
-                    {isExpanded && (
-                      <div id={`verification-round-${round.verification_id}`} className="space-y-3 px-2.5 py-2.5">
-                        {round.reason && (
+                    {isOpen && (
+                      <div id={`verification-task-${group.taskId}`} className="space-y-3 px-2.5 py-2.5">
+                        {group.rounds.length > 1 && (
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span className="mr-0.5 text-[10px] text-gray-400 dark:text-gray-500">{copy.round}</span>
+                            {group.rounds.map((r) => {
+                              const active = r.verification_id === shown.verification_id;
+                              return (
+                                <button
+                                  key={r.verification_id}
+                                  type="button"
+                                  onClick={() => selectRound(group.taskId, r.verification_id)}
+                                  aria-pressed={active}
+                                  className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] tabular-nums focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                                    active
+                                      ? "border-blue-400 bg-blue-50 text-blue-700 dark:border-blue-500 dark:bg-blue-900/30 dark:text-blue-300"
+                                      : "border-gray-200 text-gray-500 hover:border-gray-300 dark:border-gray-700 dark:text-gray-400"
+                                  }`}
+                                >
+                                  <span className={`h-1.5 w-1.5 rounded-full ${VERDICT_DOT_TONES[r.verdict]}`} />
+                                  {r.round}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {shown.reason && (
                           <div className="text-[11px] text-gray-500 dark:text-gray-400">
                             <span className="font-medium">{copy.reason}: </span>
-                            {readableCode(round.reason)}
+                            {readableCode(shown.reason)}
                           </div>
                         )}
 
                         <div>
                           <h5 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
-                            {copy.dimensions}
+                            {copy.issues} ({shown.issues.length})
                           </h5>
-                          <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-5">
-                            {round.dimensions.map((dimension) => (
-                              <div
-                                key={dimension.dimension}
-                                className={`min-w-0 rounded border px-2 py-1.5 ${
-                                  dimension.passed
-                                    ? "border-green-200 bg-green-50/60 dark:border-green-900 dark:bg-green-900/10"
-                                    : "border-red-200 bg-red-50/60 dark:border-red-900 dark:bg-red-900/10"
-                                }`}
-                              >
-                                <div className="truncate text-[10px] text-gray-500 dark:text-gray-400" title={dimension.rationale}>
-                                  {DIMENSION_LABELS[dimension.dimension]?.[language] ?? dimension.dimension}
-                                </div>
-                                <div className={`text-xs font-semibold ${dimension.passed ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}`}>
-                                  {dimension.score}/10
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-
-                        <div>
-                          <h5 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
-                            {copy.issues} ({round.issues.length})
-                          </h5>
-                          {round.issues.length === 0 ? (
+                          {shown.issues.length === 0 ? (
                             <p className="text-[11px] text-gray-400 dark:text-gray-500">{copy.noIssues}</p>
                           ) : (
                             <div className="space-y-1.5">
-                              {round.issues.map((issue) => (
+                              {shown.issues.map((issue) => (
                                 <div key={issue.issue_id} className="rounded border border-gray-200 bg-gray-50/60 px-2 py-2 dark:border-gray-700 dark:bg-gray-800/40">
                                   <div className="flex flex-wrap items-center gap-1.5">
                                     <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${ISSUE_STATUS_TONES[issue.status]}`}>
-                                      {ISSUE_STATUS_LABELS[issue.status][language]}
+                                      {ISSUE_STATUS_LABELS[issue.status][lang]}
                                     </span>
                                     <span className="text-[9px] font-semibold uppercase text-gray-500 dark:text-gray-400">{issue.severity}</span>
                                     <span className="text-[10px] text-gray-400 dark:text-gray-500">
-                                      {DIMENSION_LABELS[issue.dimension]?.[language] ?? issue.dimension}
+                                      {DIMENSION_LABELS[issue.dimension]?.[lang] ?? issue.dimension}
                                     </span>
                                   </div>
                                   <p className="mt-1 break-words text-[11px] text-gray-700 dark:text-gray-300">{issue.evidence}</p>
@@ -456,27 +561,54 @@ export function GoalDetail({
                           )}
                         </div>
 
+                        {shown.dimensions.length > 0 && (
+                          <div>
+                            <h5 className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
+                              {copy.dimensions}
+                            </h5>
+                            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-5">
+                              {shown.dimensions.map((dimension) => (
+                                <div
+                                  key={dimension.dimension}
+                                  className={`min-w-0 rounded border px-2 py-1.5 ${
+                                    dimension.passed
+                                      ? "border-green-200 bg-green-50/60 dark:border-green-900 dark:bg-green-900/10"
+                                      : "border-red-200 bg-red-50/60 dark:border-red-900 dark:bg-red-900/10"
+                                  }`}
+                                >
+                                  <div className="truncate text-[10px] text-gray-500 dark:text-gray-400" title={dimension.rationale}>
+                                    {DIMENSION_LABELS[dimension.dimension]?.[lang] ?? dimension.dimension}
+                                  </div>
+                                  <div className={`text-xs font-semibold ${dimension.passed ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"}`}>
+                                    {dimension.score}/10
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
                         <details className="text-[10px] text-gray-500 dark:text-gray-400">
                           <summary className="cursor-pointer select-none font-medium focus-visible:ring-2 focus-visible:ring-blue-500">
                             {copy.execution}
                           </summary>
                           <dl className="mt-1.5 grid gap-x-3 gap-y-1.5 sm:grid-cols-2">
-                            {round.implementation_session_id && (
+                            {shown.implementation_session_id && (
                               <div className="min-w-0">
                                 <dt>{copy.implementationAgent}</dt>
-                                <dd className="break-all font-mono">{round.implementation_session_id}</dd>
+                                <dd className="break-all font-mono">{shown.implementation_session_id}</dd>
                               </div>
                             )}
-                            {round.evaluator_session_id && (
+                            {shown.evaluator_session_id && (
                               <div className="min-w-0">
                                 <dt>{copy.evaluatorAgent}</dt>
-                                <dd className="break-all font-mono">{round.evaluator_session_id}</dd>
+                                <dd className="break-all font-mono">{shown.evaluator_session_id}</dd>
                               </div>
                             )}
-                            {round.fix_session_ids.length > 0 && (
+                            {shown.fix_session_ids.length > 0 && (
                               <div className="min-w-0 sm:col-span-2">
                                 <dt>{copy.fixAgents}</dt>
-                                {round.fix_session_ids.map((sessionId) => (
+                                {shown.fix_session_ids.map((sessionId) => (
                                   <dd key={sessionId} className="break-all font-mono">{sessionId}</dd>
                                 ))}
                               </div>
