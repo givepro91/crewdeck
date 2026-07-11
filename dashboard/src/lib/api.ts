@@ -353,6 +353,11 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ message }),
       }),
+    sendChat: (agentId: string, message: string) =>
+      request<{ status: string }>(`/orchestration/agents/${agentId}/chat`, {
+        method: "POST",
+        body: JSON.stringify({ message }),
+      }),
     multiPrompt: (agentIds: string[], message: string, projectId: string) =>
       request<{ status: string; sessionId: string }>("/orchestration/multi-prompt", {
         method: "POST",

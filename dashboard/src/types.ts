@@ -46,3 +46,12 @@ export interface ProviderActivityDetails {
   redispatched: boolean;
   loopGuardBlocked: boolean;
 }
+
+/** ⚠ shared/types.ts 의 ChatEvent 와 동기 유지 (WS payload 계약). */
+export type ChatEvent =
+  | { kind: "text"; text: string }
+  | { kind: "thinking"; text: string }
+  | { kind: "tool_use"; id: string; name: string; input: unknown }
+  | { kind: "tool_result"; id: string; isError: boolean; content: string }
+  | { kind: "todo"; items: Array<{ content: string; status: "pending" | "in_progress" | "completed" }> }
+  | { kind: "result"; text: string };

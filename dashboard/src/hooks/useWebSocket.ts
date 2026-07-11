@@ -243,6 +243,9 @@ export function useWebSocket() {
               window.dispatchEvent(new CustomEvent("crewdeck:refresh", { detail: msg }));
               break;
             }
+            case "chat:event":
+              window.dispatchEvent(new CustomEvent("crewdeck:chat-event", { detail: msg.payload }));
+              break;
           }
         } catch {
           // Ignore
