@@ -6,6 +6,7 @@ import { api, type WorkReport } from "../lib/api";
 import { TaskTimeline } from "./TaskTimeline";
 import { OrgChart, parseActivity, getCtoPhase } from "./OrgChart";
 import { AgentDetail } from "./AgentDetail";
+import { SessionWorkspace } from "./SessionWorkspace";
 import { TaskList } from "./TaskList";
 import { VerificationLog } from "./VerificationLog";
 import { ActivityFeed } from "./ActivityFeed";
@@ -682,6 +683,8 @@ export function ProjectHome() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   // 소환(⚡): 실패 task에서 소환된 세션에 주입할 taskId. agentId와 페어로 stale 방지.
   const [summon, setSummon] = useState<{ agentId: string; taskId: string } | null>(null);
+  // 워크스페이스(⤢): 풀 2-pane 오버레이 (좌 대화 / 우 인스펙터 4탭).
+  const [workspace, setWorkspace] = useState<{ agentId: string; agentName?: string; goalId: string | null; taskId: string | null } | null>(null);
 
   // AI 팀 설계 상태 복원(새로고침 대비) + 실시간 반영(WS)
   useEffect(() => {
@@ -1060,15 +1063,21 @@ export function ProjectHome() {
       setSummon(taskId ? { agentId, taskId } : null);
       setTab("agents");
     };
+    // 워크스페이스(⤢): 풀 2-pane 오버레이 열기.
+    const onOpenWorkspace = (e: Event) => {
+      setWorkspace((e as CustomEvent<{ agentId: string; agentName?: string; goalId: string | null; taskId: string | null }>).detail);
+    };
     window.addEventListener("crewdeck:go-tab", onGoTab);
     window.addEventListener("crewdeck:add-agent", onAddAgent);
     window.addEventListener("crewdeck:add-goal", onAddGoal);
     window.addEventListener("crewdeck:open-agent", onOpenAgent);
+    window.addEventListener("crewdeck:open-workspace", onOpenWorkspace);
     return () => {
       window.removeEventListener("crewdeck:go-tab", onGoTab);
       window.removeEventListener("crewdeck:add-agent", onAddAgent);
       window.removeEventListener("crewdeck:add-goal", onAddGoal);
       window.removeEventListener("crewdeck:open-agent", onOpenAgent);
+      window.removeEventListener("crewdeck:open-workspace", onOpenWorkspace);
     };
   }, [currentProjectId]);
 
@@ -1641,6 +1650,15 @@ export function ProjectHome() {
             setSelectedAgentId(null);
             loadData();
           }}
+        />
+      )}
+      {workspace && (
+        <SessionWorkspace
+          agentId={workspace.agentId}
+          agentName={workspace.agentName}
+          goalId={workspace.goalId}
+          taskId={workspace.taskId}
+          onClose={() => setWorkspace(null)}
         />
       )}
       <div className="max-w-6xl mx-auto py-8 px-6">

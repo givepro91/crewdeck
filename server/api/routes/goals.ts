@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
 import type { AppContext } from "../../index.js";
 import { artifactsDirForGoal } from "../../core/orchestration/work-report.js";
@@ -1174,6 +1174,57 @@ ${focusRules}
       acceptanceScript: goal.acceptance_script ?? null,
       workReport,
     });
+  });
+
+  // ─── 웹 세션 워크스페이스: worktree diff / 파일 목록 (Phase 3) ─────────────
+
+  // GET /goals/:goalId/diff — goal worktree의 unified diff (Diff 탭). squash-preview와
+  // 같은 base 결정·git 호출 패턴이나 --name-only 대신 patch 텍스트를 반환한다.
+  // worktree가 정리된(merged) goal은 빈 diff.
+  router.get("/:goalId/diff", (req, res) => {
+    const goal = db.prepare("SELECT worktree_path, project_id FROM goals WHERE id = ?").get(req.params.goalId) as any;
+    if (!goal) return res.status(404).json({ error: "Goal not found" });
+    if (!goal.worktree_path || !existsSync(goal.worktree_path)) return res.json({ diff: "", truncated: false });
+    const project = db.prepare("SELECT base_branch FROM projects WHERE id = ?").get(goal.project_id) as { base_branch?: string } | undefined;
+    const baseBranch = project?.base_branch || "main";
+    const runGitRaw = (args: string[]): string => {
+      try {
+        const r = spawnSync("git", args, { cwd: goal.worktree_path, stdio: "pipe", timeout: 15_000, encoding: "utf-8", maxBuffer: 20 * 1024 * 1024 });
+        return r.status === 0 ? r.stdout : "";
+      } catch { return ""; }
+    };
+    const committed = runGitRaw(["diff", "--no-color", `${baseBranch}...HEAD`]); // 커밋된 변경
+    const uncommitted = runGitRaw(["diff", "--no-color", "HEAD"]);               // 미커밋(WIP)
+    let diff = [committed, uncommitted].filter(Boolean).join("\n");
+    const MAX = 500 * 1024;
+    const truncated = diff.length > MAX;
+    if (truncated) diff = diff.slice(0, MAX) + "\n\n... (diff가 너무 커 잘렸습니다)";
+    res.json({ diff, truncated });
+  });
+
+  // GET /goals/:goalId/files — goal worktree 파일 트리 (작업 공간 탭). .git·node_modules 등 제외.
+  router.get("/:goalId/files", (req, res) => {
+    const goal = db.prepare("SELECT worktree_path FROM goals WHERE id = ?").get(req.params.goalId) as any;
+    if (!goal) return res.status(404).json({ error: "Goal not found" });
+    if (!goal.worktree_path || !existsSync(goal.worktree_path)) return res.json({ files: [], truncated: false });
+    const IGNORE = new Set([".git", "node_modules", "dist", ".crewdeck", ".crewdeck-worktrees", ".next", "coverage"]);
+    const safeReaddir = (dir: string) => {
+      try { return readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+    };
+    const files: string[] = [];
+    const MAX_FILES = 800;
+    const walk = (dir: string, rel: string): void => {
+      if (files.length >= MAX_FILES) return;
+      for (const e of safeReaddir(dir)) {
+        if (files.length >= MAX_FILES) break;
+        if (IGNORE.has(e.name)) continue;
+        const relPath = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) walk(join(dir, e.name), relPath);
+        else files.push(relPath);
+      }
+    };
+    walk(goal.worktree_path, "");
+    res.json({ files: files.sort(), truncated: files.length >= MAX_FILES });
   });
 
   // 작업 요약 스크린샷 아티팩트 서빙 — /api 마운트라 Bearer 보호됨 (index.ts authMiddleware)

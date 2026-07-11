@@ -249,6 +249,10 @@ export const api = {
     getStatus: (goalId: string) => request<GoalStatusResponse>(`/goals/${goalId}/status`),
     getVerificationTimeline: (goalId: string) =>
       request<VerificationTimelineResponse>(`/goals/${goalId}/verification-timeline`),
+    getDiff: (goalId: string) =>
+      request<{ diff: string; truncated: boolean }>(`/goals/${goalId}/diff`),
+    getFiles: (goalId: string) =>
+      request<{ files: string[]; truncated: boolean }>(`/goals/${goalId}/files`),
     updateSpec: (goalId: string, data: any) =>
       request<any>(`/goals/${goalId}/spec`, { method: "PATCH", body: JSON.stringify(data) }),
     generateSpec: (goalId: string) =>

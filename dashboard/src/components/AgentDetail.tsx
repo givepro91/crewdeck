@@ -31,6 +31,7 @@ interface Task {
   status: string;
   assignee_id: string | null;
   verification_id: string | null;
+  goal_id?: string | null;
 }
 
 interface AgentDetailProps {
@@ -125,6 +126,8 @@ export function AgentDetail({ agent, agents = [], tasks, onClose, onKill, onDele
     [tasks, agent.id]
   );
   const currentTask = tasks.find((t) => t.id === agent.current_task_id);
+  // 소환된 task의 goal — 워크스페이스(⤢) 진입 시 diff/판정/작업공간 탭의 스코프.
+  const workspaceGoalId = (summonTaskId ? tasks.find((tk) => tk.id === summonTaskId)?.goal_id : null) ?? null;
   const passCount = useMemo(
     () => agentTasks.filter((t) => t.verification_id !== null).length,
     [agentTasks]
@@ -359,6 +362,16 @@ export function AgentDetail({ agent, agents = [], tasks, onClose, onKill, onDele
               )}
             </div>
           </div>
+          <button
+            onClick={() => window.dispatchEvent(new CustomEvent("crewdeck:open-workspace", {
+              detail: { agentId: agent.id, agentName: agent.name, goalId: workspaceGoalId, taskId: summonTaskId ?? null },
+            }))}
+            className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-400 dark:text-gray-500 transition-colors text-base"
+            title={t("wsOpen")}
+            aria-label={t("wsOpen")}
+          >
+            ⤢
+          </button>
           <button
             onClick={onClose}
             className="w-7 h-7 flex items-center justify-center rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-400 dark:text-gray-500 transition-colors"
