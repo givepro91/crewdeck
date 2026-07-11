@@ -744,41 +744,45 @@ export function ProjectHome() {
 
   // AI Goal Suggestion — lifted from AddGoalDialog for background persistence
   type Suggestion = { title: string; description: string; priority: string; reason: string };
-  const [aiSuggestions, setAiSuggestions] = useState<Suggestion[]>([]);
-  const [aiSuggestLoading, setAiSuggestLoading] = useState(false);
-  const [aiSuggestError, setAiSuggestError] = useState("");
-  const [aiSuggestErrorDetail, setAiSuggestErrorDetail] = useState("");
-  // 제안이 어느 프로젝트 것인지 기록 — 프로젝트 전환 시 다른 프로젝트로 배너/결과가 누수되는 것 방지
-  const [aiSuggestProjectId, setAiSuggestProjectId] = useState<string | null>(null);
+  // 프로젝트별로 독립 보유 — 한 프로젝트에서 추천을 돌려도 다른 프로젝트의
+  // 준비된(아직 추가 안 한) 제안이 덮이지 않도록 projectId 키 맵으로 관리한다.
+  type SuggestState = { suggestions: Suggestion[]; loading: boolean; error: string; errorDetail: string };
+  const [aiSuggestByProject, setAiSuggestByProject] = useState<Record<string, SuggestState>>({});
 
   const startAiSuggest = useCallback(async (count?: number, material?: string) => {
-    if (!currentProjectId || aiSuggestLoading) return;
-    setAiSuggestProjectId(currentProjectId);
-    setAiSuggestLoading(true);
-    setAiSuggestError("");
-    setAiSuggestErrorDetail("");
-    setAiSuggestions([]);
+    // pid를 호출 시점에 캡처 — 완료 시 사용자가 다른 프로젝트로 옮겨가도 결과는 원래 슬롯에 안착.
+    const pid = currentProjectId;
+    if (!pid || aiSuggestByProject[pid]?.loading) return;
+    setAiSuggestByProject((prev) => ({ ...prev, [pid]: { suggestions: [], loading: true, error: "", errorDetail: "" } }));
     try {
-      const result = await api.goals.suggest(currentProjectId, count, material);
-      if (result.length === 0) {
-        setAiSuggestError(t("addGoalAiSuggestEmpty"));
-      } else {
-        setAiSuggestions(result);
-      }
+      const result = await api.goals.suggest(pid, count, material);
+      setAiSuggestByProject((prev) => ({
+        ...prev,
+        [pid]: {
+          suggestions: result.length === 0 ? [] : result,
+          loading: false,
+          error: result.length === 0 ? t("addGoalAiSuggestEmpty") : "",
+          errorDetail: "",
+        },
+      }));
     } catch (err: any) {
-      setAiSuggestError(err.message || t("addGoalAiSuggestError"));
-      setAiSuggestErrorDetail(err.detail || "");
-    } finally {
-      setAiSuggestLoading(false);
+      setAiSuggestByProject((prev) => ({
+        ...prev,
+        [pid]: { suggestions: [], loading: false, error: err.message || t("addGoalAiSuggestError"), errorDetail: err.detail || "" },
+      }));
     }
-  }, [currentProjectId, aiSuggestLoading, t]);
+  }, [currentProjectId, aiSuggestByProject, t]);
 
   const dismissAiSuggestions = useCallback(() => {
-    setAiSuggestions([]);
-    setAiSuggestError("");
-    setAiSuggestErrorDetail("");
-    setAiSuggestProjectId(null);
-  }, []);
+    const pid = currentProjectId;
+    if (!pid) return;
+    setAiSuggestByProject((prev) => {
+      if (!prev[pid]) return prev;
+      const next = { ...prev };
+      delete next[pid];
+      return next;
+    });
+  }, [currentProjectId]);
   // toast state removed — using global useToast store
   const [decomposingGoalId, setDecomposingGoalId] = useState<string | null>(null);
   const [reDecomposeGoalId, setReDecomposeGoalId] = useState<string | null>(null);
@@ -829,12 +833,12 @@ export function ProjectHome() {
 
   const project = projects.find((p) => p.id === currentProjectId);
 
-  // AI 제안 상태는 분석을 시작한 프로젝트에서만 노출한다 (프로젝트 간 배너/결과 누수 방지)
-  const suggestForCurrent = aiSuggestProjectId === currentProjectId;
-  const visibleSuggestions = suggestForCurrent ? aiSuggestions : [];
-  const visibleSuggestLoading = suggestForCurrent && aiSuggestLoading;
-  const visibleSuggestError = suggestForCurrent ? aiSuggestError : "";
-  const visibleSuggestErrorDetail = suggestForCurrent ? aiSuggestErrorDetail : "";
+  // AI 제안 상태는 현재 프로젝트 슬롯에서만 도출 — 각 프로젝트가 독립 보유하므로 누수·덮어쓰기 없음
+  const curSuggest = currentProjectId ? aiSuggestByProject[currentProjectId] : undefined;
+  const visibleSuggestions = curSuggest?.suggestions ?? [];
+  const visibleSuggestLoading = curSuggest?.loading ?? false;
+  const visibleSuggestError = curSuggest?.error ?? "";
+  const visibleSuggestErrorDetail = curSuggest?.errorDetail ?? "";
 
   const specPollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
 
