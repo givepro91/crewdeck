@@ -5,7 +5,7 @@
 export interface ChatSessionLike { status: string }
 export interface ChatSessionDeps {
   getSession(key: string): ChatSessionLike | undefined;
-  spawnAgent(agentId: string, workdir: string, sessionKey: string): ChatSessionLike;
+  spawnAgent(agentId: string, workdir: string, sessionKey: string, taskId?: string | null): ChatSessionLike;
 }
 
 /** 채팅 세션 키(단일 소스). */
@@ -23,6 +23,7 @@ export function resolveChatSession(
   deps: ChatSessionDeps,
   agentId: string,
   workdir: string,
+  taskId?: string | null,
 ): { session: ChatSessionLike; reused: boolean } | { busy: true } {
   const key = chatSessionKey(agentId);
   const existing = deps.getSession(key);
@@ -30,5 +31,6 @@ export function resolveChatSession(
     if (existing.status === "working") return { busy: true };
     return { session: existing, reused: true };
   }
-  return { session: deps.spawnAgent(agentId, workdir, key), reused: false };
+  // 새 spawn 시에만 taskId를 전달 → session.ts가 소환 컨텍스트를 시스템 프롬프트에 주입.
+  return { session: deps.spawnAgent(agentId, workdir, key, taskId), reused: false };
 }

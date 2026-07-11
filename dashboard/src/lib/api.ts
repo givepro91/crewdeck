@@ -355,10 +355,10 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ message }),
       }),
-    sendChat: (agentId: string, message: string) =>
+    sendChat: (agentId: string, message: string, opts?: { taskId?: string | null }) =>
       request<{ status: string }>(`/orchestration/agents/${agentId}/chat`, {
         method: "POST",
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message, taskId: opts?.taskId ?? null }),
       }),
     multiPrompt: (agentIds: string[], message: string, projectId: string) =>
       request<{ status: string; sessionId: string }>("/orchestration/multi-prompt", {

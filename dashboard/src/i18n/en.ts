@@ -189,6 +189,8 @@ const en = {
   reworkButton: "Re-work",
   reworkTitle: "Reopen this task to re-work the unresolved issues (failure history + cross-backend fix).",
   reworkStarted: "Re-work started — re-running the task",
+  summonButton: "Summon",
+  summonTitle: "Open a chat with this task's workspace, verdict, and recent output injected.",
   failClickDetail: "Click to see failure details",
   conditionalClickDetail: "Click to see conditional details",
   moreIssues: "+{{count}} more",

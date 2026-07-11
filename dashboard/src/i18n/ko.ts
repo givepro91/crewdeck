@@ -189,6 +189,8 @@ const ko = {
   reworkButton: "다시 해결",
   reworkTitle: "이 태스크를 다시 열어 미해결 이슈를 재작업합니다 (실패 이력 + 교차 백엔드 수정).",
   reworkStarted: "재작업 시작 — 태스크를 다시 실행합니다",
+  summonButton: "소환",
+  summonTitle: "이 태스크의 작업 공간·판정·최근 출력을 주입해 대화로 손봅니다.",
   failClickDetail: "클릭하여 실패 사유를 확인하세요",
   conditionalClickDetail: "클릭하여 조건부 사유를 확인하세요",
   moreIssues: "외 {{count}}건",

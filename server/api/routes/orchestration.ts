@@ -12,6 +12,7 @@ import { loadProviderConfig } from "../../core/agent/provider.js";
 import { serializeTask, selectTaskForResponse } from "./tasks.js";
 import { resolveChatSession, chatSessionKey } from "../../core/agent/chat-session.js";
 import { ChatEventAssembler } from "../../core/agent/adapters/chat-events.js";
+import { buildSummonContext } from "../../core/agent/summon-context.js";
 
 const log = createLogger("orchestration");
 
@@ -425,6 +426,8 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
   router.post("/agents/:agentId/chat", async (req, res) => {
     const { agentId } = req.params;
     const message: string = (req.body?.message ?? "").toString();
+    // 소환(⚡): 실패/이월 task에서 온 채팅이면 그 taskId로 goal 컨텍스트를 주입한다.
+    const taskId: string | null = req.body?.taskId ?? null;
     if (!message.trim()) return res.status(400).json({ error: "message is required" });
     if (message.length > MAX_PROMPT_LEN) {
       return res.status(400).json({ error: `message too long (max ${MAX_PROMPT_LEN})` });
@@ -436,8 +439,22 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
     const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(agent.project_id) as any;
     const workdir = project?.workdir || process.cwd();
 
-    const resolved = resolveChatSession(ctx.sessionManager, agentId, workdir);
+    // taskId는 새 spawn 시에만 세션 프롬프트에 주입된다(reused=true면 이미 살아있는 세션).
+    const resolved = resolveChatSession(ctx.sessionManager, agentId, workdir, taskId);
     if ("busy" in resolved) return res.status(409).json({ status: "busy" });
+
+    // 새 세션 spawn + 소환(taskId)이면 "무엇을 주입했는지" 칩을 주입됨 스트립용으로 1회 broadcast.
+    if (!resolved.reused && taskId) {
+      const { chips } = buildSummonContext(db, taskId);
+      if (chips.length > 0) {
+        broadcast("chat:event", {
+          agentId,
+          sessionKey: chatSessionKey(agentId),
+          seq: -1,
+          event: { kind: "context", items: chips },
+        });
+      }
+    }
 
     const session = ctx.sessionManager.getSession(chatSessionKey(agentId))!;
     // 이 세션에 실제로 해석된 provider(claude/codex). SessionManager가 spawn 시 sessions row에

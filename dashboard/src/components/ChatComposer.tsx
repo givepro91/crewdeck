@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "../lib/api";
 
-export function ChatComposer({ agentId, disabled }: { agentId: string; disabled?: boolean }) {
+export function ChatComposer({ agentId, disabled, taskId }: { agentId: string; disabled?: boolean; taskId?: string | null }) {
   const [value, setValue] = useState("");
   const [sending, setSending] = useState(false);
   const [composing, setComposing] = useState(false);
@@ -16,7 +16,7 @@ export function ChatComposer({ agentId, disabled }: { agentId: string; disabled?
     }));
     setValue("");
     try {
-      await api.orchestration.sendChat(agentId, msg);
+      await api.orchestration.sendChat(agentId, msg, { taskId });
     } finally {
       setSending(false);
     }

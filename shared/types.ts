@@ -392,4 +392,6 @@ export type ChatEvent =
   | { kind: "tool_use"; id: string; name: string; input: unknown }
   | { kind: "tool_result"; id: string; isError: boolean; content: string }
   | { kind: "todo"; items: Array<{ content: string; status: "pending" | "in_progress" | "completed" }> }
-  | { kind: "result"; text: string };
+  | { kind: "result"; text: string }
+  // 소환 시 "무엇을 주입했는지" 1회 broadcast (worktree·판정·최근출력·기획서 칩).
+  | { kind: "context"; items: Array<{ label: string; detail?: string; tone: "pass" | "conditional" | "fail" | "neutral" }> };

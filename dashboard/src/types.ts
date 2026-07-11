@@ -54,4 +54,5 @@ export type ChatEvent =
   | { kind: "tool_use"; id: string; name: string; input: unknown }
   | { kind: "tool_result"; id: string; isError: boolean; content: string }
   | { kind: "todo"; items: Array<{ content: string; status: "pending" | "in_progress" | "completed" }> }
-  | { kind: "result"; text: string };
+  | { kind: "result"; text: string }
+  | { kind: "context"; items: Array<{ label: string; detail?: string; tone: "pass" | "conditional" | "fail" | "neutral" }> };

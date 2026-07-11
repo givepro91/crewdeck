@@ -680,6 +680,8 @@ export function ProjectHome() {
   // AI 팀 설계 진행 상태 — 새로고침/모달 이탈 후에도 진행 중·미확인 결과를 칩으로 표시
   const [teamDesign, setTeamDesign] = useState<"running" | "ready" | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  // 소환(⚡): 실패 task에서 소환된 세션에 주입할 taskId. agentId와 페어로 stale 방지.
+  const [summon, setSummon] = useState<{ agentId: string; taskId: string } | null>(null);
 
   // AI 팀 설계 상태 복원(새로고침 대비) + 실시간 반영(WS)
   useEffect(() => {
@@ -1051,13 +1053,22 @@ export function ProjectHome() {
       setShowDialog("addGoal");
     };
 
+    // 소환(⚡): 실패 카드에서 온 요청 → 에이전트 탭 + 상세 열기 + taskId 주입 예약.
+    const onOpenAgent = (e: Event) => {
+      const { agentId, taskId } = (e as CustomEvent<{ agentId: string; taskId?: string }>).detail;
+      setSelectedAgentId(agentId);
+      setSummon(taskId ? { agentId, taskId } : null);
+      setTab("agents");
+    };
     window.addEventListener("crewdeck:go-tab", onGoTab);
     window.addEventListener("crewdeck:add-agent", onAddAgent);
     window.addEventListener("crewdeck:add-goal", onAddGoal);
+    window.addEventListener("crewdeck:open-agent", onOpenAgent);
     return () => {
       window.removeEventListener("crewdeck:go-tab", onGoTab);
       window.removeEventListener("crewdeck:add-agent", onAddAgent);
       window.removeEventListener("crewdeck:add-goal", onAddGoal);
+      window.removeEventListener("crewdeck:open-agent", onOpenAgent);
     };
   }, [currentProjectId]);
 
@@ -1624,6 +1635,7 @@ export function ProjectHome() {
           agent={selectedAgent}
           agents={agents}
           tasks={tasks}
+          summonTaskId={summon && summon.agentId === selectedAgentId ? summon.taskId : null}
           onClose={() => setSelectedAgentId(null)}
           onKill={() => {
             setSelectedAgentId(null);

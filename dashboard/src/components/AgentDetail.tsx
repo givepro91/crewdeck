@@ -40,6 +40,7 @@ interface AgentDetailProps {
   onClose: () => void;
   onKill: () => void;
   onDeleted?: () => void;
+  summonTaskId?: string | null;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -89,7 +90,7 @@ const ROLE_LABELS: Record<string, string> = {
   custom: "Custom",
 };
 
-export function AgentDetail({ agent, agents = [], tasks, onClose, onKill, onDeleted }: AgentDetailProps) {
+export function AgentDetail({ agent, agents = [], tasks, onClose, onKill, onDeleted, summonTaskId }: AgentDetailProps) {
   const { t } = useTranslation();
   const [promptExpanded, setPromptExpanded] = useState(false);
   const [showKillConfirm, setShowKillConfirm] = useState(false);
@@ -810,7 +811,7 @@ export function AgentDetail({ agent, agents = [], tasks, onClose, onKill, onDele
         {/* 대화형 세션 — 지속 스레드 + 입력 (기존 단발 Direct Prompt 대체) */}
         <div className="flex flex-col h-80 border-t border-gray-100 dark:border-gray-700 shrink-0">
           <ChatThread agentId={agent.id} />
-          <ChatComposer agentId={agent.id} disabled={agent.status === "working"} />
+          <ChatComposer agentId={agent.id} disabled={agent.status === "working"} taskId={summonTaskId} />
         </div>
 
         {/* Footer */}

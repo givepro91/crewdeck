@@ -8,6 +8,7 @@ import { resolvePrompt } from "./prompt-resolver.js";
 import { loadMemory } from "./memory.js";
 import { agentActivityLog, parseActivityEvents } from "./activity-log.js";
 import { ROLE_DEFAULT_MODEL } from "../../utils/constants.js";
+import { buildSummonContext } from "./summon-context.js";
 
 const log = createLogger("session-manager");
 
@@ -135,7 +136,9 @@ export function createSessionManager(db: Database): SessionManager {
       const dataDir = process.env.CREWDECK_DATA_DIR || join(process.cwd(), ".crewdeck");
       const memory = loadMemory(dataDir, agentId);
 
-      const enrichedPrompt = claudeMdContext + resolution.prompt + contextChain + projectContext;
+      // 소환(⚡): taskId가 있으면 그 goal의 기획서·worktree·판정·최근출력을 프리앰블로 주입.
+      const summonPreamble = buildSummonContext(db, taskId).preamble;
+      const enrichedPrompt = claudeMdContext + resolution.prompt + contextChain + projectContext + summonPreamble;
 
       // Model resolution: agent-level override > role default > CLI default
       const resolvedModel = agent.model || ROLE_DEFAULT_MODEL[agent.role] || undefined;

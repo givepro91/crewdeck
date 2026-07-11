@@ -661,7 +661,7 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
         })()}
         {/* 재작업 버튼 — 이월된(done+fail) 태스크를 다시 열어 재해결 */}
         {task.status === "done" && task.verification_verdict === "fail" && (
-          <div className={`pt-0.5 ${isSubtask ? "pl-15" : "pl-9"}`}>
+          <div className={`pt-0.5 flex gap-1.5 ${isSubtask ? "pl-15" : "pl-9"}`}>
             <button
               onClick={(e) => { e.stopPropagation(); handleRework(task.id); }}
               className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-300 dark:hover:bg-amber-900/60 font-medium transition-colors"
@@ -669,6 +669,20 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
             >
               ↻ {t("reworkButton")}
             </button>
+            {task.assignee_id && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.dispatchEvent(new CustomEvent("crewdeck:open-agent", {
+                    detail: { agentId: task.assignee_id, taskId: task.id },
+                  }));
+                }}
+                className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/40 dark:text-indigo-300 dark:hover:bg-indigo-900/60 font-medium transition-colors"
+                title={t("summonTitle")}
+              >
+                ⚡ {t("summonButton")}
+              </button>
+            )}
           </div>
         )}
         {/* Subtasks (expanded) */}
