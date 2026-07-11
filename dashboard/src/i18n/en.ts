@@ -18,6 +18,9 @@ const en = {
   // OrgChart
   orgChartTitle: "Organization",
   agentCount: "{{count}} agents",
+  agentsMore: "+{{count}}",
+  agentsIdle: "idle",
+  goalProgressDetail: "Details",
   goToAgentsTab: "Agents tab →",
   teamPresetApply: "Apply Team Template",
   noAgentsOrgChart: "No agents yet",

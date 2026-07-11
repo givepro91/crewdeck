@@ -25,6 +25,23 @@ import { GoalDetail } from "./GoalDetail";
 
 type Tab = "overview" | "agents" | "kanban" | "verification" | "sessions" | "settings";
 
+// 역할별 아이콘 + 소프트 컬러 — 에이전트 팀 프레즌스 패널에서 한눈에 역할 구분
+const AGENT_ROLE_META: Record<string, { icon: string; tone: string }> = {
+  cto: { icon: "🧭", tone: "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300" },
+  pm: { icon: "📋", tone: "bg-sky-100 text-sky-700 dark:bg-sky-900/40 dark:text-sky-300" },
+  backend: { icon: "⚙️", tone: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300" },
+  frontend: { icon: "🎨", tone: "bg-pink-100 text-pink-700 dark:bg-pink-900/40 dark:text-pink-300" },
+  ux: { icon: "✨", tone: "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300" },
+  qa: { icon: "🔍", tone: "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300" },
+  reviewer: { icon: "🛡️", tone: "bg-teal-100 text-teal-700 dark:bg-teal-900/40 dark:text-teal-300" },
+  devops: { icon: "🚀", tone: "bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300" },
+  marketer: { icon: "📣", tone: "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300" },
+  coder: { icon: "⚙️", tone: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300" },
+  designer: { icon: "🎨", tone: "bg-pink-100 text-pink-700 dark:bg-pink-900/40 dark:text-pink-300" },
+};
+const roleMeta = (role: string) =>
+  AGENT_ROLE_META[role] ?? { icon: "🤖", tone: "bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300" };
+
 // ─── AddGoalDialog ───────────────────────────────────
 type Suggestion = { title: string; description: string; priority: string; reason: string };
 
@@ -766,10 +783,13 @@ export function ProjectHome() {
   // Goals 접기 상태
   const [showCompletedGoals, setShowCompletedGoals] = useState(false);
   const COMPLETED_GOALS_THRESHOLD = 3;
+  const AGENT_IDLE_CAP = 16;
 
   // Goal edit state
   const [editGoalId, setEditGoalId] = useState<string | null>(null);
   const [expandedGoalDescs, setExpandedGoalDescs] = useState<Set<string>>(new Set());
+  // goal 카드의 진행 상세(GoalDetail: 상태+품질 타임라인+활동) 기본 접힘 — overview 스크롤 절감
+  const [expandedGoalDetails, setExpandedGoalDetails] = useState<Set<string>>(new Set());
 
   // Goal Spec state
   const [specGoalId, setSpecGoalId] = useState<string | null>(null);
@@ -1768,79 +1788,115 @@ export function ProjectHome() {
 
               {/* Rate Limit Banner — removed, now shown as overlay on task area */}
 
-              {/* Agents Section — compact summary with activity */}
+              {/* Agents Section — team presence panel */}
               <section className="mb-8">
-                <div className="flex items-center justify-between mb-2">
+                {agents.length === 0 ? (
                   <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
                     <span className="font-medium text-gray-700 dark:text-gray-300 shrink-0">{t("agents")}:</span>
-                    {agents.length === 0 ? (
-                      <button
-                        onClick={handleAddAgent}
-                        className="text-blue-500 hover:text-blue-700 dark:hover:text-blue-300 transition-colors"
-                      >
-                        {t("addAgent")}
-                      </button>
-                    ) : (
-                      <>
-                        <span className="flex flex-wrap gap-1 items-center min-w-0">
-                          {agents.map((a, idx) => {
+                    <button
+                      onClick={handleAddAgent}
+                      className="text-blue-500 hover:text-blue-700 dark:hover:text-blue-300 transition-colors"
+                    >
+                      {t("addAgent")}
+                    </button>
+                  </div>
+                ) : (() => {
+                  const workingAgents = agents.filter((a) => a.status === "working");
+                  const idleAgents = agents.filter((a) => a.status !== "working");
+                  const visibleIdle = idleAgents.slice(0, AGENT_IDLE_CAP);
+                  return (
+                    <div className="overflow-hidden rounded-xl border border-gray-200 dark:border-gray-700">
+                      {/* Header — count + working badge + actions */}
+                      <div className="flex items-center justify-between gap-2 border-b border-gray-100 bg-gray-50 px-3 py-2 dark:border-gray-700/60 dark:bg-gray-800/50">
+                        <div className="flex min-w-0 items-center gap-2 text-xs">
+                          <span className="shrink-0 font-semibold text-gray-700 dark:text-gray-200">{t("agents")}</span>
+                          <span className="shrink-0 text-gray-400 dark:text-gray-500">{t("agentCount", { count: agents.length })}</span>
+                          {workingAgents.length > 0 && (
+                            <span className="inline-flex shrink-0 items-center gap-1 text-green-600 dark:text-green-400">
+                              <span className="h-1.5 w-1.5 rounded-full bg-green-400 animate-pulse" />
+                              {t("agentsWorking", { count: workingAgents.length })}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 items-center gap-3 text-[11px]">
+                          <button
+                            onClick={() => setTab("agents")}
+                            className="whitespace-nowrap text-blue-500 transition-colors hover:text-blue-700 dark:hover:text-blue-300"
+                          >
+                            {t("goToAgentsTab")}
+                          </button>
+                          <button
+                            onClick={() => setDuplicateTeamConfirm(true)}
+                            disabled={duplicatingTeam}
+                            title={t("duplicateTeamTip")}
+                            className="whitespace-nowrap text-gray-400 transition-colors hover:text-blue-600 disabled:opacity-50 dark:text-gray-500 dark:hover:text-blue-300"
+                          >
+                            {duplicatingTeam ? t("duplicateTeamRunning") : t("duplicateTeam")}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Working agents — hero rows with live activity */}
+                      {workingAgents.length > 0 && (
+                        <div className="divide-y divide-gray-50 dark:divide-gray-800">
+                          {workingAgents.map((a) => {
+                            const meta = roleMeta(a.role);
                             const phase = getCtoPhase(a.current_activity);
-                            const dotClass = a.status === "working" && phase
-                              ? "bg-blue-400 animate-pulse"
-                              : a.status === "working"
-                              ? "bg-green-400 animate-pulse"
-                              : null;
                             return (
-                              <span key={a.id} className="inline-flex items-center gap-0.5">
-                                {dotClass && <span className={`w-1.5 h-1.5 rounded-full ${dotClass} shrink-0`} />}
-                                <span className="text-gray-700 dark:text-gray-300">{a.name}</span>
-                                {idx < agents.length - 1 && (
-                                  <span className="text-gray-300 dark:text-gray-600">,</span>
-                                )}
-                              </span>
+                              <div key={a.id} className="flex items-center gap-2.5 px-3 py-2">
+                                <span className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-sm ${meta.tone}`}>
+                                  {meta.icon}
+                                </span>
+                                <div className="min-w-0 flex-1">
+                                  <div className="truncate text-xs font-medium text-gray-700 dark:text-gray-200">{a.name}</div>
+                                  {a.current_activity && (
+                                    <div className="mt-0.5 flex items-center gap-1.5 text-[11px]">
+                                      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${phase ? "bg-blue-400 animate-pulse" : "bg-green-400 animate-pulse"}`} />
+                                      <span className={`truncate ${phase ? "text-blue-500 dark:text-blue-400" : "text-green-600 dark:text-green-400"}`}>
+                                        {parseActivity(a.current_activity, t)}
+                                      </span>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
                             );
                           })}
-                          <span className="text-gray-400 dark:text-gray-500">
-                            ({t("agentCount", { count: agents.length })})
-                          </span>
-                        </span>
-                        <button
-                          onClick={() => setTab("agents")}
-                          className="shrink-0 text-blue-500 hover:text-blue-700 dark:hover:text-blue-300 transition-colors whitespace-nowrap"
-                        >
-                          {t("goToAgentsTab")}
-                        </button>
-                      </>
-                    )}
-                  </div>
-                  {agents.length > 0 && (
-                    <button
-                      onClick={() => setDuplicateTeamConfirm(true)}
-                      disabled={duplicatingTeam}
-                      className="shrink-0 text-[11px] text-gray-400 hover:text-blue-600 dark:text-gray-500 dark:hover:text-blue-300 transition-colors whitespace-nowrap disabled:opacity-50"
-                      title={t("duplicateTeamTip")}
-                    >
-                      {duplicatingTeam ? t("duplicateTeamRunning") : t("duplicateTeam")}
-                    </button>
-                  )}
-                </div>
-                {/* Active agent activities */}
-                {agents.filter((a) => a.status === "working" && a.current_activity).length > 0 && (
-                  <div className="space-y-1.5 ml-1">
-                    {agents.filter((a) => a.status === "working" && a.current_activity).map((a) => {
-                      const phase = getCtoPhase(a.current_activity);
-                      return (
-                        <div key={a.id} className="flex items-center gap-2 text-[11px]">
-                          <span className={`w-1 h-1 rounded-full shrink-0 ${phase ? "bg-blue-400" : "bg-green-400"}`} />
-                          <span className="text-gray-500 dark:text-gray-400">{a.name}</span>
-                          <span className={phase ? "text-blue-500 dark:text-blue-400" : "text-green-600 dark:text-green-400"}>
-                            {parseActivity(a.current_activity, t)}
-                          </span>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
+                      )}
+
+                      {/* Idle agents — compact role-avatar cluster */}
+                      {idleAgents.length > 0 && (
+                        <div className={`flex items-center gap-2 px-3 py-2 ${workingAgents.length > 0 ? "border-t border-gray-100 dark:border-gray-700/60" : ""}`}>
+                          <span className="shrink-0 text-[11px] text-gray-400 dark:text-gray-500">
+                            {t("agentsIdle")} {idleAgents.length}
+                          </span>
+                          <div className="flex min-w-0 flex-wrap items-center gap-1">
+                            {visibleIdle.map((a) => {
+                              const meta = roleMeta(a.role);
+                              return (
+                                <span
+                                  key={a.id}
+                                  title={a.name}
+                                  className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-gray-100 text-[11px] opacity-70 dark:bg-gray-800"
+                                >
+                                  {meta.icon}
+                                </span>
+                              );
+                            })}
+                            {idleAgents.length > visibleIdle.length && (
+                              <button
+                                onClick={() => setTab("agents")}
+                                className="text-[11px] text-gray-400 transition-colors hover:text-blue-500 dark:text-gray-500"
+                              >
+                                {t("agentsMore", { count: idleAgents.length - visibleIdle.length })}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </section>
 
               {/* Goals Section */}
@@ -2230,7 +2286,30 @@ export function ProjectHome() {
                         })()}
                         {goal.goal_model === "goal_as_unit" && (
                           <div className="px-3 pb-1.5">
-                            <GoalDetail goalId={goal.id} />
+                            <button
+                              type="button"
+                              onClick={() => setExpandedGoalDetails((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(goal.id)) next.delete(goal.id);
+                                else next.add(goal.id);
+                                return next;
+                              })}
+                              aria-expanded={expandedGoalDetails.has(goal.id)}
+                              className="flex items-center gap-1 text-[11px] text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 transition-colors"
+                            >
+                              <svg
+                                className={`w-3 h-3 transition-transform ${expandedGoalDetails.has(goal.id) ? "rotate-90" : ""}`}
+                                viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+                              >
+                                <polyline points="9 18 15 12 9 6" />
+                              </svg>
+                              {t("goalProgressDetail")}
+                            </button>
+                            {expandedGoalDetails.has(goal.id) && (
+                              <div className="mt-1.5">
+                                <GoalDetail goalId={goal.id} />
+                              </div>
+                            )}
                           </div>
                         )}
                         {hasDescription && (

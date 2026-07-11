@@ -18,6 +18,9 @@ const ko = {
   // OrgChart
   orgChartTitle: "조직도",
   agentCount: "{{count}}명",
+  agentsMore: "+{{count}}",
+  agentsIdle: "대기",
+  goalProgressDetail: "진행 상세",
   goToAgentsTab: "에이전트 탭으로 →",
   teamPresetApply: "팀 템플릿 적용",
   noAgentsOrgChart: "에이전트가 없습니다",
