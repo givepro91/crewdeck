@@ -19,9 +19,11 @@
     "postbuild": "mkdir -p dist/server/core/methodology && cp server/core/methodology/*.md dist/server/core/methodology/; chmod +x dist/bin/crewdeck.js",
     "start": "node dist/bin/crewdeck.js",
     "test": "vitest run",
+    "test:e2e": "CREWDECK_TEST_SCOPE=e2e vitest run",
+    "test:all": "CREWDECK_TEST_SCOPE=all vitest run",
     "typecheck": "tsc --noEmit",
     "verify:startup": "node scripts/verify-startup.mjs",
-    "prepublishOnly": "npm run build && npm test && npm run verify:startup"
+    "prepublishOnly": "npm run build && npm run test:all && npm --prefix dashboard test && npm run verify:startup"
   },
   "keywords": [
     "ai",

@@ -23,7 +23,9 @@ npm start                           # 빌드 산출물 실행 (dist/bin/crewdeck
 
 npm run typecheck                   # server tsc --noEmit
 cd dashboard && npx tsc -b          # dashboard typecheck (app + test 프로젝트) — ⚠ `tsc --noEmit`은 files:[]+references 구조라 no-op
-npm test                            # server vitest run (unit only — 통합/E2E 없음)
+npm test                            # server 빠른 unit (무거운 통합/E2E 제외 — 수초, 평소 루프용)
+npm run test:e2e                    # 무거운 통합/E2E만 (실 git worktree/서버 spawn, ~5.5분 — release/CI용)
+npm run test:all                    # 전체 (fast + e2e). prepublishOnly가 이걸 실행
 cd dashboard && npm test            # dashboard 컴포넌트 테스트 (vitest + jsdom)
 
 # 상시 기동 (macOS launchd — 로그인 자동 시작, 개인 도구 운영 모드)
