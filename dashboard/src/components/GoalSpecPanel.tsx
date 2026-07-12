@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { GoalSpecVersionSnapshot, SpecFields } from "../../../shared/types";
 import { ApiError, api } from "../lib/api";
@@ -8,6 +8,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 
 interface GoalSpecPanelProps {
   goalId: string;
+  goalTitle?: string;
   onClose: () => void;
   onGeneratingClose?: () => void;
 }
@@ -274,7 +275,93 @@ function VersionCompareView({ versions, baseId, targetId, onBaseChange, onTarget
   );
 }
 
-export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: GoalSpecPanelProps) {
+/**
+ * 사람이 읽는 문서 뷰 — flat 5필드를 폼이 아니라 한 장짜리 기획 문서로 렌더한다.
+ * "이 기획이 무엇인지 누구에게나 설명할 수 있는" 읽기 밀도가 목표(표현 계층만, 생성 로직 불변).
+ */
+function SpecDocumentView({ title, fields, t }: {
+  title?: string;
+  fields: SpecFields;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const clean = (values: string[]) => values.map((value) => value.trim()).filter(Boolean);
+  const acceptance = clean(fields.acceptance_criteria);
+  const tasks = clean(fields.expected_tasks);
+  const verification = clean(fields.verification_methods);
+  const scope = fields.scope.trim();
+  const outOfScope = fields.out_of_scope.trim();
+
+  const Section = ({ label, children }: { label: string; children: ReactNode }) => (
+    <section className="space-y-2">
+      <h3 className="text-[11px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">{label}</h3>
+      {children}
+    </section>
+  );
+
+  return (
+    <article className="mx-auto max-w-2xl space-y-6">
+      {title && (
+        <header className="space-y-1 border-b border-gray-100 pb-4 dark:border-gray-800">
+          <p className="text-[11px] font-medium uppercase tracking-wide text-indigo-500 dark:text-indigo-400">{t("specHeaderTitle")}</p>
+          <h2 className="text-lg font-semibold leading-snug text-gray-900 dark:text-gray-50">{title}</h2>
+        </header>
+      )}
+
+      <Section label={t("specScope")}>
+        {scope
+          ? <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-700 dark:text-gray-200">{scope}</p>
+          : <p className="text-sm italic text-gray-400 dark:text-gray-500">—</p>}
+      </Section>
+
+      {outOfScope && (
+        <Section label={t("specOutOfScope")}>
+          <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-500 dark:text-gray-400">{outOfScope}</p>
+        </Section>
+      )}
+
+      <Section label={t("specAcceptanceCriteria")}>
+        {acceptance.length > 0 ? (
+          <ul className="space-y-1.5">
+            {acceptance.map((item, index) => (
+              <li key={index} className="flex gap-2 text-sm leading-relaxed text-gray-700 dark:text-gray-200">
+                <span aria-hidden="true" className="mt-0.5 shrink-0 text-emerald-500 dark:text-emerald-400">✓</span>
+                <span className="min-w-0">{item}</span>
+              </li>
+            ))}
+          </ul>
+        ) : <p className="text-sm italic text-gray-400 dark:text-gray-500">—</p>}
+      </Section>
+
+      <Section label={t("specExpectedTasks")}>
+        {tasks.length > 0 ? (
+          <ol className="space-y-1.5">
+            {tasks.map((item, index) => (
+              <li key={index} className="flex gap-2 text-sm leading-relaxed text-gray-700 dark:text-gray-200">
+                <span aria-hidden="true" className="mt-0.5 w-4 shrink-0 text-right tabular-nums text-gray-400 dark:text-gray-500">{index + 1}.</span>
+                <span className="min-w-0">{item}</span>
+              </li>
+            ))}
+          </ol>
+        ) : <p className="text-sm italic text-gray-400 dark:text-gray-500">—</p>}
+      </Section>
+
+      <Section label={t("specVerificationMethods")}>
+        {verification.length > 0 ? (
+          <ul className="space-y-1.5">
+            {verification.map((item, index) => (
+              <li key={index} className="flex gap-2 text-sm leading-relaxed text-gray-700 dark:text-gray-200">
+                <span aria-hidden="true" className="mt-0.5 shrink-0 text-gray-400 dark:text-gray-500">•</span>
+                <span className="min-w-0">{item}</span>
+              </li>
+            ))}
+          </ul>
+        ) : <p className="text-sm italic text-gray-400 dark:text-gray-500">—</p>}
+      </Section>
+    </article>
+  );
+}
+
+export default function GoalSpecPanel({ goalId, goalTitle, onClose, onGeneratingClose }: GoalSpecPanelProps) {
   const { t } = useTranslation();
   const state = useGoalSpecStore((store) => store.byGoalId[goalId] ?? null);
   const loading = useGoalSpecStore((store) =>
@@ -296,6 +383,8 @@ export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: Go
   const [compareMode, setCompareMode] = useState(false);
   const [compareBaseId, setCompareBaseId] = useState<string | null>(null);
   const [compareTargetId, setCompareTargetId] = useState<string | null>(null);
+  // 문서 보기(read) ↔ 편집(edit). 열거나 버전을 고르면 읽기 문서가 기본, 편집은 명시적으로.
+  const [mode, setMode] = useState<"read" | "edit">("read");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
 
@@ -315,6 +404,7 @@ export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: Go
     setDraft(toDraft(latest));
     setDirty(false);
     setErrorLocation(null);
+    setMode("read");
   }, []);
 
   const stopPolling = useCallback(() => {
@@ -388,6 +478,7 @@ export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: Go
     setDirty(false);
     setError(null);
     setErrorLocation(null);
+    setMode("read");
   };
 
   const enterCompare = () => {
@@ -410,8 +501,11 @@ export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: Go
   };
 
   const showRequestError = (requestError: unknown, fallback: string) => {
+    const location = getSpecErrorLocation(requestError);
     setError(requestError instanceof Error ? requestError.message : fallback);
-    setErrorLocation(getSpecErrorLocation(requestError));
+    setErrorLocation(location);
+    // 필드 단위 오류는 편집 폼에서만 강조되므로, 문서 보기 중이면 편집 모드로 전환해 사용자가 고칠 수 있게 한다.
+    if (location) setMode("edit");
   };
 
   const saveDraft = async () => {
@@ -463,6 +557,7 @@ export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: Go
     setDirty(true);
     setError(null);
     setErrorLocation(null);
+    setMode("edit");
   };
 
   // 모달 접근성 — 열릴 때 첫 의미 있는 컨트롤로 포커스 이동, Tab 순환, Escape 닫기.
@@ -528,6 +623,11 @@ export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: Go
           </div>
           <div className="flex flex-wrap items-center gap-2">
             {generating && <span className="text-xs text-amber-600 dark:text-amber-400">{t("specGenerating")}</span>}
+            {state && state.status !== "missing" && !creatingNew && !compareMode && !generating && !readOnly && (
+              <button type="button" onClick={() => setMode(mode === "read" ? "edit" : "read")} className="rounded-lg bg-gray-100 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-400 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700">
+                {mode === "read" ? t("specEdit") : t("specDocView")}
+              </button>
+            )}
             {state && state.versions.length >= 2 && !compareMode && (
               <button type="button" onClick={enterCompare} className="rounded-lg bg-gray-100 px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-400 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700">
                 {t("specCompareEnter")}
@@ -602,22 +702,43 @@ export default function GoalSpecPanel({ goalId, onClose, onGeneratingClose }: Go
                 <GoalSpecEmptyState title={t("specEmpty")} hint={t("specEmptyHint")} createLabel={t("specCreateDraft")} generateLabel={t("specGenerate")} error={error} disabled={busy} onCreate={startNewDraft} onGenerate={generate} />
               ) : (
                 <div className="space-y-5">
-                  {state.status === "draft" && <p className="rounded-lg bg-blue-50 px-3 py-2 text-xs text-blue-700 dark:bg-blue-900/20 dark:text-blue-300">{t("specDraft")}</p>}
-                  {state.status === "changes_pending" && <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-900/20 dark:text-amber-300">{t("specChangesPending")}</p>}
+                  {/* 승인 게이트 배너 — 미승인 최신 draft면 크게: 실행이 막혀 있다는 사실 + 승인 CTA */}
+                  {!creatingNew && selectedVersion?.state === "draft" && selectedVersion.id === latestVersion?.id && (
+                    <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 dark:border-amber-700 dark:bg-amber-900/20">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="min-w-0 text-xs font-medium text-amber-800 dark:text-amber-200">
+                          {state.status === "changes_pending" ? t("specChangesPending") : t("specApproveGate")}
+                        </p>
+                        {!dirty ? (
+                          <button type="button" onClick={approveDraft} disabled={approving} className="shrink-0 rounded-lg bg-green-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-400 disabled:opacity-50">
+                            {approving ? "..." : t("specApproveNow")}
+                          </button>
+                        ) : (
+                          <span className="shrink-0 text-xs text-amber-700 dark:text-amber-300">{t("specSaveBeforeApprove")}</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
                   {readOnly && <p className="rounded-lg bg-green-50 px-3 py-2 text-xs text-green-700 dark:bg-green-900/20 dark:text-green-300">{t("specApprovedReadOnly")}</p>}
-                  <label className="block text-xs font-semibold text-gray-600 dark:text-gray-300">
-                    {t("specScope")}
-                    <textarea rows={4} disabled={readOnly} value={draft.scope} aria-invalid={errorLocation === "scope" ? true : undefined} aria-describedby={errorLocation === "scope" ? "spec-scope-error" : undefined} onChange={(event) => updateDraft({ ...draft, scope: event.target.value })} className="mt-2 w-full resize-y rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-normal text-gray-700 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 disabled:bg-gray-50 disabled:text-gray-500 dark:border-gray-700 dark:bg-[#25253d] dark:text-gray-200 dark:disabled:bg-gray-800" />
-                    <GoalSpecFieldError field="scope" location={errorLocation} message={error} />
-                  </label>
-                  <label className="block text-xs font-semibold text-gray-600 dark:text-gray-300">
-                    {t("specOutOfScope")}
-                    <textarea rows={3} disabled={readOnly} value={draft.out_of_scope} aria-invalid={errorLocation === "out_of_scope" ? true : undefined} aria-describedby={errorLocation === "out_of_scope" ? "spec-out-of-scope-error" : undefined} onChange={(event) => updateDraft({ ...draft, out_of_scope: event.target.value })} className="mt-2 w-full resize-y rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-normal text-gray-700 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 disabled:bg-gray-50 disabled:text-gray-500 dark:border-gray-700 dark:bg-[#25253d] dark:text-gray-200 dark:disabled:bg-gray-800" />
-                    <GoalSpecFieldError field="out_of_scope" location={errorLocation} message={error} />
-                  </label>
-                  <TextListEditor field="acceptance_criteria" label={t("specAcceptanceCriteria")} values={draft.acceptance_criteria} disabled={readOnly} error={errorLocation === "acceptance_criteria" ? error ?? undefined : undefined} onChange={(values) => updateDraft({ ...draft, acceptance_criteria: values })} />
-                  <TextListEditor field="expected_tasks" label={t("specExpectedTasks")} values={draft.expected_tasks} disabled={readOnly} error={errorLocation === "expected_tasks" ? error ?? undefined : undefined} onChange={(values) => updateDraft({ ...draft, expected_tasks: values })} />
-                  <TextListEditor field="verification_methods" label={t("specVerificationMethods")} values={draft.verification_methods} disabled={readOnly} error={errorLocation === "verification_methods" ? error ?? undefined : undefined} onChange={(values) => updateDraft({ ...draft, verification_methods: values })} />
+                  {mode === "read" && !creatingNew ? (
+                    <SpecDocumentView title={goalTitle} fields={draft} t={t} />
+                  ) : (
+                    <>
+                      <label className="block text-xs font-semibold text-gray-600 dark:text-gray-300">
+                        {t("specScope")}
+                        <textarea rows={4} disabled={readOnly} value={draft.scope} aria-invalid={errorLocation === "scope" ? true : undefined} aria-describedby={errorLocation === "scope" ? "spec-scope-error" : undefined} onChange={(event) => updateDraft({ ...draft, scope: event.target.value })} className="mt-2 w-full resize-y rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-normal text-gray-700 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 disabled:bg-gray-50 disabled:text-gray-500 dark:border-gray-700 dark:bg-[#25253d] dark:text-gray-200 dark:disabled:bg-gray-800" />
+                        <GoalSpecFieldError field="scope" location={errorLocation} message={error} />
+                      </label>
+                      <label className="block text-xs font-semibold text-gray-600 dark:text-gray-300">
+                        {t("specOutOfScope")}
+                        <textarea rows={3} disabled={readOnly} value={draft.out_of_scope} aria-invalid={errorLocation === "out_of_scope" ? true : undefined} aria-describedby={errorLocation === "out_of_scope" ? "spec-out-of-scope-error" : undefined} onChange={(event) => updateDraft({ ...draft, out_of_scope: event.target.value })} className="mt-2 w-full resize-y rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-normal text-gray-700 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 disabled:bg-gray-50 disabled:text-gray-500 dark:border-gray-700 dark:bg-[#25253d] dark:text-gray-200 dark:disabled:bg-gray-800" />
+                        <GoalSpecFieldError field="out_of_scope" location={errorLocation} message={error} />
+                      </label>
+                      <TextListEditor field="acceptance_criteria" label={t("specAcceptanceCriteria")} values={draft.acceptance_criteria} disabled={readOnly} error={errorLocation === "acceptance_criteria" ? error ?? undefined : undefined} onChange={(values) => updateDraft({ ...draft, acceptance_criteria: values })} />
+                      <TextListEditor field="expected_tasks" label={t("specExpectedTasks")} values={draft.expected_tasks} disabled={readOnly} error={errorLocation === "expected_tasks" ? error ?? undefined : undefined} onChange={(values) => updateDraft({ ...draft, expected_tasks: values })} />
+                      <TextListEditor field="verification_methods" label={t("specVerificationMethods")} values={draft.verification_methods} disabled={readOnly} error={errorLocation === "verification_methods" ? error ?? undefined : undefined} onChange={(values) => updateDraft({ ...draft, verification_methods: values })} />
+                    </>
+                  )}
                   {error && !errorLocation && <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-300">{error}</p>}
                 </div>
               )}

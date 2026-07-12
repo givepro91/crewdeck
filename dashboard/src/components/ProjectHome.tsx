@@ -1643,7 +1643,7 @@ export function ProjectHome() {
         );
       })()}
       {specGoalId && (
-        <GoalSpecPanel goalId={specGoalId} onClose={() => setSpecGoalId(null)} onGeneratingClose={() => startSpecPolling(specGoalId)} />
+        <GoalSpecPanel goalId={specGoalId} goalTitle={goals.find((g) => g.id === specGoalId)?.title || goals.find((g) => g.id === specGoalId)?.description} onClose={() => setSpecGoalId(null)} onGeneratingClose={() => startSpecPolling(specGoalId)} />
       )}
       {showAutopilotModal && (
         <AutopilotModal
@@ -2084,19 +2084,26 @@ export function ProjectHome() {
                     );
                     const isDecomposing = decomposingGoalId === goal.id || agentDecomposingThis;
                     const isGeneratingSpec = generatingSpecGoalIds.has(goal.id);
+                    // 승인 게이트가 실행을 막는 상태 — handleDecomposeGoal/서버 assertExecutionAllowed와 동일 조건.
+                    // 기획서(draft)는 있으나 실행 기준으로 고정된 승인본이 없다 = 승인해야 실행됨.
+                    const needsSpecApproval = goal.has_spec === 1
+                      && goal.spec_approval_required === 1
+                      && !goal.execution_spec_version_id
+                      && !isGeneratingSpec;
                     const displayTitle = goal.title || goal.description;
                     const hasDescription = goal.description && goal.title && goal.description !== goal.title;
                     const goalRefs = (() => { try { const r = JSON.parse(goal.references || "[]"); return Array.isArray(r) ? r : []; } catch { return []; } })();
+                    const cardAccentClass = isDecomposing
+                      ? "border-purple-300 dark:border-purple-600 bg-purple-50/50 dark:bg-purple-900/10 ring-1 ring-purple-200 dark:ring-purple-800 animate-pulse"
+                      : isGeneratingSpec
+                        ? "border-indigo-300 dark:border-indigo-600 bg-indigo-50/30 dark:bg-indigo-900/10 ring-1 ring-indigo-200 dark:ring-indigo-800"
+                        : needsSpecApproval
+                          ? "border-amber-300 dark:border-amber-600 bg-amber-50/40 dark:bg-amber-900/10 ring-1 ring-amber-200 dark:ring-amber-800"
+                          : "border-gray-200 dark:border-gray-700 bg-white dark:bg-[#25253d]";
                     return (
                       <div
                         key={goal.id}
-                        className={`mb-3 border rounded-lg overflow-visible transition-all ${
-                          isDecomposing
-                            ? "border-purple-300 dark:border-purple-600 bg-purple-50/50 dark:bg-purple-900/10 ring-1 ring-purple-200 dark:ring-purple-800 animate-pulse"
-                            : isGeneratingSpec
-                              ? "border-indigo-300 dark:border-indigo-600 bg-indigo-50/30 dark:bg-indigo-900/10 ring-1 ring-indigo-200 dark:ring-indigo-800"
-                              : "border-gray-200 dark:border-gray-700 bg-white dark:bg-[#25253d]"
-                        }`}
+                        className={`mb-3 border rounded-lg overflow-visible transition-all ${cardAccentClass}`}
                       >
                         <div className="flex items-center justify-between gap-3 px-3 py-2">
                           <button
@@ -2153,6 +2160,15 @@ export function ProjectHome() {
                                 </svg>
                                 {t("specGeneratingInCard")}
                               </span>
+                            ) : needsSpecApproval ? (
+                              <button
+                                onClick={() => setSpecGoalId(goal.id)}
+                                title={t("specApprovalNeededHint")}
+                                className="text-[10px] px-2 py-0.5 rounded font-medium flex items-center gap-1 bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-900/60 ring-1 ring-amber-300 dark:ring-amber-700 transition-colors whitespace-nowrap"
+                              >
+                                <span aria-hidden="true">✎</span>
+                                {t("specApprovalNeeded")}
+                              </button>
                             ) : (
                               <button
                                 onClick={() => setSpecGoalId(goal.id)}

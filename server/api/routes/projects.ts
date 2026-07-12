@@ -41,13 +41,13 @@ export function createProjectRoutes(ctx: AppContext): Router {
   router.get("/activity", (_req, res) => {
     type Agg = {
       inProgress: number; workingAgents: number; specGen: number; squashRunning: number;
-      pending: number; waitingAgents: number; squashPending: number;
+      pending: number; waitingAgents: number; squashPending: number; specPending: number;
     };
     const map = new Map<string, Agg>();
     const bump = (pid: string, key: keyof Agg, n: number) => {
       let a = map.get(pid);
       if (!a) {
-        a = { inProgress: 0, workingAgents: 0, specGen: 0, squashRunning: 0, pending: 0, waitingAgents: 0, squashPending: 0 };
+        a = { inProgress: 0, workingAgents: 0, specGen: 0, squashRunning: 0, pending: 0, waitingAgents: 0, squashPending: 0, specPending: 0 };
         map.set(pid, a);
       }
       a[key] += n;
@@ -63,13 +63,19 @@ export function createProjectRoutes(ctx: AppContext): Router {
       bump(r.project_id, r.squash_status === "pending_approval" ? "squashPending" : "squashRunning", r.c);
     for (const r of db.prepare(`SELECT g.project_id, COUNT(*) c FROM goal_specs gs JOIN goals g ON g.id = gs.goal_id WHERE gs.prd_summary LIKE '%"_status":"generating"%' GROUP BY g.project_id`).all() as any[])
       bump(r.project_id, "specGen", r.c);
+    // Blueprint(기획서) 승인 대기 — 승인 게이트가 실행을 막는 goal(marker on, 미고정, 실제 draft 존재).
+    // assertExecutionAllowed / handleDecomposeGoal 게이트 조건과 동일.
+    for (const r of db.prepare(`SELECT g.project_id, COUNT(*) c FROM goals g WHERE g.spec_approval_required = 1 AND g.execution_spec_version_id IS NULL AND EXISTS(SELECT 1 FROM goal_spec_versions v WHERE v.goal_id = g.id) GROUP BY g.project_id`).all() as any[])
+      bump(r.project_id, "specPending", r.c);
 
-    const out: Record<string, { state: "working" | "waiting"; activeCount: number }> = {};
+    const out: Record<string, { state: "working" | "waiting"; activeCount: number; specPending: number }> = {};
     for (const [pid, a] of map) {
       const working = a.inProgress > 0 || a.workingAgents > 0 || a.specGen > 0 || a.squashRunning > 0;
-      const waiting = a.pending > 0 || a.waitingAgents > 0 || a.squashPending > 0;
-      if (working) out[pid] = { state: "working", activeCount: a.inProgress };
-      else if (waiting) out[pid] = { state: "waiting", activeCount: a.pending + a.squashPending + a.waitingAgents };
+      const waiting = a.pending > 0 || a.waitingAgents > 0 || a.squashPending > 0 || a.specPending > 0;
+      // specPending 은 별도 필드로만 노출 — 사이드바가 전용 "승인 대기" 칩으로 표시하고,
+      // activeCount(일반 작업/승인 집계)와 중복 계산하지 않는다.
+      if (working) out[pid] = { state: "working", activeCount: a.inProgress, specPending: a.specPending };
+      else if (waiting) out[pid] = { state: "waiting", activeCount: a.pending + a.squashPending + a.waitingAgents, specPending: a.specPending };
     }
     res.json(out);
   });

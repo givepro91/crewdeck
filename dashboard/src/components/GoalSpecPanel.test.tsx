@@ -115,9 +115,8 @@ describe("GoalSpecPanel — full render + interaction", () => {
     // 두 버전이 모두 목록에 노출된다
     expect(screen.getByText("v1")).toBeTruthy();
     expect(screen.getByText("v2")).toBeTruthy();
-    // 최신(v2, draft) 스냅샷이 폼에 선택된다
-    const scope = screen.getAllByRole("textbox")[0] as HTMLTextAreaElement;
-    expect(scope.value).toBe("scope-draft");
+    // 최신(v2, draft) 스냅샷이 기본 문서 보기에 표시된다
+    expect(screen.getByText("scope-draft")).toBeTruthy();
   });
 
   it("marks the execution-basis version and shows the pin in the detail header when selected", async () => {
@@ -134,15 +133,13 @@ describe("GoalSpecPanel — full render + interaction", () => {
   it("switches versions and locks the approved snapshot read-only", async () => {
     await renderPanel(makeState());
     fireEvent.click(screen.getByText("v1"));
-    await waitFor(() => {
-      const scope = screen.getAllByRole("textbox")[0] as HTMLTextAreaElement;
-      expect(scope.value).toBe("scope-approved");
-    });
-    const scope = screen.getAllByRole("textbox")[0] as HTMLTextAreaElement;
-    expect(scope.disabled).toBe(true);
+    // 승인된 v1 은 문서 보기로만 표시된다(폼 없음)
+    await waitFor(() => expect(screen.getByText("scope-approved")).toBeTruthy());
     expect(screen.getByText(/approved version is locked/)).toBeTruthy();
-    // read-only 버전은 저장 버튼이 사라진다
+    // read-only 버전은 저장 버튼도, 편집 토글도 없다
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
   });
 
   it("exposes an Approve action for the latest draft and calls the approve API", async () => {
@@ -180,6 +177,8 @@ describe("GoalSpecPanel — full render + interaction", () => {
     await renderPanel(state);
     const v3 = makeVersion({ id: "v3", version: 3, state: "draft", scope: "scope-3" });
     mocks.saveSpec.mockResolvedValue({ ...state, versions: [...state.versions, v3] });
+    // 편집 모드로 전환해야 폼이 노출된다(기본 = 문서 보기)
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     const scope = screen.getAllByRole("textbox")[0] as HTMLTextAreaElement;
     fireEvent.change(scope, { target: { value: "edited scope" } });
     const saveBtn = await screen.findByRole("button", { name: "Save" });
@@ -188,7 +187,7 @@ describe("GoalSpecPanel — full render + interaction", () => {
     await waitFor(() => expect(screen.getByText("v3")).toBeTruthy());
   });
 
-  it("compares two versions with a field diff and exits back to the editor", async () => {
+  it("compares two versions with a field diff and exits back to the document", async () => {
     await renderPanel(makeState());
     fireEvent.click(screen.getByRole("button", { name: "Compare versions" }));
     // 비교 뷰: 기준/비교 version selector 두 개 (키보드 접근 가능한 <select>)
@@ -204,10 +203,10 @@ describe("GoalSpecPanel — full render + interaction", () => {
     // 기준 version 을 키보드/셀렉트로 바꿀 수 있다
     fireEvent.change(base, { target: { value: "v2" } });
     expect(base.value).toBe("v2");
-    // 비교 종료 → 편집 폼 복귀
+    // 비교 종료 → 문서 보기(기본) 복귀
     fireEvent.click(screen.getByRole("button", { name: "Exit compare" }));
     await waitFor(() => expect(screen.queryByTestId("spec-compare-view")).toBeNull());
-    expect(screen.getAllByRole("textbox").length).toBeGreaterThan(0);
+    expect(screen.getByText("scope-draft")).toBeTruthy();
   });
 
   it("is an accessible dialog: initial focus is trapped inside and Escape closes it", async () => {

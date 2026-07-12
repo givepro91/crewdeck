@@ -16,7 +16,7 @@ export function Sidebar() {
 
   // 프로젝트별 실시간 작업 상태 — 어떤 프로젝트가 지금 일하는지 사이드바에서 한눈에.
   // DB 집계라 새로고침에도 정확. 마운트 1회 + WS refresh(디바운스) + 8s 폴백 폴링.
-  const [activity, setActivity] = useState<Record<string, { state: "working" | "waiting"; activeCount: number }>>({});
+  const [activity, setActivity] = useState<Record<string, { state: "working" | "waiting"; activeCount: number; specPending: number }>>({});
 
   useEffect(() => {
     let alive = true;
@@ -59,24 +59,43 @@ export function Sidebar() {
 
   const showToast = (msg: string) => setToast(msg);
 
-  // working = 인디고 pulse(+진행 태스크 수), waiting = 앰버(+승인 대기 수), idle = 표시 없음
+  // working = 인디고 pulse(+진행 태스크 수), waiting = 앰버(+승인 대기 수), idle = 표시 없음.
+  // 기획서 승인 대기는 별도 앰버 pill(✎N)로 — 작업 중이어도 승인이 필요함을 항상 드러낸다.
   const renderActivity = (projectId: string) => {
     const act = activity[projectId];
     if (!act) return null;
     const working = act.state === "working";
     const label = working ? t("sidebarWorking") : t("sidebarWaiting");
+    const specPending = act.specPending ?? 0;
+    // 일반 작업/승인 신호 여부 (기획서 승인 대기는 아래 전용 칩으로 분리 표시)
+    const hasGeneric = working || act.activeCount > 0;
+    if (!hasGeneric && specPending === 0) return null;
     return (
-      <span className="shrink-0 flex items-center gap-1" title={label} aria-label={label}>
-        {act.activeCount > 0 && (
+      <span className="shrink-0 flex items-center gap-1">
+        {specPending > 0 && (
           <span
-            className={`text-[10px] font-medium tabular-nums ${
-              working ? "text-indigo-500 dark:text-indigo-400" : "text-amber-500 dark:text-amber-400"
-            }`}
+            className="flex items-center gap-0.5 rounded bg-amber-100 px-1 text-[10px] font-medium text-amber-600 dark:bg-amber-900/40 dark:text-amber-400"
+            title={t("sidebarSpecPending", { count: specPending })}
+            aria-label={t("sidebarSpecPending", { count: specPending })}
           >
-            {act.activeCount}
+            <span aria-hidden="true">✎</span>
+            <span className="tabular-nums">{specPending}</span>
           </span>
         )}
-        <span className={`w-2 h-2 rounded-full ${working ? "bg-indigo-500 animate-pulse" : "bg-amber-400"}`} />
+        {hasGeneric && (
+          <span className="flex items-center gap-1" title={label} aria-label={label}>
+            {act.activeCount > 0 && (
+              <span
+                className={`text-[10px] font-medium tabular-nums ${
+                  working ? "text-indigo-500 dark:text-indigo-400" : "text-amber-500 dark:text-amber-400"
+                }`}
+              >
+                {act.activeCount}
+              </span>
+            )}
+            <span className={`w-2 h-2 rounded-full ${working ? "bg-indigo-500 animate-pulse" : "bg-amber-400"}`} />
+          </span>
+        )}
       </span>
     );
   };

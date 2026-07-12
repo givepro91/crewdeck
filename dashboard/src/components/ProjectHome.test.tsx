@@ -104,12 +104,13 @@ describe("ProjectHome goal blueprint action", () => {
   });
 
   it.each([
-    ["versioned draft", null],
-    ["approved version", "approved-v1"],
-  ])("shows view for a %s and opens that goal's panel", async (_label, executionSpecVersionId) => {
+    // 미승인 draft(실행 기준 미고정)는 눈에 띄는 "Approve" CTA, 승인본은 조용한 "View Blueprint"
+    ["unapproved versioned draft", null, "Approve"],
+    ["approved version", "approved-v1", "View Blueprint"],
+  ])("shows the blueprint action for an %s and opens that goal's panel", async (_label, executionSpecVersionId, buttonName) => {
     await renderGoal({ ...baseGoal, has_spec: 1, execution_spec_version_id: executionSpecVersionId });
-    const view = screen.getByRole("button", { name: "View Blueprint" });
-    fireEvent.click(view);
+    const action = screen.getByRole("button", { name: buttonName });
+    fireEvent.click(action);
     expect(screen.getByRole("dialog").textContent).toBe("blueprint:g1");
   });
 

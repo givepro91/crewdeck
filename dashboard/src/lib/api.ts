@@ -309,7 +309,7 @@ export const api = {
   projects: {
     list: () => request<any[]>("/projects"),
     activity: () =>
-      request<Record<string, { state: "working" | "waiting"; activeCount: number }>>("/projects/activity"),
+      request<Record<string, { state: "working" | "waiting"; activeCount: number; specPending: number }>>("/projects/activity"),
     get: (id: string) => request<any>(`/projects/${id}`),
     create: (data: any) => request<any>("/projects", { method: "POST", body: JSON.stringify(data) }),
     update: (id: string, data: any) =>
