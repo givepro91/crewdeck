@@ -13,7 +13,7 @@ import { getBackend, type AgentProvider } from "../agent/adapters/backend.js";
 import { loadProviderConfig } from "../agent/provider.js";
 import { decideFailover, triedProvidersFromFailoverTrace, type FailureClass, type FailoverReasonCode } from "../agent/failover.js";
 import { selectTaskForResponse, serializeTask } from "../../api/routes/tasks.js";
-import { assertExecutionAllowed, approveSpecVersion, getSpecState } from "../goal-spec/spec-approval.js";
+import { assertExecutionAllowed, approveSpecVersion, getSpecState, SpecApprovalError } from "../goal-spec/spec-approval.js";
 import type {
   ActivityLogEntry,
   ProviderFailoverEventPayload,
@@ -717,6 +717,14 @@ export function createScheduler(
   // contend on one project-level flight.
   const goalPreparationFlights = new Map<string, string>();
   const decomposRetryCount = new Map<string, number>();
+
+  // Blueprint version ids whose autopilot auto-approval failed validation
+  // (invalid_spec). The selector skips a goal whose LATEST version is here so an
+  // un-approvable blueprint (e.g. AI produced an incomplete one) stops being
+  // re-picked every poll (busy-loop) and no longer blocks other goals. Keyed by
+  // version id, not goal id, so an edited/regenerated blueprint (new version id)
+  // is retried automatically. Bounded by the number of failed versions.
+  const autoApproveFailedVersions = new Set<string>();
 
   // 사용자가 명시적으로 정지한 큐 (stopQueue API). 자동 완료 정지(stopQueueInternal)와
   // 구분한다 — in-flight decompose 완료(processNextGoal 꼬리)가 정지된 큐를 침묵
@@ -1569,16 +1577,25 @@ export function createScheduler(
 
     if (activeGoalCount >= getEffectiveConcurrency(projectId) + 1) return; // 실행분 + 선행 1개까지 준비 완료
 
-    const nextGoal = db.prepare(`
-      SELECT g.id FROM goals g
+    // Fetch candidates in priority order with each goal's latest blueprint
+    // version, then pick the first that is NOT stalled by a failed auto-approval.
+    // Skipping an un-approvable blueprint lets a lower-priority goal be prepared
+    // instead of the whole pipeline wedging on it (autopilot auto-approve edge).
+    const candidates = db.prepare(`
+      SELECT g.id AS id,
+        (SELECT v.id FROM goal_spec_versions v WHERE v.goal_id = g.id ORDER BY v.version DESC LIMIT 1) AS latest_version_id
+      FROM goals g
       WHERE g.project_id = ?
         AND (SELECT COUNT(*) FROM tasks t WHERE t.goal_id = g.id) = 0
       ORDER BY
         CASE g.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
         g.sort_order ASC,
         g.created_at ASC
-      LIMIT 1
-    `).get(projectId) as { id: string } | undefined;
+    `).all(projectId) as { id: string; latest_version_id: string | null }[];
+
+    const nextGoal = candidates.find(
+      (c) => !(c.latest_version_id && autoApproveFailedVersions.has(c.latest_version_id)),
+    );
 
     if (nextGoal) {
       processNextGoal(projectId, nextGoal.id);
@@ -1744,7 +1761,23 @@ export function createScheduler(
               );
               broadcast("project:updated", { projectId });
             } catch (approveErr: any) {
-              log.warn(`Auto-approve spec failed for goal ${goalId}: ${approveErr.message}`);
+              // Validation failure (incomplete blueprint) is permanent until the
+              // blueprint is edited — record the version so the selector stops
+              // re-picking this goal every poll (busy-loop) and blocking others,
+              // and surface it once for manual review. Other (transient) errors
+              // are left to retry on the next poll.
+              const invalidSpec = approveErr instanceof SpecApprovalError && approveErr.code === "invalid_spec";
+              if (invalidSpec && !autoApproveFailedVersions.has(latest.id)) {
+                autoApproveFailedVersions.add(latest.id);
+                log.warn(`Auto-approve spec failed (invalid) for goal ${goalId}: ${approveErr.message}`);
+                db.prepare("INSERT INTO activities (project_id, type, message) VALUES (?, 'autopilot_warning', ?)").run(
+                  projectId,
+                  `기획서 자동 승인 실패 — 수동 검토 필요: "${goalTitle.slice(0, 60)}" (${String(approveErr.message).slice(0, 100)})`,
+                );
+                broadcast("project:updated", { projectId });
+              } else if (!invalidSpec) {
+                log.warn(`Auto-approve spec failed for goal ${goalId}: ${approveErr.message}`);
+              }
             }
           }
         }

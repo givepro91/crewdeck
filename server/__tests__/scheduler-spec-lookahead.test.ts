@@ -181,4 +181,46 @@ describe("scheduler spec/decompose lookahead", () => {
 
     scheduler2.stopQueue(projectId);
   });
+
+  it("skips a goal whose auto-approval keeps failing validation instead of wedging the pipeline", async () => {
+    // "invalid-draft": top priority, but its blueprint fails approval validation
+    // (empty scope) — autopilot auto-approve can never approve it. Before the fix
+    // the selector re-picked this zero-task goal every poll, hit the gate, and
+    // returned (busy-loop) — and no lower-priority goal was ever prepared.
+    seedGoal("invalid-draft", "critical", 0);
+    saveSpecDraft(db, "invalid-draft", {
+      scope: "",
+      out_of_scope: "",
+      acceptance_criteria: [],
+      expected_tasks: [],
+      verification_methods: [],
+    });
+    // "valid-next": lower priority, no blueprint — must still get prepared.
+    seedGoal("valid-next", "high", 1);
+
+    const generateSpec = vi.fn(async (goalId: string) => {
+      saveSpecDraft(db, goalId, {
+        scope: "s",
+        out_of_scope: "n",
+        acceptance_criteria: ["a"],
+        expected_tasks: ["t"],
+        verification_methods: ["v"],
+      });
+    });
+    scheduler.setSpecGenerator(generateSpec);
+
+    scheduler.startQueue(projectId);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    // Pipeline advanced past the un-approvable goal to prepare the valid one.
+    expect(generateSpec).toHaveBeenCalledWith("valid-next");
+    // The stuck goal was surfaced once for manual review.
+    const warned = db.prepare(
+      "SELECT COUNT(*) AS c FROM activities WHERE project_id = ? AND type = 'autopilot_warning' AND message LIKE '기획서 자동 승인 실패%'",
+    ).get(projectId) as { c: number };
+    expect(warned.c).toBeGreaterThanOrEqual(1);
+    // 'valid-next' has no failed version; 'invalid-draft' stays unapproved.
+    expect(db.prepare("SELECT execution_spec_version_id FROM goals WHERE id = 'invalid-draft'").get())
+      .toEqual({ execution_spec_version_id: null });
+  });
 });
