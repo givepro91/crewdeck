@@ -18,6 +18,14 @@ import { AgentError, detectAgentRunFailure, classifyAgentFailure } from "../../u
 import { getBackend } from "../agent/adapters/backend.js";
 import { loadProviderConfig } from "../agent/provider.js";
 import { escalateVerificationCap, issueSetSignature } from "./verification-policy.js";
+import {
+  assertExecutionAllowed,
+  beginExecutionRun,
+  failExecutionRun,
+  formatExecutionSpecContext,
+  getExecutionSpecByVersionId,
+  getTaskExecutionSpec,
+} from "../goal-spec/spec-approval.js";
 
 const log = createLogger("orchestration");
 
@@ -35,6 +43,8 @@ interface TaskRow {
   target_files: string | null;  // JSON array of paths (P2: scope anchoring)
   stack_hint: string | null;    // Short stack constraint (P2: scope anchoring)
   depends_on: string | null;    // JSON array of task IDs (DAG dependency)
+  execution_run_id: string | null;
+  execution_spec_version_id: string | null;
 }
 interface ProjectRow {
   id: string;
@@ -349,9 +359,11 @@ export type TaskExecutionClaim =
   | {
       claimed: false;
       taskId: string;
-      reason: "not_found" | "conflict";
+      reason: "not_found" | "conflict" | "spec_not_approved";
       error: string;
       status?: TaskExecutionStatus;
+      specStatus?: "missing" | "draft" | "changes_pending";
+      currentDraftVersion?: number | null;
     };
 
 export interface OrchestrationConfig {
@@ -649,9 +661,34 @@ export function saveDiscardedDiff(db: Database, taskId: string, workdir: string)
  */
 export function claimTaskForExecution(db: Database, taskId: string): TaskExecutionClaim {
   const claim = db.transaction((candidateTaskId: string): TaskExecutionClaim => {
-    const existing = db.prepare(
-      "SELECT status FROM tasks WHERE id = ?",
-    ).get(candidateTaskId) as { status: TaskExecutionStatus } | undefined;
+    const existing = db.prepare(`
+      SELECT
+        task.status,
+        task.goal_id,
+        task.execution_run_id,
+        task.execution_spec_version_id,
+        goal.active_execution_run_id,
+        goal.execution_spec_version_id AS goal_execution_spec_version_id,
+        run.id AS joined_execution_run_id,
+        run.status AS execution_run_status,
+        run.execution_spec_version_id AS run_execution_spec_version_id
+      FROM tasks AS task
+      JOIN goals AS goal ON goal.id = task.goal_id
+      LEFT JOIN goal_execution_runs AS run
+        ON run.id = task.execution_run_id
+       AND run.goal_id = task.goal_id
+      WHERE task.id = ?
+    `).get(candidateTaskId) as {
+      status: TaskExecutionStatus;
+      goal_id: string;
+      execution_run_id: string | null;
+      execution_spec_version_id: string | null;
+      active_execution_run_id: string | null;
+      goal_execution_spec_version_id: string | null;
+      joined_execution_run_id: string | null;
+      execution_run_status: "active" | "completed" | "failed" | null;
+      run_execution_spec_version_id: string | null;
+    } | undefined;
     if (!existing) {
       return {
         claimed: false,
@@ -659,6 +696,72 @@ export function claimTaskForExecution(db: Database, taskId: string): TaskExecuti
         reason: "not_found",
         error: "Task not found",
       };
+    }
+
+    if (existing.status === "todo" || existing.status === "pending_approval") {
+      // A task already owned by a previous run must never be silently reused by a
+      // newer approved spec. Re-decomposition creates fresh tasks for the new run.
+      // Without this guard beginExecutionRun() would pin v2 while implementation
+      // and verification still read the stale task's v1 snapshot.
+      if (existing.execution_run_id && existing.execution_run_id !== existing.active_execution_run_id) {
+        return {
+          claimed: false,
+          taskId: candidateTaskId,
+          reason: "conflict",
+          error: "Task belongs to a previous execution run and must be re-decomposed",
+          status: existing.status,
+        };
+      }
+      if (
+        existing.execution_run_id
+        && (!existing.joined_execution_run_id || existing.execution_run_status !== "active")
+      ) {
+        return {
+          claimed: false,
+          taskId: candidateTaskId,
+          reason: "conflict",
+          error: "Task execution run is missing or inactive and must be re-decomposed",
+          status: existing.status,
+        };
+      }
+      if (
+        existing.execution_run_id
+        && existing.execution_spec_version_id !== existing.run_execution_spec_version_id
+      ) {
+        return {
+          claimed: false,
+          taskId: candidateTaskId,
+          reason: "conflict",
+          error: "Task spec version differs from its execution run and must be re-decomposed",
+          status: existing.status,
+        };
+      }
+      if (
+        existing.execution_spec_version_id
+        && existing.goal_execution_spec_version_id
+        && existing.execution_spec_version_id !== existing.goal_execution_spec_version_id
+      ) {
+        return {
+          claimed: false,
+          taskId: candidateTaskId,
+          reason: "conflict",
+          error: "Task spec version differs from the approved execution version and must be re-decomposed",
+          status: existing.status,
+        };
+      }
+
+      const executionGate = assertExecutionAllowed(db, existing.goal_id, candidateTaskId);
+      if (!executionGate.allowed) {
+        return {
+          claimed: false,
+          taskId: candidateTaskId,
+          reason: executionGate.reason,
+          error: executionGate.message,
+          status: existing.status,
+          specStatus: executionGate.specStatus,
+          currentDraftVersion: executionGate.currentDraftVersion,
+        };
+      }
     }
 
     const updated = db.prepare(`
@@ -706,6 +809,7 @@ export function claimTaskForExecution(db: Database, taskId: string): TaskExecuti
     `).run(candidateTaskId);
 
     if (updated.changes === 1) {
+      beginExecutionRun(db, existing.goal_id);
       return { claimed: true, taskId: candidateTaskId };
     }
 
@@ -990,7 +1094,7 @@ export function createOrchestrationEngine(
             }
           })());
           try {
-            const archSession = sessionManager.spawnAgent(ctoAgent.id, effectiveWorkdir, archSessionKey);
+            const archSession = sessionManager.spawnAgent(ctoAgent.id, effectiveWorkdir, archSessionKey, taskId);
             // Mirror the listeners we attach to the impl session so that
             // architect-phase rate-limits and stream errors also surface to
             // the dashboard (previously they only showed up as an extra
@@ -1248,10 +1352,12 @@ introduce a different framework / language / build tool to solve this task.` : "
         // (기존에는 autoFix 경로에만 있어, blocked→재시도가 같은 이슈를 백지에서 재발견했다)
         const priorFailureContext = buildFailureHistoryContext(db, task.id);
 
+        const executionSpecContext = formatExecutionSpecContext(getTaskExecutionSpec(db, task.id));
         const implementationPrompt = `
 # Task: ${task.title}
 
 ${task.description}
+${executionSpecContext}
 ${previousTaskContext}${priorFailureContext ? `${priorFailureContext}\n\nThe issues above caused previous attempts of THIS task to fail verification.\nThe workspace was restored to its pre-task state, so your implementation must\nsolve the task AND avoid re-introducing every issue listed above.\n` : ""}${scopeAnchor}${architectContext ? `\n## Architecture Design\n${architectContext}\n` : ""}
 ## Crewdeck Auto-Apply Rules
 ${autoApplyRules || "Follow clean code conventions and existing patterns."}
@@ -1556,6 +1662,7 @@ When complete, provide a summary of changes made.
               .join("\n\n---\n\n");
             const fixPrompt = `
 # Fix Required (Smart Resume — round ${round}/${effectiveMaxRounds})
+${executionSpecContext}
 ${failureContext}
 
 ${structuredFixPrompts || `The following issues were found during verification:
@@ -1976,12 +2083,16 @@ Fix ONLY these issues. Do not modify other code.
       }
 
       inflightDecompose.add(goalId);
+      let executionRun: ReturnType<typeof beginExecutionRun> = null;
       try {
 
       const goal = db.prepare("SELECT * FROM goals WHERE id = ?").get(goalId) as GoalRow | undefined;
       if (!goal) {
         throw new Error(`Goal ${goalId} not found`);
       }
+      const executionGate = assertExecutionAllowed(db, goal.id);
+      if (!executionGate.allowed) throw new Error(executionGate.message);
+      executionRun = beginExecutionRun(db, goal.id, "decompose");
 
       // H-3: tasks INSERT 전에 미리 goal_model='goal_as_unit' 설정.
       //      tasks INSERT 이후 승격 시 scheduler 가 그 사이에 legacy 경로로 태스크를 pick 할 수 있음.
@@ -2012,7 +2123,18 @@ Fix ONLY these issues. Do not modify other code.
       const decomposeSessionKey = `decompose-${goal.id}`;
       let session;
       try {
-        session = sessionManager.spawnAgent(agent.id, project?.workdir || process.cwd(), decomposeSessionKey);
+        session = sessionManager.spawnAgent(
+          agent.id,
+          project?.workdir || process.cwd(),
+          decomposeSessionKey,
+          null,
+          executionRun
+            ? {
+                executionRunId: executionRun.id,
+                executionSpecVersionId: executionRun.executionSpecVersionId,
+              }
+            : undefined,
+        );
       } catch (err: any) {
         throw new Error(`Failed to spawn agent for decomposition: ${err.message}`);
       }
@@ -2045,35 +2167,8 @@ Fix ONLY these issues. Do not modify other code.
       ).all(goal.project_id) as { name: string; role: string }[];
       const roleList = availableAgents.map((a) => `"${a.role}" (${a.name})`).join(", ");
 
-      // Check if goal has a structured spec for richer context
-      const goalSpec = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goal.id) as any;
-      let specContext = "";
-      if (goalSpec) {
-        try {
-          const prd = JSON.parse(goalSpec.prd_summary || "{}");
-          const features = JSON.parse(goalSpec.feature_specs || "[]");
-          const flow = JSON.parse(goalSpec.user_flow || "[]");
-          const criteria = JSON.parse(goalSpec.acceptance_criteria || "[]");
-          const tech = JSON.parse(goalSpec.tech_considerations || "[]");
-
-          // Compact spec: name+priority only (no description), max 5 criteria to minimize token usage
-          const featureList = features.slice(0, 8).map((f: any) => `- [${f.priority}] ${f.name}`).join("\n");
-          const criteriaList = criteria.slice(0, 5).map((c: string) => `- ${c}`).join("\n");
-
-          specContext = `
-
-## Spec Summary
-**Objective**: ${(prd.objective || "N/A").slice(0, 120)}
-**Scope**: ${(prd.scope || "N/A").slice(0, 120)}
-
-### Features (${features.length})
-${featureList}
-
-### Acceptance Criteria
-${criteriaList}
-`;
-        } catch { /* ignore parse errors, use basic prompt */ }
-      }
+      const executionSpec = getExecutionSpecByVersionId(db, executionRun?.executionSpecVersionId);
+      const specContext = formatExecutionSpecContext(executionSpec);
 
       // Project tech stack context — helps the decomposer fill stack_hint and
       // pick plausible target_files. Without this the decomposer has no idea
@@ -2105,7 +2200,7 @@ Rules:
 - Set "priority": "critical" | "high" | "medium" | "low" based on importance and dependency
 - Set "order": sequential number (1, 2, 3...) reflecting execution order — tasks with dependencies on others must have a higher number
 - Set "depends_on": array of order numbers that MUST complete before this task starts. Use [] for tasks with no dependencies. Example: a QA task after tasks 1,2,3 should have "depends_on": [1,2,3]. Independent tasks (e.g. parallel content generation) each get [].
-- Verification/review/QA tasks should always have the highest order number (run last)${goalSpec ? "\n- Reference the structured spec above to ensure complete coverage of all features and acceptance criteria" : ""}
+- Verification/review/QA tasks should always have the highest order number (run last)${executionSpec ? "\n- Reference the approved blueprint above to ensure complete coverage of its expected tasks, acceptance criteria, and verification methods" : ""}
 - Set "type": task type — determines verification criteria applied
   - "code": source code implementation (default, 5-dimension verification)
   - "content": documentation / copywriting / i18n (3-dimension: Completeness, Consistency, Clarity)
@@ -2354,13 +2449,19 @@ Respond in this EXACT JSON format:
           // Sprint 5: tasks created from decomposition start as pending_approval
           // so the user can review the plan before execution begins
           const row = db.prepare(`
-            INSERT INTO tasks (goal_id, project_id, title, description, assignee_id, status, priority, sort_order, target_files, stack_hint, task_type)
-            VALUES (?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?, ?)
+            INSERT INTO tasks (
+              goal_id, project_id, title, description, assignee_id, status, priority,
+              sort_order, target_files, stack_hint, task_type,
+              execution_run_id, execution_spec_version_id
+            )
+            VALUES (?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
           `).get(
             goal.id, goal.project_id, title, description, agent?.id ?? null,
             priority, sortOrder,
             JSON.stringify(targetFiles), stackHint, taskType,
+            executionRun?.id ?? null,
+            executionRun?.executionSpecVersionId ?? null,
           ) as { id: string } | undefined;
 
           if (row) {
@@ -2425,6 +2526,10 @@ Respond in this EXACT JSON format:
           log.info(`Goal ${goal.id} upgraded to goal_as_unit model`);
         }
 
+        if (created === 0) {
+          throw new Error("Goal decomposition produced no valid tasks");
+        }
+
         log.info(`Created ${created} tasks from goal decomposition`);
         db.prepare(
           "INSERT INTO activities (project_id, agent_id, type, message) VALUES (?, ?, 'decompose_completed', ?)",
@@ -2456,6 +2561,9 @@ Respond in this EXACT JSON format:
         ).run(agent.id);
       }
 
+      } catch (err) {
+        if (executionRun) failExecutionRun(db, goalId, executionRun.id);
+        throw err;
       } finally {
         // Single cleanup point: ensure inflightDecompose is ALWAYS released,
         // whether the inner try-catch-finally ran or an early throw occurred
@@ -2599,7 +2707,7 @@ Respond in this EXACT JSON format:
         for (const { g, index } of entries) {
           const priority = VALID_PRIORITIES.includes(g.priority) ? g.priority : "medium";
           const row = db.prepare(
-            "INSERT INTO goals (project_id, title, description, priority, sort_order, goal_model) VALUES (?, ?, ?, ?, ?, 'goal_as_unit') RETURNING id",
+            "INSERT INTO goals (project_id, title, description, priority, sort_order, goal_model, spec_approval_required) VALUES (?, ?, ?, ?, ?, 'goal_as_unit', 1) RETURNING id",
           ).get(projectId, (g.title ?? g.description).slice(0, 100), g.description.slice(0, 500), priority, sortOrderBase + index) as { id: string };
           ids.push(row.id);
         }

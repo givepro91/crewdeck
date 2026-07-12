@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
@@ -22,6 +22,12 @@ import { runAcceptanceScript } from "../../core/orchestration/engine.js";
 import { removeWorktree, dropCheckpoint } from "../../core/project/worktree.js";
 import { MAX_TITLE_LEN, MAX_DESC_LEN } from "../../utils/constants.js";
 import type { GoalE2EActivityEvent, GoalE2EStatus, GoalE2EStatusResponse } from "../../../shared/types.js";
+import {
+  approveSpecVersion,
+  getSpecState,
+  saveSpecDraft,
+  SpecApprovalError,
+} from "../../core/goal-spec/spec-approval.js";
 
 /** 아티팩트 서빙 경로 안전화: 화이트리스트 basename만, dir 밖 이탈 차단. 안전하면 절대경로, 아니면 null. */
 export function resolveArtifactPath(dir: string, name: string): string | null {
@@ -278,7 +284,9 @@ export function createGoalRoutes(ctx: AppContext): Router {
 
     const goals = db.prepare(
       `SELECT g.*,
-        CASE WHEN gs.id IS NOT NULL THEN 1 ELSE 0 END AS has_spec,
+        CASE WHEN gs.id IS NOT NULL OR g.execution_spec_version_id IS NOT NULL OR EXISTS (
+          SELECT 1 FROM goal_spec_versions version WHERE version.goal_id = g.id
+        ) THEN 1 ELSE 0 END AS has_spec,
         gs.prd_summary AS _raw_prd
        FROM goals g LEFT JOIN goal_specs gs ON g.id = gs.goal_id
        WHERE g.project_id = ? ORDER BY g.priority, g.created_at LIMIT ?`,
@@ -685,7 +693,7 @@ export function createGoalRoutes(ctx: AppContext): Router {
       const sourceMaterialVal = typeof source_material === "string" ? (source_material.slice(0, 20000) || null) : null;
 
       const result = db.prepare(
-        "INSERT INTO goals (project_id, title, description, priority, \"references\", sort_order, skip_adversarial, acceptance_script, source_material) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO goals (project_id, title, description, priority, \"references\", sort_order, skip_adversarial, acceptance_script, source_material, spec_approval_required) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
       ).run(project_id, goalTitle, goalDescription, priority, goalRefs, sortOrder, skipAdversarialVal, acceptanceVal, sourceMaterialVal);
 
       const goal = db.prepare("SELECT * FROM goals WHERE rowid = ?").get(result.lastInsertRowid) as any;
@@ -979,65 +987,81 @@ ${focusRules}
 
   // ─── Goal Spec endpoints ───────────────────────────────
 
-  // Get spec for a goal
-  router.get("/:id/spec", (req, res) => {
-    const spec = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(req.params.id) as any;
-    if (!spec) return res.status(404).json({ error: "Spec not found for this goal" });
-    res.json({
-      id: spec.id,
-      goal_id: spec.goal_id,
-      prd_summary: JSON.parse(spec.prd_summary || "{}"),
-      feature_specs: JSON.parse(spec.feature_specs || "[]"),
-      user_flow: JSON.parse(spec.user_flow || "[]"),
-      acceptance_criteria: JSON.parse(spec.acceptance_criteria || "[]"),
-      tech_considerations: JSON.parse(spec.tech_considerations || "[]"),
-      generated_by: spec.generated_by,
-      version: spec.version,
-      created_at: spec.created_at,
-      updated_at: spec.updated_at,
+  const sendSpecError = (res: Response, error: unknown) => {
+    if (!(error instanceof SpecApprovalError)) throw error;
+    const status = error.code === "goal_not_found" || error.code === "version_not_found"
+      ? 404
+      : error.code === "stale_version"
+        ? 409
+        : 400;
+    return res.status(status).json({
+      error: error.code,
+      message: error.message,
+      ...(error.location ? { location: error.location } : {}),
     });
+  };
+
+  const broadcastSpecUpdate = (goalId: string) => {
+    const goal = db.prepare("SELECT project_id FROM goals WHERE id = ?").get(goalId) as { project_id: string } | undefined;
+    if (goal) broadcast("project:updated", { projectId: goal.project_id });
+  };
+
+  // All three endpoints return the same version-history state representation.
+  router.get("/:goalId/spec", (req, res) => {
+    try {
+      res.json(getSpecState(db, req.params.goalId));
+    } catch (error) {
+      sendSpecError(res, error);
+    }
+  });
+
+  router.post("/:goalId/spec", (req, res) => {
+    try {
+      saveSpecDraft(db, req.params.goalId, req.body ?? {});
+      const state = getSpecState(db, req.params.goalId);
+      broadcastSpecUpdate(req.params.goalId);
+      res.status(201).json(state);
+    } catch (error) {
+      sendSpecError(res, error);
+    }
+  });
+
+  router.post("/:goalId/spec/approve", (req, res) => {
+    try {
+      if (typeof req.body?.version_id !== "string" || req.body.version_id.trim() === "") {
+        throw new SpecApprovalError("invalid_spec", "version_id is required", "version_id");
+      }
+      approveSpecVersion(db, req.params.goalId, req.body.version_id);
+      const state = getSpecState(db, req.params.goalId);
+      const goal = db.prepare("SELECT project_id FROM goals WHERE id = ?").get(req.params.goalId) as { project_id: string } | undefined;
+      broadcastSpecUpdate(req.params.goalId);
+      res.json(state);
+      if (goal) ctx.scheduler?.notifyGoalReady(goal.project_id);
+    } catch (error) {
+      sendSpecError(res, error);
+    }
   });
 
   // Update spec manually
   router.patch("/:id/spec", (req, res) => {
     const goalId = req.params.id;
-    const existing = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
-    if (!existing) return res.status(404).json({ error: "Spec not found" });
-
-    const { prd_summary, feature_specs, user_flow, acceptance_criteria, tech_considerations } = req.body;
-
     try {
-      db.prepare(`
-        UPDATE goal_specs SET
-          prd_summary = COALESCE(?, prd_summary),
-          feature_specs = COALESCE(?, feature_specs),
-          user_flow = COALESCE(?, user_flow),
-          acceptance_criteria = COALESCE(?, acceptance_criteria),
-          tech_considerations = COALESCE(?, tech_considerations),
-          generated_by = 'manual',
-          version = version + 1,
-          updated_at = datetime('now')
-        WHERE goal_id = ?
-      `).run(
-        prd_summary ? JSON.stringify(prd_summary) : null,
-        feature_specs ? JSON.stringify(feature_specs) : null,
-        user_flow ? JSON.stringify(user_flow) : null,
-        acceptance_criteria ? JSON.stringify(acceptance_criteria) : null,
-        tech_considerations ? JSON.stringify(tech_considerations) : null,
-        goalId,
-      );
+      const state = getSpecState(db, goalId);
+      const latest = state.versions.at(-1);
+      if (!latest) return res.status(404).json({ error: "version_not_found", message: "Spec version not found for this goal" });
 
-      const updated = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
-      res.json({
-        ...updated,
-        prd_summary: JSON.parse(updated.prd_summary),
-        feature_specs: JSON.parse(updated.feature_specs),
-        user_flow: JSON.parse(updated.user_flow),
-        acceptance_criteria: JSON.parse(updated.acceptance_criteria),
-        tech_considerations: JSON.parse(updated.tech_considerations),
+      saveSpecDraft(db, goalId, {
+        scope: req.body?.scope ?? req.body?.prd_summary?.scope ?? latest.scope,
+        out_of_scope: req.body?.out_of_scope ?? latest.out_of_scope,
+        acceptance_criteria: req.body?.acceptance_criteria ?? latest.acceptance_criteria,
+        expected_tasks: req.body?.expected_tasks ?? latest.expected_tasks,
+        verification_methods: req.body?.verification_methods ?? latest.verification_methods,
       });
-    } catch (err: any) {
-      res.status(400).json({ error: err.message });
+      const updated = getSpecState(db, goalId);
+      broadcastSpecUpdate(goalId);
+      res.json(updated);
+    } catch (error) {
+      sendSpecError(res, error);
     }
   });
 
@@ -1053,8 +1077,22 @@ ${focusRules}
       return res.status(503).json({ error: "Orchestration engine not ready" });
     }
 
+    // Reject a concurrent generation. A single legacy sentinel row can't track
+    // two in-flight jobs: if a second generate ran, the first's completion would
+    // flip generation_status to idle while the second is still running, so
+    // pollers stop early and the late job overwrites (or reverts) the result.
+    const existing = db.prepare("SELECT id, prd_summary FROM goal_specs WHERE goal_id = ?").get(goalId) as
+      | { id: string; prd_summary: string }
+      | undefined;
+    if (existing) {
+      let alreadyGenerating = false;
+      try { alreadyGenerating = JSON.parse(existing.prd_summary)?._status === "generating"; } catch { /* not a sentinel */ }
+      if (alreadyGenerating) {
+        return res.status(409).json({ error: "Spec generation already in progress", goalId });
+      }
+    }
+
     // Mark as generating (client can check this)
-    const existing = db.prepare("SELECT id FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
     if (!existing) {
       db.prepare(
         "INSERT INTO goal_specs (goal_id, prd_summary, feature_specs, user_flow, acceptance_criteria, tech_considerations, generated_by) VALUES (?, '{\"_status\":\"generating\"}', '[]', '[]', '[]', '[]', 'ai')"
@@ -1099,11 +1137,11 @@ ${focusRules}
       return res.status(400).json({ error: "prompt is required" });
     }
 
-    const specRow = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
-    if (!specRow) return res.status(404).json({ error: "No spec to refine — generate one first" });
-
     const goal = db.prepare("SELECT * FROM goals WHERE id = ?").get(goalId) as any;
     if (!goal) return res.status(404).json({ error: "Goal not found" });
+
+    const currentSpec = getSpecState(db, goalId).versions.at(-1);
+    if (!currentSpec) return res.status(404).json({ error: "No spec to refine — generate one first" });
 
     if (!ctx.generateGoalSpec) {
       return res.status(503).json({ error: "Orchestration engine not ready" });
@@ -1115,7 +1153,7 @@ ${focusRules}
     }
 
     try {
-      const result = await (ctx as any).refineGoalSpec(goalId, prompt);
+      const result = await (ctx as any).refineGoalSpec(goalId, prompt, currentSpec);
       res.json(result);
     } catch (err: any) {
       log.error(`Failed to refine spec for goal ${goalId}`, err);

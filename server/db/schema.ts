@@ -538,6 +538,207 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE goals ADD COLUMN source_material TEXT");
   }
 
+  // 실행 전 Goal Spec 승인 게이트 (immutable version snapshots).
+  // execution_spec_version_id: 승인 시 고정되는 실행 기준 version(goal_spec_versions.id).
+  //   null = 미승인. 모든 실행 단계가 이 동일 snapshot 을 참조한다.
+  // spec_approval_required: opt-in marker. 새 승인 워크플로(POST /spec-versions)를 거친
+  //   goal 만 1 이 되어 게이트 적용을 받는다. 기존/legacy goal(0)은 게이트 무조건 통과.
+  if (!goalColsLate.some((c) => c.name === "execution_spec_version_id")) {
+    db.exec("ALTER TABLE goals ADD COLUMN execution_spec_version_id TEXT");
+  }
+  if (!goalColsLate.some((c) => c.name === "spec_approval_required")) {
+    db.exec("ALTER TABLE goals ADD COLUMN spec_approval_required INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!goalColsLate.some((c) => c.name === "active_execution_run_id")) {
+    db.exec("ALTER TABLE goals ADD COLUMN active_execution_run_id TEXT");
+  }
+  if (!goalColsLate.some((c) => c.name === "pending_execution_spec_version_id")) {
+    db.exec("ALTER TABLE goals ADD COLUMN pending_execution_spec_version_id TEXT");
+  }
+
+  const taskRunCols = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
+  if (!taskRunCols.some((c) => c.name === "execution_run_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN execution_run_id TEXT");
+  }
+  if (!taskRunCols.some((c) => c.name === "execution_spec_version_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN execution_spec_version_id TEXT");
+  }
+  const sessionRunCols = db.prepare("PRAGMA table_info(sessions)").all() as { name: string }[];
+  if (!sessionRunCols.some((c) => c.name === "execution_run_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN execution_run_id TEXT");
+  }
+  if (!sessionRunCols.some((c) => c.name === "execution_spec_version_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN execution_spec_version_id TEXT");
+  }
+
+  // Run FK와 trigger가 참조하기 전에 version 저장소를 먼저 보장한다.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS goal_spec_versions (
+      id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+      goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      scope TEXT NOT NULL DEFAULT '',
+      out_of_scope TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      expected_tasks TEXT NOT NULL DEFAULT '[]',
+      verification_methods TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'approved')),
+      approved_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (goal_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_goal_spec_versions_goal ON goal_spec_versions(goal_id);
+  `);
+
+  // 실행 snapshot은 goal의 가변 승인 포인터와 분리해 영구 보존한다. decompose 시작 시
+  // 한 row를 만들고, 이후 task/session은 이 row와 version id를 직접 기록한다.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS goal_execution_runs (
+      id TEXT PRIMARY KEY,
+      goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+      execution_spec_version_id TEXT NOT NULL REFERENCES goal_spec_versions(id),
+      source TEXT NOT NULL DEFAULT 'claim' CHECK (source IN ('claim', 'decompose')),
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'failed')),
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      ended_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_goal_execution_runs_goal
+      ON goal_execution_runs(goal_id, started_at);
+
+    -- 이전 빌드가 active_execution_run_id만 남긴 채 재시작된 경우에도 진행 중 run의
+    -- 승인본을 복원한다. 종료된 과거 run은 당시 version을 추론하지 않는다.
+    INSERT OR IGNORE INTO goal_execution_runs (id, goal_id, execution_spec_version_id)
+    SELECT active_execution_run_id, id, execution_spec_version_id
+    FROM goals
+    WHERE active_execution_run_id IS NOT NULL
+      AND execution_spec_version_id IS NOT NULL;
+
+    UPDATE tasks
+    SET execution_spec_version_id = (
+      SELECT execution_spec_version_id
+      FROM goal_execution_runs
+      WHERE id = tasks.execution_run_id
+    )
+    WHERE execution_spec_version_id IS NULL
+      AND execution_run_id IS NOT NULL;
+
+    UPDATE sessions
+    SET execution_run_id = (
+          SELECT execution_run_id FROM tasks WHERE id = sessions.task_id
+        ),
+        execution_spec_version_id = (
+          SELECT execution_spec_version_id FROM tasks WHERE id = sessions.task_id
+        )
+    WHERE task_id IS NOT NULL
+      AND execution_spec_version_id IS NULL;
+  `);
+  const executionRunCols = db.prepare("PRAGMA table_info(goal_execution_runs)").all() as { name: string }[];
+  if (!executionRunCols.some((column) => column.name === "source")) {
+    db.exec("ALTER TABLE goal_execution_runs ADD COLUMN source TEXT NOT NULL DEFAULT 'claim'");
+  }
+  // tasks_close_execution_run 은 pending 승인본 승계 로직도 담당하므로 기존 DB의
+  // 이전 trigger 정의를 반드시 교체한다(CREATE IF NOT EXISTS 만으로는 갱신되지 않음).
+  db.exec("DROP TRIGGER IF EXISTS tasks_inherit_active_execution_run");
+  db.exec("DROP TRIGGER IF EXISTS tasks_close_execution_run");
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS tasks_inherit_active_execution_run
+    AFTER INSERT ON tasks
+    WHEN NEW.execution_run_id IS NULL
+    BEGIN
+      UPDATE tasks
+      SET execution_run_id = (SELECT active_execution_run_id FROM goals WHERE id = NEW.goal_id),
+          execution_spec_version_id = (
+            SELECT run.execution_spec_version_id
+            FROM goal_execution_runs AS run
+            JOIN goals AS goal ON goal.active_execution_run_id = run.id
+            WHERE goal.id = NEW.goal_id
+          )
+      WHERE id = NEW.id;
+    END;
+
+    -- run 종료는 모든 run task 가 'done' 일 때만. 'blocked' 는 종결이 아니다 —
+    -- scheduler 의 retryBlockedTasks 가 retry/reassign budget 이 남은 blocked task 를
+    -- 다시 todo 로 되돌리기 때문이다. blocked 를 종료로 취급하면 실행 중 일시적으로
+    -- blocked 된 유일한 task 가 run 을 조기 종료시켜, 재시도된 동일 task 가 실행 중
+    -- 저장한 미승인 draft 의 changes_pending 게이트에 막힌다(승인 후 수정이 기존
+    -- 실행에 영향을 주면 안 된다는 요구 위반). budget 소진된 영구 blocked 는
+    -- autoResolvePermanentlyBlocked 가 done 으로 승격하므로 이 trigger 로 정상 종료된다.
+    CREATE TRIGGER IF NOT EXISTS tasks_close_execution_run
+    AFTER UPDATE OF status ON tasks
+    WHEN NEW.execution_run_id IS NOT NULL
+      AND NEW.status = 'done'
+      AND (
+        (SELECT source FROM goal_execution_runs WHERE id = NEW.execution_run_id) = 'claim'
+        OR NEW.id = (SELECT qa_regression_task_id FROM goals WHERE id = NEW.goal_id)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM tasks
+        WHERE goal_id = NEW.goal_id
+          AND execution_run_id = NEW.execution_run_id
+          AND status != 'done'
+      )
+    BEGIN
+      UPDATE goal_execution_runs
+      SET status = 'completed', ended_at = datetime('now')
+      WHERE id = NEW.execution_run_id AND status = 'active';
+
+      UPDATE goals
+      SET execution_spec_version_id = CASE
+            WHEN pending_execution_spec_version_id IS NOT NULL
+              AND pending_execution_spec_version_id = (
+                SELECT id FROM goal_spec_versions
+                WHERE goal_id = NEW.goal_id
+                ORDER BY version DESC
+                LIMIT 1
+              )
+              AND EXISTS (
+                SELECT 1 FROM goal_spec_versions
+                WHERE id = pending_execution_spec_version_id
+                  AND goal_id = NEW.goal_id
+                  AND status = 'approved'
+              )
+            THEN pending_execution_spec_version_id
+            ELSE execution_spec_version_id
+          END,
+          pending_execution_spec_version_id = NULL,
+          active_execution_run_id = NULL
+      WHERE id = NEW.goal_id
+        AND active_execution_run_id = NEW.execution_run_id;
+    END;
+  `);
+
+  // Goal Spec Versions — 실행 전 승인 게이트의 immutable snapshot 저장소.
+  // 저장(POST)은 기존 row 를 수정하지 않고 매번 새 version row 를 만든다. 승인은
+  // 한 row 를 goal 의 execution_spec_version_id 로 고정해, 분해·구현·검증이 정확히
+  // 같은 승인본을 참조하게 한다. UNIQUE(goal_id, version) 로 버전 충돌을 막는다.
+  const specVersionCols = db.prepare("PRAGMA table_info(goal_spec_versions)").all() as { name: string }[];
+  for (const [name, definition] of [
+    ["scope", "TEXT NOT NULL DEFAULT ''"],
+    ["out_of_scope", "TEXT NOT NULL DEFAULT ''"],
+    ["expected_tasks", "TEXT NOT NULL DEFAULT '[]'"],
+    ["verification_methods", "TEXT NOT NULL DEFAULT '[]'"],
+  ] as const) {
+    if (!specVersionCols.some((column) => column.name === name)) {
+      db.exec(`ALTER TABLE goal_spec_versions ADD COLUMN ${name} ${definition}`);
+    }
+  }
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS prevent_approved_goal_spec_update
+    BEFORE UPDATE ON goal_spec_versions
+    WHEN OLD.status = 'approved'
+    BEGIN
+      SELECT RAISE(ABORT, 'approved goal spec versions are immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS prevent_approved_goal_spec_delete
+    BEFORE DELETE ON goal_spec_versions
+    WHEN OLD.status = 'approved'
+      AND EXISTS (SELECT 1 FROM goals WHERE id = OLD.goal_id)
+    BEGIN
+      SELECT RAISE(ABORT, 'approved goal spec versions are immutable');
+    END;
+  `);
+
   // base_branch on projects — 기본값 'main', develop/master 등 지원
   const projectColsLate = db.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
   if (!projectColsLate.some((c) => c.name === "base_branch")) {

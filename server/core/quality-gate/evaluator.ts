@@ -18,6 +18,7 @@ import type {
   VerificationIssue,
   VerificationTerminationReason,
 } from "../../../shared/types.js";
+import { formatExecutionSpecContext, getTaskExecutionSpec } from "../goal-spec/spec-approval.js";
 
 const log = createLogger("quality-gate");
 
@@ -147,8 +148,9 @@ export function createQualityGate(
       const priorFails = db.prepare(
         "SELECT issues, created_at FROM verifications WHERE task_id = ? AND verdict = 'fail' ORDER BY created_at DESC LIMIT 3",
       ).all(taskId) as { issues: string; created_at: string }[];
+      const executionSpecContext = formatExecutionSpecContext(getTaskExecutionSpec(db, taskId));
       const evaluationPrompt =
-        buildEvaluationPrompt(task, project, opts.scope, diffSummary) + buildReverifyContext(priorFails);
+        buildEvaluationPrompt(task, project, opts.scope, diffSummary) + executionSpecContext + buildReverifyContext(priorFails);
 
       // Spawn independent Evaluator session (NOT the Generator session)
       // This is the core Generator-Evaluator separation.
@@ -350,6 +352,7 @@ export function createQualityGate(
           evaluatorAgent.id,
           evalWorkdir,
           evaluatorId,
+          taskId,
         );
 
         // Surface the review activity on the evaluator agent so the UI can

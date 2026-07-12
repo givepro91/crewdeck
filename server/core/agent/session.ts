@@ -15,7 +15,13 @@ const log = createLogger("session-manager");
 export interface SessionManager {
   /** Spawn a session. sessionKey defaults to agentId; use a unique key for concurrent sessions on the same agent.
    *  taskId stamps sessions.task_id so failover redispatch backfill can correlate the session to its task. */
-  spawnAgent: (agentId: string, projectWorkdir: string, sessionKey?: string, taskId?: string | null) => AgentSession;
+  spawnAgent: (
+    agentId: string,
+    projectWorkdir: string,
+    sessionKey?: string,
+    taskId?: string | null,
+    executionContext?: ExecutionSessionContext,
+  ) => AgentSession;
   getSession: (agentId: string) => AgentSession | undefined;
   getSessionRecord: (sessionKey: string) => SessionRecord | undefined;
   killSession: (agentId: string) => void;
@@ -25,6 +31,11 @@ export interface SessionManager {
   /** failover: 다음 spawn(sessionKey)이 강제로 이 provider를 쓰도록 override 설정 */
   setProviderOverride: (sessionKey: string, provider: AgentProvider) => void;
   clearProviderOverride: (sessionKey: string) => void;
+}
+
+export interface ExecutionSessionContext {
+  executionRunId: string;
+  executionSpecVersionId: string;
 }
 
 export interface SessionRecord {
@@ -50,7 +61,13 @@ export function createSessionManager(db: Database): SessionManager {
   const providerOverrides = new Map<string, AgentProvider>();
 
   return {
-    spawnAgent(agentId: string, projectWorkdir: string, sessionKey?: string, taskId?: string | null): AgentSession {
+    spawnAgent(
+      agentId: string,
+      projectWorkdir: string,
+      sessionKey?: string,
+      taskId?: string | null,
+      executionContext?: ExecutionSessionContext,
+    ): AgentSession {
       const key = sessionKey ?? agentId;
 
       // Cleanup existing session for this key (memory map + DB)
@@ -167,19 +184,52 @@ export function createSessionManager(db: Database): SessionManager {
         provider,
       });
 
+      const taskExecutionContext = taskId
+        ? db.prepare(`
+            SELECT
+              task.execution_run_id,
+              run.execution_spec_version_id
+            FROM tasks AS task
+            LEFT JOIN goal_execution_runs AS run
+              ON run.id = task.execution_run_id
+             AND run.goal_id = task.goal_id
+            WHERE task.id = ?
+          `).get(taskId) as {
+            execution_run_id: string | null;
+            execution_spec_version_id: string | null;
+          } | undefined
+        : undefined;
+      // task session은 호출자가 넘긴 복사본보다 task→run JOIN 결과가
+      // authoritative하다. executionContext는 task가 없는 decompose session에만 쓴다.
+      const executionRunId = taskId
+        ? taskExecutionContext?.execution_run_id ?? null
+        : executionContext?.executionRunId ?? null;
+      const executionSpecVersionId = taskId
+        ? taskExecutionContext?.execution_spec_version_id ?? null
+        : executionContext?.executionSpecVersionId ?? null;
+
       // Track session in DB — use RETURNING to get session row id for PID update
       const sessionRow = db
         .prepare(`
           INSERT INTO sessions (
             agent_id, status, provider,
-            provider_trace_resolved_provider, provider_trace_resolution_source, task_id
-          ) VALUES (?, 'active', ?, ?, ?, ?) RETURNING id
+            provider_trace_resolved_provider, provider_trace_resolution_source, task_id,
+            execution_run_id, execution_spec_version_id
+          ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?) RETURNING id
         `)
         // resolved_provider = 실제로 실행된 provider(failover override 반영). 기본 해석과
         // override가 갈릴 때 sessions.provider와 provider_trace_resolved_provider가 어긋나지
         // 않도록 override를 포함한 `provider`를 기록한다.
         // task_id: 이 세션이 실행하는 task — failover 재디스패치 backfill의 세션↔task 귀속에 쓴다.
-        .get(agentId, provider, provider, providerResolution.source, taskId ?? null) as { id: string };
+        .get(
+          agentId,
+          provider,
+          provider,
+          providerResolution.source,
+          taskId ?? null,
+          executionRunId,
+          executionSpecVersionId,
+        ) as { id: string };
       keyToSessionRecord.set(key, {
         sessionKey: key,
         agentId,

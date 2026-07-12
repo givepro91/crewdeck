@@ -13,6 +13,7 @@ import { getBackend, type AgentProvider } from "../agent/adapters/backend.js";
 import { loadProviderConfig } from "../agent/provider.js";
 import { decideFailover, triedProvidersFromFailoverTrace, type FailureClass, type FailoverReasonCode } from "../agent/failover.js";
 import { selectTaskForResponse, serializeTask } from "../../api/routes/tasks.js";
+import { assertExecutionAllowed } from "../goal-spec/spec-approval.js";
 import type {
   ActivityLogEntry,
   ProviderFailoverEventPayload,
@@ -1596,6 +1597,19 @@ export function createScheduler(
 
     if (generating.cnt > 0) return false;
 
+    // A zero-task goal waiting for its latest spec approval is pending user
+    // work, not a completed project. Without this guard Full Auto immediately
+    // generates another mission goal after processNextGoal returns at the gate.
+    const approvalCandidates = db.prepare(`
+      SELECT g.id FROM goals g
+      WHERE g.project_id = ?
+        AND g.spec_approval_required = 1
+        AND (SELECT COUNT(*) FROM tasks t WHERE t.goal_id = g.id) = 0
+    `).all(projectId) as { id: string }[];
+    if (approvalCandidates.some((goal) => !assertExecutionAllowed(db, goal.id).allowed)) {
+      return false;
+    }
+
     const remaining = db.prepare(`
       SELECT COUNT(*) as cnt FROM tasks
       WHERE project_id = ?
@@ -1653,7 +1667,10 @@ export function createScheduler(
     const spec = db.prepare("SELECT prd_summary FROM goal_specs WHERE goal_id = ?").get(goalId) as { prd_summary: string } | undefined;
     const prd = spec?.prd_summary;
     const isGenerating = prd && prd.includes('"_status":"generating"');
-    const hasSpec = prd && !isGenerating && !prd.includes('"_status":"failed"');
+    const hasVersionedSpec = db.prepare(
+      "SELECT 1 FROM goal_spec_versions WHERE goal_id = ? LIMIT 1",
+    ).get(goalId) !== undefined;
+    const hasSpec = hasVersionedSpec || (prd && !isGenerating && !prd.includes('"_status":"failed"'));
 
     if (isGenerating) {
       goalPreparationFlights.delete(projectId);
@@ -1684,6 +1701,14 @@ export function createScheduler(
           // flight. Finishing that already-started session is allowed, but it
           // must not launch the next decompose session after the stop boundary.
           if (!timers.has(projectId) || userStoppedQueues.has(projectId)) return;
+        }
+
+        const executionGate = assertExecutionAllowed(db, goalId);
+        if (!executionGate.allowed) {
+          log.info(
+            `Sequential pipeline: waiting for Goal Spec approval (${goalId}, status=${executionGate.specStatus})`,
+          );
+          return;
         }
 
         // Step 2: Decompose (skip if tasks already exist — decomposeGoal guards this too)

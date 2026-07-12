@@ -3,6 +3,7 @@ import { createDatabase, migrate } from "../db/schema.js";
 import { claimTaskForExecution, createOrchestrationEngine } from "../core/orchestration/engine.js";
 import { createSessionManager } from "../core/agent/session.js";
 import { makeSpawnFailedError } from "../utils/errors.js";
+import { approveSpecVersion, beginExecutionRun, getExecutionSpec, getSpecState, getTaskExecutionSpec, saveSpecDraft } from "../core/goal-spec/spec-approval.js";
 import type Database from "better-sqlite3";
 
 /**
@@ -92,6 +93,476 @@ describe("claimTaskForExecution", () => {
     expect(claim.claimed).toBe(false);
     if (claim.claimed) throw new Error("unreachable");
     expect(claim.reason).toBe("not_found");
+  });
+
+  it("승인 필수 goal의 미승인 태스크는 상태 변경 없이 거절한다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const taskId = seedTask(db, goalId, projectId, "todo", agentId);
+
+    const claim = claimTaskForExecution(db, taskId);
+
+    expect(claim).toMatchObject({
+      claimed: false,
+      taskId,
+      reason: "spec_not_approved",
+      status: "todo",
+      specStatus: "missing",
+      currentDraftVersion: null,
+    });
+    const row = db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId) as { status: string };
+    expect(row.status).toBe("todo");
+  });
+
+  it("실행 중 spec 수정은 기존 in_progress claim의 conflict 계약을 바꾸지 않는다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    const approved = saveSpecDraft(db, goalId, {
+      scope: "approved",
+      out_of_scope: "none",
+      acceptance_criteria: ["pass"],
+      expected_tasks: ["implement"],
+      verification_methods: ["test"],
+    });
+    approveSpecVersion(db, goalId, approved.id);
+    const taskId = seedTask(db, goalId, projectId, "in_progress", agentId);
+    saveSpecDraft(db, goalId, {
+      scope: "next run",
+      out_of_scope: "none",
+      acceptance_criteria: ["pass next"],
+      expected_tasks: ["implement next"],
+      verification_methods: ["test next"],
+    });
+
+    const claim = claimTaskForExecution(db, taskId);
+
+    expect(claim).toMatchObject({
+      claimed: false,
+      reason: "conflict",
+      status: "in_progress",
+    });
+    expect(db.prepare("SELECT execution_spec_version_id FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ execution_spec_version_id: approved.id });
+  });
+
+  it("실행 중 draft 저장 후 t1 완료돼도 다음 순차 task는 고정된 승인 version으로 claim 성공한다", () => {
+    // Goal 실행 run 은 첫 claim 에서 승인 version 을 고정하고, 실행 중 draft/재승인은
+    // 그 run 의 pin 을 바꾸지 않는다. 순차 task 사이에 draft 가 저장돼도 다음 task 는
+    // 같은 승인 snapshot 으로 계속 실행돼야 한다.
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const t1 = seedTask(db, goalId, projectId, "todo", agentId);
+    const t2 = seedTask(db, goalId, projectId, "todo", agentId);
+
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "run scope v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 acceptance"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+
+    // 첫 claim = run 시작 → v1 고정.
+    expect(claimTaskForExecution(db, t1).claimed).toBe(true);
+
+    // 실행 중 다음 실행용 draft v2 저장.
+    const v2 = saveSpecDraft(db, goalId, {
+      scope: "run scope v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 acceptance"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+    expect(v2.version).toBe(2);
+
+    // 현재 in_progress task 완료.
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(t1);
+
+    // 같은 run 의 다음 순차 task claim 성공 — v2 draft 가 막지 않는다.
+    const claim = claimTaskForExecution(db, t2);
+    expect(claim.claimed).toBe(true);
+
+    // pin 은 여전히 v1, 모든 실행 단계가 참조하는 execution spec 도 v1 로 유지된다.
+    expect(db.prepare("SELECT execution_spec_version_id FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ execution_spec_version_id: v1.id });
+    expect(getExecutionSpec(db, goalId)).toMatchObject({ id: v1.id, version: 1, scope: "run scope v1" });
+  });
+
+  it("실행 중 다른 version 승인은 활성 run의 고정 version을 바꾸지 않는다", () => {
+    // approveSpecVersion 이 실행 중에 포인터를 옮기면 한 run 이 서로 다른 spec version 을
+    // 쓰게 된다. 활성 run 진행 중 재승인은 pin 을 유지해야 한다.
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const t1 = seedTask(db, goalId, projectId, "todo", agentId);
+
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "run scope v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 acceptance"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+    expect(claimTaskForExecution(db, t1).claimed).toBe(true);
+
+    const v2 = saveSpecDraft(db, goalId, {
+      scope: "run scope v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 acceptance"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+    approveSpecVersion(db, goalId, v2.id);
+
+    // 실행 중 v2 승인에도 pin 은 v1 로 유지된다.
+    expect(db.prepare("SELECT execution_spec_version_id FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ execution_spec_version_id: v1.id });
+    expect(getExecutionSpec(db, goalId)).toMatchObject({ id: v1.id, version: 1 });
+  });
+
+  it("실행 중 승인한 최신 version은 run 종료 후 다음 실행 기준으로 승계한다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const t1 = seedTask(db, goalId, projectId, "todo", agentId);
+
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "run scope v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 acceptance"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+    expect(claimTaskForExecution(db, t1).claimed).toBe(true);
+
+    const v2 = saveSpecDraft(db, goalId, {
+      scope: "next run scope v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 acceptance"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+    approveSpecVersion(db, goalId, v2.id);
+
+    expect(db.prepare(`
+      SELECT execution_spec_version_id, pending_execution_spec_version_id
+      FROM goals WHERE id = ?
+    `).get(goalId)).toEqual({
+      execution_spec_version_id: v1.id,
+      pending_execution_spec_version_id: v2.id,
+    });
+
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(t1);
+    expect(getSpecState(db, goalId)).toMatchObject({
+      status: "approved",
+      execution_spec_version_id: v2.id,
+    });
+    expect(db.prepare(`
+      SELECT active_execution_run_id, execution_spec_version_id, pending_execution_spec_version_id
+      FROM goals WHERE id = ?
+    `).get(goalId)).toEqual({
+      active_execution_run_id: null,
+      execution_spec_version_id: v2.id,
+      pending_execution_spec_version_id: null,
+    });
+
+    const t2 = seedTask(db, goalId, projectId, "todo", agentId);
+    expect(claimTaskForExecution(db, t2).claimed).toBe(true);
+  });
+
+  it("decompose run은 마지막 구현 task가 아니라 QA regression 완료 후 닫힌다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 acceptance"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+    const run = beginExecutionRun(db, goalId, "decompose");
+    expect(run).not.toBeNull();
+    if (!run) throw new Error("execution run was not created");
+    const implementationTaskId = seedTask(db, goalId, projectId, "in_progress", agentId);
+
+    const v2 = saveSpecDraft(db, goalId, {
+      scope: "v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 acceptance"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+    approveSpecVersion(db, goalId, v2.id);
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(implementationTaskId);
+
+    expect(db.prepare(`
+      SELECT active_execution_run_id, execution_spec_version_id
+      FROM goals WHERE id = ?
+    `).get(goalId)).toEqual({
+      active_execution_run_id: run.id,
+      execution_spec_version_id: v1.id,
+    });
+
+    const qaTaskId = seedTask(db, goalId, projectId, "in_progress", agentId);
+    db.prepare("UPDATE goals SET qa_regression_task_id = ? WHERE id = ?").run(qaTaskId, goalId);
+    expect(db.prepare(`
+      SELECT execution_run_id, execution_spec_version_id FROM tasks WHERE id = ?
+    `).get(qaTaskId)).toEqual({
+      execution_run_id: run.id,
+      execution_spec_version_id: v1.id,
+    });
+
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(qaTaskId);
+    expect(db.prepare(`
+      SELECT active_execution_run_id, execution_spec_version_id
+      FROM goals WHERE id = ?
+    `).get(goalId)).toEqual({
+      active_execution_run_id: null,
+      execution_spec_version_id: v2.id,
+    });
+    expect(db.prepare("SELECT status FROM goal_execution_runs WHERE id = ?").get(run.id))
+      .toEqual({ status: "completed" });
+  });
+
+  it("실행 중 승인본 뒤 최신 draft가 생기면 run 종료 시 승인본을 승계하지 않는다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const t1 = seedTask(db, goalId, projectId, "todo", agentId);
+
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "run scope v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 acceptance"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+    expect(claimTaskForExecution(db, t1).claimed).toBe(true);
+
+    const v2 = saveSpecDraft(db, goalId, {
+      scope: "approved next run scope v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 acceptance"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+    approveSpecVersion(db, goalId, v2.id);
+    saveSpecDraft(db, goalId, {
+      scope: "unapproved latest scope v3",
+      out_of_scope: "none",
+      acceptance_criteria: ["v3 acceptance"],
+      expected_tasks: ["v3 task"],
+      verification_methods: ["v3 test"],
+    });
+
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(t1);
+    expect(getSpecState(db, goalId)).toMatchObject({
+      status: "changes_pending",
+      execution_spec_version_id: v1.id,
+    });
+    expect(db.prepare("SELECT pending_execution_spec_version_id FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ pending_execution_spec_version_id: null });
+
+    const t2 = seedTask(db, goalId, projectId, "todo", agentId);
+    expect(claimTaskForExecution(db, t2)).toMatchObject({
+      claimed: false,
+      reason: "spec_not_approved",
+      specStatus: "changes_pending",
+    });
+  });
+
+  it("완료된 과거 run의 done task와 신규 todo task를 활성 run으로 결합하지 않는다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const oldTaskId = seedTask(db, goalId, projectId, "todo", agentId);
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["ok"],
+      expected_tasks: ["work"],
+      verification_methods: ["test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+
+    expect(claimTaskForExecution(db, oldTaskId).claimed).toBe(true);
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(oldTaskId);
+    const newTaskId = seedTask(db, goalId, projectId, "todo", agentId);
+    saveSpecDraft(db, goalId, {
+      scope: "v2 unapproved",
+      out_of_scope: "none",
+      acceptance_criteria: ["ok"],
+      expected_tasks: ["work"],
+      verification_methods: ["test"],
+    });
+
+    expect(claimTaskForExecution(db, newTaskId)).toMatchObject({
+      claimed: false,
+      reason: "spec_not_approved",
+      specStatus: "changes_pending",
+    });
+    expect(db.prepare("SELECT active_execution_run_id, execution_spec_version_id FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ active_execution_run_id: null, execution_spec_version_id: null });
+  });
+
+  it("과거 run의 v1 task를 현재 승인본 v2 실행으로 claim하지 않는다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 accepted"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+    const staleTaskId = seedTask(db, goalId, projectId, "todo", agentId);
+    expect(claimTaskForExecution(db, staleTaskId).claimed).toBe(true);
+    const staleRunId = (db.prepare(
+      "SELECT execution_run_id FROM tasks WHERE id = ?",
+    ).get(staleTaskId) as { execution_run_id: string }).execution_run_id;
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(staleTaskId);
+
+    const v2 = saveSpecDraft(db, goalId, {
+      scope: "v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 accepted"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+    approveSpecVersion(db, goalId, v2.id);
+    db.prepare("UPDATE tasks SET status = 'todo' WHERE id = ?").run(staleTaskId);
+
+    expect(claimTaskForExecution(db, staleTaskId)).toMatchObject({
+      claimed: false,
+      reason: "conflict",
+      status: "todo",
+      error: "Task belongs to a previous execution run and must be re-decomposed",
+    });
+    expect(db.prepare(`
+      SELECT status, execution_run_id, execution_spec_version_id
+      FROM tasks WHERE id = ?
+    `).get(staleTaskId)).toEqual({
+      status: "todo",
+      execution_run_id: staleRunId,
+      execution_spec_version_id: v1.id,
+    });
+    expect(db.prepare(`
+      SELECT active_execution_run_id, execution_spec_version_id
+      FROM goals WHERE id = ?
+    `).get(goalId)).toEqual({
+      active_execution_run_id: null,
+      execution_spec_version_id: v2.id,
+    });
+  });
+
+  it("task version 복사본이 누락돼도 claim을 거절하고 조회는 run 고정본을 사용한다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "run-v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 accepted"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+    const taskId = seedTask(db, goalId, projectId, "todo", agentId);
+    const run = beginExecutionRun(db, goalId, "decompose");
+    const v2 = saveSpecDraft(db, goalId, {
+      scope: "run-v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 accepted"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+    approveSpecVersion(db, goalId, v2.id);
+    db.prepare("UPDATE tasks SET execution_spec_version_id = NULL WHERE id = ?").run(taskId);
+
+    expect(run?.executionSpecVersionId).toBe(v1.id);
+    expect(getTaskExecutionSpec(db, taskId)).toMatchObject({ id: v1.id, scope: "run-v1" });
+    expect(claimTaskForExecution(db, taskId)).toMatchObject({
+      claimed: false,
+      reason: "conflict",
+      status: "todo",
+      error: "Task spec version differs from its execution run and must be re-decomposed",
+    });
+  });
+
+  it("retry budget이 남은 blocked→todo 전환 중에는 active run·pin·execution_run_id를 유지하고 재claim이 성공한다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    db.prepare("UPDATE goals SET spec_approval_required = 1 WHERE id = ?").run(goalId);
+    const t1 = seedTask(db, goalId, projectId, "todo", agentId);
+
+    const v1 = saveSpecDraft(db, goalId, {
+      scope: "run scope v1",
+      out_of_scope: "none",
+      acceptance_criteria: ["v1 acceptance"],
+      expected_tasks: ["v1 task"],
+      verification_methods: ["v1 test"],
+    });
+    approveSpecVersion(db, goalId, v1.id);
+    expect(claimTaskForExecution(db, t1).claimed).toBe(true);
+
+    const runId = (db.prepare("SELECT active_execution_run_id AS r FROM goals WHERE id = ?").get(goalId) as { r: string }).r;
+    expect(runId).not.toBeNull();
+
+    // 실행 중 미승인 v2 draft 저장 — active run 진행 중이므로 pin(v1)은 흔들지 않는다.
+    saveSpecDraft(db, goalId, {
+      scope: "next run scope v2",
+      out_of_scope: "none",
+      acceptance_criteria: ["v2 acceptance"],
+      expected_tasks: ["v2 task"],
+      verification_methods: ["v2 test"],
+    });
+
+    // 유일한 task가 일시적으로 blocked — run 이 조기 종료되면 안 된다.
+    db.prepare("UPDATE tasks SET status = 'blocked' WHERE id = ?").run(t1);
+    expect(db.prepare("SELECT active_execution_run_id AS r FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ r: runId });
+    expect(db.prepare("SELECT execution_spec_version_id AS v FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ v: v1.id });
+    expect(db.prepare("SELECT execution_run_id AS r FROM tasks WHERE id = ?").get(t1))
+      .toEqual({ r: runId });
+
+    // scheduler retry 와 동일하게 blocked→todo 복구. retryBlockedTasks 는 cooldown(≥10s)
+    // 뒤에 재시도하므로 원래 claim 의 started_at 은 5s settling 창을 이미 지난다 — 그 경과를
+    // 재현하려 started_at 을 과거로 당긴다(안 그러면 자기 started_at 이 settling 가드를 튕긴다).
+    db.prepare(
+      "UPDATE tasks SET status = 'todo', retry_count = retry_count + 1, started_at = datetime('now', '-30 seconds') WHERE id = ?",
+    ).run(t1);
+    expect(db.prepare("SELECT active_execution_run_id AS r FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ r: runId });
+    expect(db.prepare("SELECT execution_spec_version_id AS v FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ v: v1.id });
+    expect(db.prepare("SELECT execution_run_id AS r FROM tasks WHERE id = ?").get(t1))
+      .toEqual({ r: runId });
+
+    // 재claim 은 기존 run 소속이므로 성공한다.
+    expect(claimTaskForExecution(db, t1).claimed).toBe(true);
+
+    // 기존 실행이 실제 종료(done)된 뒤에야 미승인 v2가 신규 실행 재승인을 요구한다.
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(t1);
+    expect(db.prepare("SELECT active_execution_run_id AS r FROM goals WHERE id = ?").get(goalId))
+      .toEqual({ r: null });
+    const t2 = seedTask(db, goalId, projectId, "todo", agentId);
+    expect(claimTaskForExecution(db, t2)).toMatchObject({
+      claimed: false,
+      reason: "spec_not_approved",
+      specStatus: "changes_pending",
+    });
   });
 
   it("다른 goal이라도 동일 agent가 실행 중이면 claim을 거절한다", () => {

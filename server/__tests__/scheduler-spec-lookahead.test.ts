@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import type { SessionManager } from "../core/agent/session.js";
 import { createScheduler } from "../core/orchestration/scheduler.js";
 import { createDatabase, migrate } from "../db/schema.js";
+import { approveSpecVersion, saveSpecDraft } from "../core/goal-spec/spec-approval.js";
 
 function createSessionManager(): SessionManager {
   return {
@@ -130,6 +131,27 @@ describe("scheduler spec/decompose lookahead", () => {
     expect(generateSpec).toHaveBeenCalledWith("prepared-first");
     expect(db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE goal_id = 'must-wait'").get())
       .toEqual({ count: 0 });
+  });
+
+  it("an approved versioned spec without a legacy row is not regenerated before decompose", async () => {
+    seedGoal("versioned-approved", "critical", 0);
+    const version = saveSpecDraft(db, "versioned-approved", {
+      scope: "approved",
+      out_of_scope: "none",
+      acceptance_criteria: ["pass"],
+      expected_tasks: ["implement"],
+      verification_methods: ["test"],
+    });
+    approveSpecVersion(db, "versioned-approved", version.id);
+    const generateSpec = vi.fn(async () => {});
+    scheduler.setSpecGenerator(generateSpec);
+
+    scheduler.startQueue(projectId);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(generateSpec).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM goal_spec_versions WHERE goal_id = ?").get("versioned-approved"))
+      .toEqual({ count: 1 });
   });
 
   it("a zero-task goal whose spec is still generating does not auto-stop the queue as completed", async () => {

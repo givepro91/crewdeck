@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useStore } from "../stores/useStore";
-import { api, type WorkReport } from "../lib/api";
+import { ApiError, api, type WorkReport } from "../lib/api";
 
 import { TaskTimeline } from "./TaskTimeline";
 import { OrgChart, parseActivity, getCtoPhase } from "./OrgChart";
@@ -1228,9 +1228,18 @@ export function ProjectHome() {
     const timer = setInterval(async () => {
       retryCount++;
       try {
-        const data = await api.goals.getSpec(goalId);
-        const status = data?.prd_summary?._status;
-        if (status !== "generating") {
+        const generation = await api.goals.getSpecGenerationState(goalId);
+        const status = generation.generation_status;
+        if (status === "generating" && retryCount >= MAX_RETRIES) {
+          clearInterval(timer);
+          specPollRefs.current.delete(goalId);
+          setGeneratingSpecGoalIds((prev) => {
+            const next = new Set(prev);
+            next.delete(goalId);
+            return next;
+          });
+          showToast(t("specGenerateFailed"), "error", "Timeout: spec generation took too long");
+        } else if (status !== "generating") {
           clearInterval(timer);
           specPollRefs.current.delete(goalId);
           setGeneratingSpecGoalIds((prev) => {
@@ -1239,9 +1248,14 @@ export function ProjectHome() {
             return next;
           });
           if (status === "failed") {
-            showToast(t("specGenerateFailed"), "error", data?.prd_summary?._error);
+            showToast(t("specGenerateFailed"), "error", generation.generation_error ?? undefined);
           } else {
-            showToast(t("specGenerateComplete"), "success");
+            const spec = await api.goals.getSpec(goalId);
+            if (spec.versions.length > 0) {
+              showToast(t("specGenerateComplete"), "success");
+            } else {
+              showToast(t("specGenerateFailed"), "error", "Spec generation completed without a snapshot");
+            }
           }
         }
       } catch (err: any) {
@@ -1356,6 +1370,12 @@ export function ProjectHome() {
   };
 
   const handleDecomposeGoal = async (goalId: string) => {
+    const goal = goals.find((candidate) => candidate.id === goalId);
+    if (goal?.spec_approval_required === 1 && !goal.execution_spec_version_id) {
+      showToast(t("specNotApprovedToast"), "error");
+      setSpecGoalId(goalId);
+      return;
+    }
     // If tasks already exist (re-decompose), show confirm modal
     const existingTasks = tasksByGoalId.get(goalId) ?? [];
     if (existingTasks.length > 0) {
@@ -1372,7 +1392,13 @@ export function ProjectHome() {
       loadData();
       showToast(isReDecompose ? t("reDecomposeSuccess") : t("decomposeSuccess"), "success");
     } catch (err: any) {
-      showToast(t("decomposeFailed"), "error", err.message);
+      // 승인 게이트 차단(spec_not_approved): generic toast 대신 해당 goal의 승인 화면(Blueprint)을 연다
+      if (err instanceof ApiError && err.code === "spec_not_approved") {
+        showToast(t("specNotApprovedToast"), "error", err.message);
+        setSpecGoalId(goalId);
+      } else {
+        showToast(t("decomposeFailed"), "error", err.message);
+      }
     } finally {
       setDecomposingGoalId(null);
     }
@@ -2132,7 +2158,7 @@ export function ProjectHome() {
                                 onClick={() => setSpecGoalId(goal.id)}
                                 className="text-[10px] px-2 py-0.5 rounded bg-indigo-50 dark:bg-indigo-900/20 text-indigo-500 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors whitespace-nowrap"
                               >
-                                {(goal as any).has_spec ? t("specView") : t("specGenerate")}
+                                {goal.has_spec ? t("specView") : t("specGenerate")}
                               </button>
                             )}
                             {(() => {
@@ -2613,7 +2639,7 @@ export function ProjectHome() {
                         </button>
                     </div>
                   )}
-                  <TaskList tasks={tasks} agents={agents} projectId={currentProjectId ?? undefined} onUpdate={loadData} autopilotMode={autopilotMode} onAddGoal={handleAddGoal} />
+                  <TaskList tasks={tasks} agents={agents} projectId={currentProjectId ?? undefined} onUpdate={loadData} autopilotMode={autopilotMode} onAddGoal={handleAddGoal} onOpenSpec={setSpecGoalId} />
                 </div>
               </section>
             </div>

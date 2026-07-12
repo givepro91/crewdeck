@@ -1,3 +1,5 @@
+import type { GoalSpecVersionSnapshot, SpecFields } from "../../../shared/types";
+
 const BASE = "/api";
 
 // Auth — API key management
@@ -128,6 +130,32 @@ function tryReauth(): Promise<boolean> {
 let serverDown = false;
 export function isServerDown() { return serverDown; }
 
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  location?: string;
+  detail?: unknown;
+  /** 서버가 함께 내려준 오류 페이로드 원본 (예: spec_not_approved의 goalId·specStatus·currentDraftVersion). */
+  data?: Record<string, unknown>;
+
+  constructor(
+    message: string,
+    status: number,
+    code?: string,
+    location?: string,
+    detail?: unknown,
+    data?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.location = location;
+    this.detail = detail;
+    this.data = data;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   try {
     const headers: Record<string, string> = {
@@ -150,10 +178,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         return new Promise<never>(() => {});
       }
       const body = await res.json().catch(() => ({ error: res.statusText }));
-      const err = new Error(body.error ?? "Request failed");
-      (err as any).status = res.status;
-      (err as any).detail = body.detail;
-      throw err;
+      const message = typeof body.message === "string"
+        ? body.message
+        : body.error ?? "Request failed";
+      throw new ApiError(message, res.status, body.error, body.location, body.detail, body);
     }
     return res.json();
   } catch (err: any) {
@@ -164,6 +192,103 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     }
     throw err;
   }
+}
+
+const specStatuses = new Set(["missing", "draft", "approved", "changes_pending"]);
+const generationStatuses = new Set(["idle", "generating", "failed"]);
+
+export interface GoalSpecState {
+  goal_id: string;
+  status: "missing" | "draft" | "approved" | "changes_pending";
+  execution_spec_version_id: string | null;
+  versions: GoalSpecVersionSnapshot[];
+}
+
+export interface GoalSpecGenerationState {
+  generation_status: "idle" | "generating" | "failed";
+  generation_error: string | null;
+}
+
+export interface GoalListItem {
+  id: string;
+  project_id: string;
+  title: string;
+  description: string;
+  references: string;
+  priority: string;
+  progress: number;
+  goal_model: "legacy" | "goal_as_unit";
+  squash_status: "none" | "pending_approval" | "approved" | "resolving" | "merged" | "blocked" | "triggering";
+  squash_commit_sha: string | null;
+  acceptance_script: string | null;
+  qa_regression_task_id: string | null;
+  worktree_path: string | null;
+  worktree_branch: string | null;
+  has_spec: 0 | 1;
+  execution_spec_version_id: string | null;
+  spec_approval_required: 0 | 1;
+}
+
+export function parseGoalSpecState(value: unknown): GoalSpecState {
+  if (!value || typeof value !== "object") throw new Error("Invalid blueprint response");
+  const state = value as Record<string, unknown>;
+  const validVersion = (version: unknown) => {
+    if (!version || typeof version !== "object") return false;
+    const snapshot = version as Record<string, unknown>;
+    return typeof snapshot.id === "string"
+      && typeof snapshot.version === "number"
+      && (snapshot.state === "draft" || snapshot.state === "approved")
+      && typeof snapshot.scope === "string"
+      && typeof snapshot.out_of_scope === "string"
+      && Array.isArray(snapshot.acceptance_criteria) && snapshot.acceptance_criteria.every((item) => typeof item === "string")
+      && Array.isArray(snapshot.expected_tasks) && snapshot.expected_tasks.every((item) => typeof item === "string")
+      && Array.isArray(snapshot.verification_methods) && snapshot.verification_methods.every((item) => typeof item === "string")
+      && typeof snapshot.created_at === "string"
+      && (snapshot.approved_at === null || typeof snapshot.approved_at === "string");
+  };
+  const valid = typeof state.goal_id === "string"
+    && specStatuses.has(String(state.status))
+    && (state.execution_spec_version_id === null || typeof state.execution_spec_version_id === "string")
+    && Array.isArray(state.versions)
+    && state.versions.every(validVersion);
+  if (!valid) throw new Error("Invalid blueprint response");
+  return {
+    goal_id: state.goal_id as string,
+    status: state.status as GoalSpecState["status"],
+    execution_spec_version_id: state.execution_spec_version_id as string | null,
+    versions: (state.versions as Array<Record<string, unknown>>).map((snapshot) => ({
+      id: snapshot.id as string,
+      version: snapshot.version as number,
+      state: snapshot.state as GoalSpecVersionSnapshot["state"],
+      scope: snapshot.scope as string,
+      out_of_scope: snapshot.out_of_scope as string,
+      acceptance_criteria: [...snapshot.acceptance_criteria as string[]],
+      expected_tasks: [...snapshot.expected_tasks as string[]],
+      verification_methods: [...snapshot.verification_methods as string[]],
+      created_at: snapshot.created_at as string,
+      approved_at: snapshot.approved_at as string | null,
+    })),
+  };
+}
+
+const requestGoalSpecState = (path: string, goalId: string, options?: RequestInit) =>
+  request<unknown>(path, options).then((value) => {
+    const spec = parseGoalSpecState(value);
+    if (spec.goal_id !== goalId) throw new Error("Blueprint response goal_id mismatch");
+    return spec;
+  });
+
+function parseGoalSpecGenerationState(value: unknown): GoalSpecGenerationState {
+  if (!value || typeof value !== "object") throw new Error("Invalid blueprint generation response");
+  const state = value as Record<string, unknown>;
+  if (!generationStatuses.has(String(state.generation_status))
+    || !(state.generation_error === null || typeof state.generation_error === "string")) {
+    throw new Error("Invalid blueprint generation response");
+  }
+  return {
+    generation_status: state.generation_status as GoalSpecGenerationState["generation_status"],
+    generation_error: state.generation_error as string | null,
+  };
 }
 
 // Projects
@@ -240,12 +365,14 @@ export const api = {
       ),
   },
   goals: {
-    list: (projectId: string) => request<any[]>(`/goals?projectId=${projectId}`),
+    list: (projectId: string) => request<GoalListItem[]>(`/goals?projectId=${projectId}`),
     create: (data: any) => request<any>("/goals", { method: "POST", body: JSON.stringify(data) }),
     update: (id: string, data: any) =>
       request<any>(`/goals/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
     delete: (id: string) => request<any>(`/goals/${id}`, { method: "DELETE" }),
-    getSpec: (goalId: string) => request<any>(`/goals/${goalId}/spec`),
+    getSpec: (goalId: string) => requestGoalSpecState(`/goals/${goalId}/spec`, goalId),
+    getSpecGenerationState: (goalId: string) =>
+      request<unknown>(`/goals/${goalId}/spec`).then(parseGoalSpecGenerationState),
     getStatus: (goalId: string) => request<GoalStatusResponse>(`/goals/${goalId}/status`),
     getVerificationTimeline: (goalId: string) =>
       request<VerificationTimelineResponse>(`/goals/${goalId}/verification-timeline`),
@@ -253,12 +380,20 @@ export const api = {
       request<{ diff: string; truncated: boolean }>(`/goals/${goalId}/diff`),
     getFiles: (goalId: string) =>
       request<{ files: string[]; truncated: boolean }>(`/goals/${goalId}/files`),
-    updateSpec: (goalId: string, data: any) =>
-      request<any>(`/goals/${goalId}/spec`, { method: "PATCH", body: JSON.stringify(data) }),
+    saveSpec: (goalId: string, data: SpecFields) =>
+      requestGoalSpecState(`/goals/${goalId}/spec`, goalId, { method: "POST", body: JSON.stringify(data) }),
+    approveSpec: (goalId: string, versionId: string) =>
+      requestGoalSpecState(`/goals/${goalId}/spec/approve`, goalId, {
+        method: "POST",
+        body: JSON.stringify({ version_id: versionId }),
+      }),
     generateSpec: (goalId: string) =>
       request<any>(`/goals/${goalId}/generate-spec`, { method: "POST" }),
     refineSpec: (goalId: string, prompt: string) =>
-      request<any>(`/goals/${goalId}/refine-spec`, { method: "POST", body: JSON.stringify({ prompt }) }),
+      requestGoalSpecState(`/goals/${goalId}/refine-spec`, goalId, {
+        method: "POST",
+        body: JSON.stringify({ prompt }),
+      }),
     suggest: (projectId: string, count?: number, sourceMaterial?: string) =>
       request<Array<{ title: string; description: string; priority: string; reason: string }>>("/goals/suggest", { method: "POST", body: JSON.stringify({ project_id: projectId, count, language: uiLang(), ...(sourceMaterial ? { sourceMaterial } : {}) }) }),
     squashPreview: (goalId: string) =>

@@ -40,6 +40,9 @@ function providerEngineName(p: ProviderName | null): string {
 interface Session {
   id: string;
   agent_id: string;
+  task_id: string | null;
+  execution_run_id: string | null;
+  execution_spec_version_id: string | null;
   pid: number | null;
   started_at: string;
   ended_at: string | null;

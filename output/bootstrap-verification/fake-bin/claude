@@ -1,0 +1,80 @@
+#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import process from "node:process";
+
+if (process.argv.includes("--version")) {
+  console.log("claude bootstrap-fixture 1.0.0");
+  process.exit(0);
+}
+
+if (process.argv.includes("auth") && process.argv.includes("status")) {
+  console.log(JSON.stringify({ loggedIn: true }));
+  process.exit(0);
+}
+
+let prompt = "";
+for await (const chunk of process.stdin) prompt += chunk;
+appendFileSync("/tmp/crewdeck-bootstrap-prompt-log.txt", `\n--- PROMPT ---\n${prompt}\n`);
+
+let response;
+if (prompt.includes("# Goal Decomposition")) {
+  response = JSON.stringify({
+    tasks: [{
+      title: "Bootstrap proof implementation",
+      description: "Create a proof file through the approved Goal Spec execution path.",
+      role: "backend",
+      priority: "high",
+      order: 1,
+      type: "code",
+      target_files: ["bootstrap-proof.txt"],
+      stack_hint: "Node filesystem fixture",
+      depends_on: [],
+    }],
+  });
+} else if (prompt.includes("# Code Review — Quality Verification")) {
+  const criterionPresent = prompt.includes("bootstrap-proof.txt contains the approved execution marker");
+  let proofMatches = false;
+  try {
+    proofMatches = readFileSync("bootstrap-proof.txt", "utf8").trim() === "approved goal spec bootstrap verified";
+  } catch {
+    proofMatches = false;
+  }
+  const passed = criterionPresent && proofMatches;
+  response = JSON.stringify({
+    verdict: passed ? "pass" : "fail",
+    severity: passed ? "auto-resolve" : "hard-block",
+    dimensionJudgements: [
+      { dimension: "functionality", verdict: "pass", evidence: "bootstrap proof exists" },
+      { dimension: "dataFlow", verdict: "pass", evidence: "approved spec context present" },
+      { dimension: "designAlignment", verdict: "pass", evidence: "fixture follows requested stack" },
+      { dimension: "craft", verdict: "pass", evidence: "minimal deterministic change" },
+      { dimension: "edgeCases", verdict: "pass", evidence: "fresh install path exercised" },
+    ],
+    dimensions: {
+      functionality: { value: 8, notes: "pass" },
+      dataFlow: { value: 8, notes: "pass" },
+      designAlignment: { value: 8, notes: "pass" },
+      craft: { value: 8, notes: "pass" },
+      edgeCases: { value: 8, notes: "pass" },
+    },
+    issues: passed ? [] : [{
+      dimension: "functionality",
+      severity: "critical",
+      message: "Approved acceptance criterion or proof file did not match.",
+      reproCommand: "test $(cat bootstrap-proof.txt) = 'approved goal spec bootstrap verified'",
+      expectedResult: "approved marker exists and criterion is present in the evaluator prompt",
+      actualResult: `criterionPresent=${criterionPresent}, proofMatches=${proofMatches}`,
+      fixInstruction: "Propagate the approved criterion and create the expected proof file.",
+    }],
+    knownGaps: [],
+  });
+} else if (prompt.includes("# Task: Bootstrap proof implementation")) {
+  writeFileSync("bootstrap-proof.txt", "approved goal spec bootstrap verified\n");
+  response = "Created bootstrap-proof.txt from the approved execution path.";
+} else {
+  response = JSON.stringify({ tasks: [] });
+}
+
+const sessionId = `fixture-${Date.now()}`;
+console.log(JSON.stringify({ type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text: response }] } }));
+console.log(JSON.stringify({ type: "result", session_id: sessionId, result: response }));

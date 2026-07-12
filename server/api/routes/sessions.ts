@@ -117,7 +117,8 @@ export function createSessionRoutes(ctx: AppContext): Router {
 
     const globalDefault = loadProviderConfig().defaultProvider;
     const rows = db.prepare(`
-      SELECT s.id, s.agent_id, s.pid, s.started_at, s.ended_at, s.status,
+      SELECT s.id, s.agent_id, s.task_id, s.execution_run_id, s.execution_spec_version_id,
+             s.pid, s.started_at, s.ended_at, s.status,
              s.token_usage, s.cost_usd, s.provider,
              s.provider_trace_resolved_provider, s.provider_trace_resolution_source,
              s.provider_failover_reason_code, s.provider_failover_user_message,

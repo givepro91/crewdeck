@@ -12,6 +12,7 @@ import { createDatabase, migrate } from "../db/schema.js";
 import { createGoalRoutes } from "../api/routes/goals.js";
 import { createOrchestrationRoutes } from "../api/routes/orchestration.js";
 import { createScheduler } from "../core/orchestration/scheduler.js";
+import { approveSpecVersion, saveSpecDraft } from "../core/goal-spec/spec-approval.js";
 import type { SessionManager, SessionRecord } from "../core/agent/session.js";
 import type { AgentProvider, AgentSession } from "../core/agent/adapters/backend.js";
 import type { RunResult } from "../core/agent/adapters/claude-code.js";
@@ -360,6 +361,88 @@ describe("scheduler scheduling contract integration", () => {
       "manual setup failure cleanup",
     );
     expect(db.prepare("SELECT COUNT(*) AS count FROM sessions").get()).toEqual({ count: 0 });
+  });
+
+  it("manual execute and decompose APIs reject an unapproved spec before state, worktree, or session creation", async () => {
+    const db = makeDb();
+    const projectId = seedProject(db, join(tmpdir(), "crewdeck-gate-never-created"), "project-spec-gate-api");
+    seedAgent(db, projectId, "agent-spec-gate");
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, goal_model, spec_approval_required)
+      VALUES ('goal-spec-gate', ?, 'spec gate', 'spec gate', 'goal_as_unit', 1)
+    `).run(projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, status, assignee_id)
+      VALUES ('task-spec-gate', 'goal-spec-gate', ?, 'spec gate', 'spec gate', 'todo', 'agent-spec-gate')
+    `).run(projectId);
+
+    const app = express();
+    app.use(express.json());
+    app.use("/api/orchestration", createOrchestrationRoutes({ db, broadcast: () => {} } as unknown as AppContext));
+    const { baseUrl } = await listen(app);
+
+    for (const path of ["tasks/task-spec-gate/execute", "goals/goal-spec-gate/decompose"]) {
+      const response = await fetch(`${baseUrl}/api/orchestration/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: "spec_not_approved",
+        goalId: "goal-spec-gate",
+        specStatus: "missing",
+        currentDraftVersion: null,
+      });
+    }
+
+    expect(db.prepare("SELECT status FROM tasks WHERE id = 'task-spec-gate'").get()).toEqual({ status: "todo" });
+    expect(db.prepare("SELECT worktree_path FROM goals WHERE id = 'goal-spec-gate'").get()).toEqual({ worktree_path: null });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM sessions").get()).toEqual({ count: 0 });
+  });
+
+  it("scheduler waits for latest spec approval and starts only after re-approval", { timeout: 20_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedProject(db, repo, "project-spec-gate-scheduler");
+    seedAgent(db, projectId, "agent-spec-scheduler");
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, goal_model, spec_approval_required)
+      VALUES ('goal-spec-scheduler', ?, 'scheduler gate', 'scheduler gate', 'goal_as_unit', 1)
+    `).run(projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, status, assignee_id)
+      VALUES ('task-spec-scheduler', 'goal-spec-scheduler', ?, 'scheduler gate', 'scheduler gate', 'todo', 'agent-spec-scheduler')
+    `).run(projectId);
+    const approved = saveSpecDraft(db, "goal-spec-scheduler", {
+      scope: "approved scope",
+      out_of_scope: "none",
+      acceptance_criteria: ["works"],
+      expected_tasks: ["implement"],
+      verification_methods: ["test"],
+    });
+    approveSpecVersion(db, "goal-spec-scheduler", approved.id);
+    const latest = saveSpecDraft(db, "goal-spec-scheduler", {
+      scope: "changed scope",
+      out_of_scope: "none",
+      acceptance_criteria: ["works better"],
+      expected_tasks: ["implement change"],
+      verification_methods: ["test change"],
+    });
+
+    const sessions = new RecordingSessionManager();
+    const scheduler = createScheduler(db, sessions, () => {});
+    schedulers.push({ ...scheduler, projectId });
+    scheduler.startQueue(projectId);
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+    expect(sessions.spawns).toHaveLength(0);
+    expect(db.prepare("SELECT status FROM tasks WHERE id = 'task-spec-scheduler'").get()).toEqual({ status: "todo" });
+    expect(db.prepare("SELECT worktree_path FROM goals WHERE id = 'goal-spec-scheduler'").get()).toEqual({ worktree_path: null });
+
+    approveSpecVersion(db, "goal-spec-scheduler", latest.id);
+    scheduler.notifyGoalReady(projectId);
+    await waitFor(() => sessions.spawns.some((spawn) => spawn.taskId === "task-spec-scheduler"), "approved scheduler spawn");
   });
 
   it("retries the exact failed task in the same worktree without running its later sibling", { timeout: 30_000 }, async () => {

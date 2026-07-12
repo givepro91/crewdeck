@@ -13,6 +13,7 @@ import { serializeTask, selectTaskForResponse } from "./tasks.js";
 import { resolveChatSession, chatSessionKey } from "../../core/agent/chat-session.js";
 import { ChatEventAssembler } from "../../core/agent/adapters/chat-events.js";
 import { buildSummonContext } from "../../core/agent/summon-context.js";
+import { assertExecutionAllowed, getSpecState, saveSpecDraft, type SpecVersion } from "../../core/goal-spec/spec-approval.js";
 import { snapshotWorkdir, restoreWorkdirSnapshot } from "../../core/project/worktree.js";
 
 const log = createLogger("orchestration");
@@ -60,7 +61,7 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
       "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM goals WHERE project_id = ?",
     ).get(projectId) as { next: number }).next;
     const goalRow = db.prepare(
-      "INSERT INTO goals (project_id, title, description, priority, sort_order) VALUES (?, ?, ?, 'high', ?) RETURNING id",
+      "INSERT INTO goals (project_id, title, description, priority, sort_order, spec_approval_required) VALUES (?, ?, ?, 'high', ?, 1) RETURNING id",
     ).get(projectId, goalDesc.slice(0, 100), goalDesc, sortOrder) as { id: string } | undefined;
 
     if (!goalRow) return false;
@@ -107,6 +108,15 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
     if (!claim.claimed) {
       if (claim.reason === "not_found") {
         return res.status(404).json({ error: claim.error });
+      }
+      if (claim.reason === "spec_not_approved") {
+        return res.status(409).json({
+          error: claim.reason,
+          message: claim.error,
+          goalId: task.goal_id,
+          specStatus: claim.specStatus,
+          currentDraftVersion: claim.currentDraftVersion,
+        });
       }
       return res.status(409).json({
         error: claim.error,
@@ -157,6 +167,17 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
 
     const goal = db.prepare("SELECT * FROM goals WHERE id = ?").get(goalId) as any;
     if (!goal) return res.status(404).json({ error: "Goal not found" });
+
+    const executionGate = assertExecutionAllowed(db, goalId);
+    if (!executionGate.allowed) {
+      return res.status(409).json({
+        error: executionGate.reason,
+        message: executionGate.message,
+        goalId,
+        specStatus: executionGate.specStatus,
+        currentDraftVersion: executionGate.currentDraftVersion,
+      });
+    }
 
     // Allow re-decompose unless tasks are actively running (in_progress / in_review)
     const existingTasks = db.prepare("SELECT COUNT(*) as count FROM tasks WHERE goal_id = ?").get(goalId) as any;
@@ -1103,7 +1124,22 @@ ${goal.source_material ? "- The Source Material above is the user's prepared bri
         }
       }
 
-      // Upsert into goal_specs
+      // Keep the generation sentinel until the immutable snapshot exists.
+      // Pollers must never observe terminal idle before the generated draft.
+      const features = Array.isArray(specData.feature_specs) ? specData.feature_specs : [];
+      saveSpecDraft(db, goalId, {
+        scope: specData.prd_summary?.scope ?? "",
+        out_of_scope: "",
+        acceptance_criteria: Array.isArray(specData.acceptance_criteria) ? specData.acceptance_criteria : [],
+        expected_tasks: features.map((feature: any) => {
+          const name = typeof feature?.name === "string" ? feature.name : "";
+          const description = typeof feature?.description === "string" ? feature.description : "";
+          return [name, description].filter(Boolean).join(": ");
+        }).filter(Boolean),
+        verification_methods: Array.isArray(specData.tech_considerations) ? specData.tech_considerations : [],
+      });
+
+      // Upsert into goal_specs. Replacing the sentinel is the terminal write.
       const existing = db.prepare("SELECT id, version FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
 
       if (existing) {
@@ -1134,7 +1170,6 @@ ${goal.source_material ? "- The Source Material above is the user's prepared bri
           JSON.stringify(specData.tech_considerations || []),
         );
       }
-
       const saved = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
 
       broadcast("project:updated", { projectId: goal.project_id });
@@ -1182,10 +1217,7 @@ ${goal.source_material ? "- The Source Material above is the user's prepared bri
   }
 
   // ─── Refine Goal Spec with custom prompt ───
-  async function refineGoalSpec(goalId: string, userPrompt: string): Promise<any> {
-    const specRow = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
-    if (!specRow) throw new Error("No spec to refine");
-
+  async function refineGoalSpec(goalId: string, userPrompt: string, currentSpec: SpecVersion): Promise<any> {
     const goal = db.prepare("SELECT * FROM goals WHERE id = ?").get(goalId) as any;
     if (!goal) throw new Error("Goal not found");
 
@@ -1199,14 +1231,6 @@ ${goal.source_material ? "- The Source Material above is the user's prepared bri
       ).get(goal.project_id) as any);
 
     if (!agent) throw new Error("No agents available");
-
-    const currentSpec = {
-      prd_summary: JSON.parse(specRow.prd_summary || "{}"),
-      feature_specs: JSON.parse(specRow.feature_specs || "[]"),
-      user_flow: JSON.parse(specRow.user_flow || "[]"),
-      acceptance_criteria: JSON.parse(specRow.acceptance_criteria || "[]"),
-      tech_considerations: JSON.parse(specRow.tech_considerations || "[]"),
-    };
 
     const refinePrompt = `
 # Spec Refinement
@@ -1225,11 +1249,11 @@ ${JSON.stringify(currentSpec, null, 2)}
 Apply the user's request to modify the spec. Return the COMPLETE updated spec in this EXACT JSON format:
 \`\`\`json
 {
-  "prd_summary": { "background": "...", "objective": "...", "scope": "...", "success_metrics": ["..."] },
-  "feature_specs": [{ "name": "...", "description": "...", "requirements": ["..."], "priority": "must|should|could" }],
-  "user_flow": [{ "step": 1, "action": "...", "expected": "..." }],
+  "scope": "...",
+  "out_of_scope": "...",
   "acceptance_criteria": ["Given X, when Y, then Z"],
-  "tech_considerations": ["..."]
+  "expected_tasks": ["..."],
+  "verification_methods": ["..."]
 }
 \`\`\`
 
@@ -1247,36 +1271,22 @@ Rules:
       const parsed = parseAgentOutput(result.stdout, result.provider);
 
       const jsonMatch = parsed.text.match(/```json\s*([\s\S]*?)\s*```/);
-      if (!jsonMatch) throw new Error("No JSON found in refine response");
+      const refined = JSON.parse(jsonMatch?.[1] ?? parsed.text.trim());
 
-      const refined = JSON.parse(jsonMatch[1]);
-
-      db.prepare(`
-        UPDATE goal_specs SET
-          prd_summary = ?, feature_specs = ?, user_flow = ?,
-          acceptance_criteria = ?, tech_considerations = ?,
-          generated_by = 'ai', version = version + 1, updated_at = datetime('now')
-        WHERE goal_id = ?
-      `).run(
-        JSON.stringify(refined.prd_summary || currentSpec.prd_summary),
-        JSON.stringify(refined.feature_specs || currentSpec.feature_specs),
-        JSON.stringify(refined.user_flow || currentSpec.user_flow),
-        JSON.stringify(refined.acceptance_criteria || currentSpec.acceptance_criteria),
-        JSON.stringify(refined.tech_considerations || currentSpec.tech_considerations),
-        goalId,
-      );
-
-      const saved = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
+      // Persist the refined result as a new immutable draft snapshot so the
+      // common read contract (GET /spec) and the approval gate observe this
+      // version — mirror the generate path. Without this, refine only touched
+      // the legacy goal_specs row and goal_spec_versions never grew, so UI and
+      // execution kept using the prior (approved) snapshot.
+      saveSpecDraft(db, goalId, {
+        scope: refined.scope ?? currentSpec.scope,
+        out_of_scope: refined.out_of_scope ?? currentSpec.out_of_scope,
+        acceptance_criteria: refined.acceptance_criteria ?? currentSpec.acceptance_criteria,
+        expected_tasks: refined.expected_tasks ?? currentSpec.expected_tasks,
+        verification_methods: refined.verification_methods ?? currentSpec.verification_methods,
+      });
       broadcast("project:updated", { projectId: goal.project_id });
-
-      return {
-        ...saved,
-        prd_summary: JSON.parse(saved.prd_summary),
-        feature_specs: JSON.parse(saved.feature_specs),
-        user_flow: JSON.parse(saved.user_flow),
-        acceptance_criteria: JSON.parse(saved.acceptance_criteria),
-        tech_considerations: JSON.parse(saved.tech_considerations),
-      };
+      return getSpecState(db, goalId);
     } finally {
       if (session) sessionManager.killSession(refineSessionKey);
     }

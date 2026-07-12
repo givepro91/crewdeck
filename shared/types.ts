@@ -348,6 +348,38 @@ export interface GoalSpec {
   updatedAt: string;
 }
 
+/** Versioned Goal Spec API snapshot (`/api/goals/:goalId/spec`). */
+export interface GoalSpecVersionSnapshot {
+  id: string;
+  version: number;
+  state: "draft" | "approved";
+  scope: string;
+  out_of_scope: string;
+  acceptance_criteria: string[];
+  expected_tasks: string[];
+  verification_methods: string[];
+  created_at: string;
+  approved_at: string | null;
+}
+
+export interface SpecFields {
+  scope: string;
+  out_of_scope: string;
+  acceptance_criteria: string[];
+  expected_tasks: string[];
+  verification_methods: string[];
+}
+
+/** Common success response returned by Goal Spec GET, POST, and approve routes. */
+export interface GoalSpecStateResponse {
+  goal_id: string;
+  status: "missing" | "draft" | "approved" | "changes_pending";
+  generation_status: "idle" | "generating" | "failed";
+  generation_error: string | null;
+  execution_spec_version_id: string | null;
+  versions: GoalSpecVersionSnapshot[];
+}
+
 // ─── WebSocket Events ──────────────────────────────────
 
 export type WSEventType =

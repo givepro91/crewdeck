@@ -15,7 +15,8 @@ import { createOrchestrationEngine } from "../core/orchestration/engine.js";
 import { createQualityGate } from "../core/quality-gate/evaluator.js";
 import { flushVerificationBroadcastOutbox } from "../core/quality-gate/outbox.js";
 import { recoverOnStartup, rebroadcastPendingApprovals } from "../core/recovery.js";
-import type { SessionManager, SessionRecord } from "../core/agent/session.js";
+import { approveSpecVersion, saveSpecDraft } from "../core/goal-spec/spec-approval.js";
+import type { ExecutionSessionContext, SessionManager, SessionRecord } from "../core/agent/session.js";
 import type { AgentProvider, AgentSession } from "../core/agent/adapters/backend.js";
 import type { RunResult } from "../core/agent/adapters/claude-code.js";
 
@@ -189,6 +190,7 @@ class FakeSession extends EventEmitter implements AgentSession {
     private readonly workdir: string,
     private readonly runtimeSessionId = `runtime-${fakeSessionSeq}`,
     private readonly verificationResponse = passVerification(),
+    private readonly decompositionResponse?: string,
   ) {
     super();
   }
@@ -216,6 +218,9 @@ class FakeSession extends EventEmitter implements AgentSession {
     }
 
     if (message.includes("# Goal Decomposition")) {
+      if (this.decompositionResponse !== undefined) {
+        return this.stream(this.decompositionResponse);
+      }
       return this.stream(`\`\`\`json
 {
   "tasks": [
@@ -287,7 +292,14 @@ class FakeSessionManager implements SessionManager {
   private readonly records = new Map<string, SessionRecord>();
   private verificationSpawnCount = 0;
   private verificationCount = 0;
-  readonly spawns: Array<{ agentId: string; workdir: string; sessionKey?: string; taskId?: string | null }> = [];
+  readonly spawns: Array<{
+    agentId: string;
+    workdir: string;
+    sessionKey?: string;
+    taskId?: string | null;
+    executionContext?: ExecutionSessionContext;
+  }> = [];
+  readonly prompts: string[] = [];
 
   constructor(private readonly opts: {
     reuseEvaluatorRuntimeSession?: boolean;
@@ -296,11 +308,19 @@ class FakeSessionManager implements SessionManager {
     verificationResponse?: string;
     verificationResponses?: string[];
     failVerificationOnce?: boolean;
+    onPrompt?: (message: string) => void;
+    decompositionResponse?: string;
   } = {}) {}
 
-  spawnAgent(agentId: string, projectWorkdir: string, sessionKey?: string, taskId?: string | null): AgentSession {
+  spawnAgent(
+    agentId: string,
+    projectWorkdir: string,
+    sessionKey?: string,
+    taskId?: string | null,
+    executionContext?: ExecutionSessionContext,
+  ): AgentSession {
     const key = sessionKey ?? agentId;
-    this.spawns.push({ agentId, workdir: projectWorkdir, sessionKey, taskId });
+    this.spawns.push({ agentId, workdir: projectWorkdir, sessionKey, taskId, executionContext });
     const implementationRuntimeId = this.records.get("agent-coder")?.runtimeSessionId ?? undefined;
     const runtimeSessionId = key.startsWith("evaluator-")
       ? (this.opts.reuseEvaluatorRuntimeSessionId
@@ -311,7 +331,12 @@ class FakeSessionManager implements SessionManager {
           Math.min(this.verificationSpawnCount++, this.opts.verificationResponses.length - 1)
         ]
       : this.opts.verificationResponse;
-    const session = new FakeSession(projectWorkdir, runtimeSessionId, verificationResponse);
+    const session = new FakeSession(
+      projectWorkdir,
+      runtimeSessionId,
+      verificationResponse,
+      this.opts.decompositionResponse,
+    );
     const record: SessionRecord = {
       sessionKey: key,
       agentId,
@@ -323,6 +348,8 @@ class FakeSessionManager implements SessionManager {
     };
     const rawSend = session.send.bind(session);
     session.send = async (message: string) => {
+      this.prompts.push(message);
+      this.opts.onPrompt?.(message);
       let result = await rawSend(message);
       if (this.opts.failVerificationOnce && message.includes("Quality Verification") && this.verificationCount++ === 0) {
         result = streamJson(failVerification(), result.sessionId ?? undefined);
@@ -452,6 +479,127 @@ afterEach(() => {
 });
 
 describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
+  it("분해·구현·검증이 승인된 동일 snapshot을 사용하고 legacy 변경을 무시한다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-approved-spec-context";
+    let approvedDuringDecompose = false;
+    const sessions = new FakeSessionManager({
+      onPrompt: (message) => {
+        if (!message.includes("# Goal Decomposition") || approvedDuringDecompose) return;
+        approvedDuringDecompose = true;
+        const nextVersion = saveSpecDraft(db, goalId, {
+          scope: "approved-v2 scope",
+          out_of_scope: "excluded-v2",
+          acceptance_criteria: ["v2 acceptance"],
+          expected_tasks: ["v2 expected task"],
+          verification_methods: ["v2 verification"],
+        });
+        approveSpecVersion(db, goalId, nextVersion.id);
+      },
+    });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority)
+      VALUES (?, ?, 'Approved blueprint fixture', 'goal', 'high')
+    `).run(goalId, projectId);
+    const approvedVersion = saveSpecDraft(db, goalId, {
+      scope: "approved-v1 scope",
+      out_of_scope: "excluded-v1",
+      acceptance_criteria: ["approved acceptance"],
+      expected_tasks: ["approved expected task"],
+      verification_methods: ["approved verification"],
+    });
+    approveSpecVersion(db, goalId, approvedVersion.id);
+    db.prepare(`
+      INSERT INTO goal_specs
+        (goal_id, prd_summary, feature_specs, user_flow, acceptance_criteria, tech_considerations, generated_by)
+      VALUES (?, ?, '[]', '[]', '[]', '[]', 'manual')
+    `).run(goalId, JSON.stringify({ scope: "unapproved legacy scope" }));
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    const decomposed = await engine.decomposeGoal(goalId);
+    expect(decomposed.taskCount).toBeGreaterThan(0);
+    const task = db.prepare(`
+      SELECT id, execution_run_id, execution_spec_version_id
+      FROM tasks WHERE goal_id = ? ORDER BY sort_order ASC LIMIT 1
+    `).get(goalId) as {
+      id: string;
+      execution_run_id: string;
+      execution_spec_version_id: string;
+    };
+    expect(task.execution_run_id).toBeTruthy();
+    expect(task.execution_spec_version_id).toBe(approvedVersion.id);
+    expect(db.prepare(`
+      SELECT execution_spec_version_id FROM goal_execution_runs WHERE id = ?
+    `).get(task.execution_run_id)).toEqual({ execution_spec_version_id: approvedVersion.id });
+    expect(sessions.spawns.find((spawn) => spawn.sessionKey === `decompose-${goalId}`)?.executionContext)
+      .toEqual({
+        executionRunId: task.execution_run_id,
+        executionSpecVersionId: approvedVersion.id,
+      });
+    db.prepare("UPDATE tasks SET status = 'todo' WHERE id = ?").run(task.id);
+
+    const result = await engine.executeTask(task.id, { autoFix: false });
+    expect(result.verdict).toBe("pass");
+
+    const relevantPrompts = sessions.prompts.filter((prompt) =>
+      prompt.includes("# Goal Decomposition") ||
+      prompt.includes("# Task: Implement first fixture") ||
+      prompt.includes("Quality Verification"),
+    );
+    expect(relevantPrompts).toHaveLength(3);
+    for (const prompt of relevantPrompts) {
+      expect(prompt).toContain(`id: ${approvedVersion.id}`);
+      expect(prompt).toContain("approved-v1 scope");
+      expect(prompt).toContain("excluded-v1");
+      expect(prompt).toContain("approved acceptance");
+      expect(prompt).toContain("approved expected task");
+      expect(prompt).toContain("approved verification");
+      expect(prompt).not.toContain("unapproved legacy scope");
+      expect(prompt).not.toContain("approved-v2 scope");
+    }
+  });
+
+  it("유효 task가 없는 decompose는 run을 failed로 닫고 pin을 해제한다", async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-empty-decomposition";
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority)
+      VALUES (?, ?, 'Empty decomposition', 'goal', 'high')
+    `).run(goalId, projectId);
+    const version = saveSpecDraft(db, goalId, {
+      scope: "scope",
+      out_of_scope: "none",
+      acceptance_criteria: ["accepted"],
+      expected_tasks: ["task"],
+      verification_methods: ["test"],
+    });
+    approveSpecVersion(db, goalId, version.id);
+    const engine = createOrchestrationEngine(
+      db,
+      new FakeSessionManager({ decompositionResponse: '```json\n{"tasks":[]}\n```' }),
+      () => {},
+    );
+
+    await expect(engine.decomposeGoal(goalId)).rejects.toThrow("produced no valid tasks");
+    expect(db.prepare(`
+      SELECT active_execution_run_id FROM goals WHERE id = ?
+    `).get(goalId)).toEqual({ active_execution_run_id: null });
+    expect(db.prepare(`
+      SELECT status, execution_spec_version_id
+      FROM goal_execution_runs WHERE goal_id = ?
+    `).get(goalId)).toEqual({
+      status: "failed",
+      execution_spec_version_id: version.id,
+    });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE goal_id = ?").get(goalId))
+      .toEqual({ count: 0 });
+  });
+
   it("status API가 metadata 없는 goal-level squash 실패 activity를 failed goal에 포함한다", async () => {
     const repo = makeRepo();
     const db = makeDb();
@@ -1751,6 +1899,17 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
     const projectId = seedFullAutoProject(db, repo, { qaNeedsWorktree: 0, reviewerNeedsWorktree: 0 });
     const sessions = new FakeSessionManager();
     const scheduler = createScheduler(db, sessions, () => {});
+    scheduler.setSpecGenerator(async (goalId) => {
+      saveSpecDraft(db, goalId, {
+        scope: "fixture scope",
+        out_of_scope: "none",
+        acceptance_criteria: ["fixture files are implemented"],
+        expected_tasks: ["implement fixture files"],
+        verification_methods: ["run fixture verification"],
+      });
+      db.prepare("UPDATE goal_specs SET prd_summary = ? WHERE goal_id = ?")
+        .run(JSON.stringify({ scope: "fixture scope" }), goalId);
+    });
     const api = await startGoalApi(db);
     missionGenerationCount = 0;
 
@@ -1758,6 +1917,20 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
       const initialMainCount = Number(git(repo, "rev-list", "--count", "main"));
 
       scheduler.startQueue(projectId);
+
+      const generatedGoal = await waitFor(() => {
+        const row = db.prepare(`
+          SELECT g.id, version.id AS version_id
+          FROM goals g
+          JOIN goal_spec_versions version ON version.goal_id = g.id
+          WHERE g.project_id = ? AND version.status = 'draft'
+          ORDER BY g.created_at ASC, version.version DESC
+          LIMIT 1
+        `).get(projectId) as { id: string; version_id: string } | undefined;
+        return row ?? null;
+      }, "Full Auto goal spec draft");
+      approveSpecVersion(db, generatedGoal.id, generatedGoal.version_id);
+      scheduler.notifyGoalReady(projectId);
 
       const goalAfterFirst = await waitFor(() => {
         const row = db.prepare(`

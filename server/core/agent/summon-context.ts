@@ -7,6 +7,7 @@
  * 쓰도록 순수 함수로 격리한다. taskId가 없거나 없는 항목은 조용히 스킵.
  */
 import type Database from "better-sqlite3";
+import { formatExecutionSpecContext, getTaskExecutionSpec } from "../goal-spec/spec-approval.js";
 
 export type SummonTone = "pass" | "conditional" | "fail" | "neutral";
 export interface SummonChip {
@@ -43,12 +44,18 @@ export function buildSummonContext(db: Database.Database, taskId: string | null 
 
   // 기획서(spec) + worktree — goal 스코프
   if (task.goal_id) {
-    const spec = db
-      .prepare("SELECT prd_summary FROM goal_specs WHERE goal_id = ?")
-      .get(task.goal_id) as { prd_summary: string | null } | undefined;
-    if (spec?.prd_summary) {
-      parts.push(`### 기획서 요약\n${spec.prd_summary}`);
+    const executionSpec = getTaskExecutionSpec(db, task.id);
+    if (executionSpec) {
+      parts.push(formatExecutionSpecContext(executionSpec).trim());
       chips.push({ label: "기획서", tone: "neutral" });
+    } else {
+      const legacySpec = db
+        .prepare("SELECT prd_summary FROM goal_specs WHERE goal_id = ?")
+        .get(task.goal_id) as { prd_summary: string | null } | undefined;
+      if (legacySpec?.prd_summary) {
+        parts.push(`### 기획서 요약\n${legacySpec.prd_summary}`);
+        chips.push({ label: "기획서", tone: "neutral" });
+      }
     }
 
     const goal = db

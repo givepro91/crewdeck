@@ -1,7 +1,7 @@
 import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
-    include: ['server/__tests__/**/*.test.ts', 'server/core/**/*.test.ts'],
+    include: ['server/__tests__/**/*.test.ts', 'server/core/**/*.test.ts', 'dashboard/src/**/*.test.{ts,tsx}'],
     // git worktree/server 스폰이 무거운 통합·E2E 테스트가 파일 병렬 실행 시
     // git-index·소켓 경합으로 산발 실패(ECONNRESET/lock) → 파일 단위 직렬화로 제거.
     fileParallelism: false,

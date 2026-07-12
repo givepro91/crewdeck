@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../lib/api";
+import { ApiError, api } from "../lib/api";
 import { TaskDetail } from "./TaskDetail";
 import { RejectDialog } from "./RejectDialog";
 import { useToast } from "../stores/useToast";
@@ -53,6 +53,16 @@ interface TaskListProps {
   onUpdate?: () => void;
   autopilotMode?: string; // 'off' | 'goal' | 'full'
   onAddGoal?: () => void;
+  /** 미승인 spec으로 실행이 차단됐을 때 해당 goal의 승인 화면(Blueprint)을 여는 콜백. */
+  onOpenSpec?: (goalId: string) => void;
+}
+
+/** 미승인 spec(spec_not_approved 409)으로 실행이 막힌 태스크의 안내 정보. */
+interface SpecBlock {
+  goalId: string | null;
+  message: string;
+  currentDraftVersion: number | null;
+  specStatus?: string;
 }
 
 const DONE_PREVIEW_COUNT = 5;
@@ -73,7 +83,7 @@ function groupBy<T>(arr: T[], key: keyof T): Record<string, T[]> {
   }, {});
 }
 
-export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "off", onAddGoal }: TaskListProps) {
+export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "off", onAddGoal, onOpenSpec }: TaskListProps) {
   const isAutopilot = autopilotMode !== "off";
   const { t } = useTranslation();
   const { showToast } = useToast();
@@ -87,6 +97,8 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
   const [showAllDone, setShowAllDone] = useState(false);
   const [globalSearch, setGlobalSearch] = useState("");
   const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
+  // 미승인 spec으로 차단된 실행 — taskId별 차단 사유 + 승인 동선
+  const [specBlocks, setSpecBlocks] = useState<Record<string, SpecBlock>>({});
 
   const agentMap = useMemo(() => Object.fromEntries(agents.map((a) => [a.id, a])), [agents]);
 
@@ -237,6 +249,19 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
         });
         return still;
       });
+      // Drop spec-block notices once the task actually leaves todo/blocked (e.g. spec approved → running)
+      setSpecBlocks((prev) => {
+        const ids = Object.keys(prev);
+        if (ids.length === 0) return prev;
+        const next: Record<string, SpecBlock> = {};
+        let changed = false;
+        for (const id of ids) {
+          const task = tasks.find((t) => t.id === id);
+          if (task && (task.status === "todo" || task.status === "blocked")) next[id] = prev[id];
+          else changed = true;
+        }
+        return changed ? next : prev;
+      });
     };
     window.addEventListener("crewdeck:refresh", handler);
     return () => window.removeEventListener("crewdeck:refresh", handler);
@@ -277,7 +302,34 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
     }
   };
 
+  // 실행 로컬 상태(pulse + elapsed timer)를 즉시 종료 — 서버가 실행을 시작하지 못한 경우 정리한다.
+  const stopRunningLocal = (taskId: string) => {
+    if (intervalsRef.current[taskId]) {
+      clearInterval(intervalsRef.current[taskId]);
+      delete intervalsRef.current[taskId];
+    }
+    setRunningTasks((prev) => {
+      if (!prev.has(taskId)) return prev;
+      const next = new Set(prev);
+      next.delete(taskId);
+      return next;
+    });
+    setElapsedSeconds((prev) => {
+      if (!(taskId in prev)) return prev;
+      const next = { ...prev };
+      delete next[taskId];
+      return next;
+    });
+  };
+
   const handleRunTask = async (taskId: string) => {
+    // 재실행 시 이전 차단 안내는 걷어낸다
+    setSpecBlocks((prev) => {
+      if (!prev[taskId]) return prev;
+      const next = { ...prev };
+      delete next[taskId];
+      return next;
+    });
     setRunningTasks((prev) => new Set(prev).add(taskId));
     setElapsedSeconds((prev) => ({ ...prev, [taskId]: 0 }));
     intervalsRef.current[taskId] = setInterval(() => {
@@ -285,8 +337,20 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
     }, 1000);
     try {
       await api.orchestration.executeTask(taskId);
-    } catch {
-      // Error will be broadcast via WebSocket
+    } catch (err: unknown) {
+      // 승인 게이트 차단(409 spec_not_approved): WebSocket 이벤트가 오지 않으므로
+      // 로컬 실행 상태·타이머를 직접 정리하고 차단 사유 + 승인 동선을 노출한다.
+      if (err instanceof ApiError && err.code === "spec_not_approved") {
+        stopRunningLocal(taskId);
+        const data = err.data ?? {};
+        const goalId = (typeof data.goalId === "string" ? data.goalId : undefined) ?? taskById[taskId]?.goal_id ?? null;
+        const currentDraftVersion = typeof data.currentDraftVersion === "number" ? data.currentDraftVersion : null;
+        const specStatus = typeof data.specStatus === "string" ? data.specStatus : undefined;
+        setSpecBlocks((prev) => ({ ...prev, [taskId]: { goalId, message: err.message, currentDraftVersion, specStatus } }));
+        showToast(t("specNotApprovedToast"), "error", err.message);
+        return;
+      }
+      // 그 외 오류는 WebSocket으로 브로드캐스트된 상태가 UI를 정리한다
     }
   };
 
@@ -665,6 +729,34 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
               </div>
             );
           } catch { return null; }
+        })()}
+        {/* 승인 게이트 차단 안내 — 미승인 spec으로 실행이 막힘. 사유 + 현재 초안 버전 + 승인 화면 진입 */}
+        {specBlocks[task.id] && (() => {
+          const block = specBlocks[task.id];
+          return (
+            <div className={`pt-0.5 ${isSubtask ? "pl-15" : "pl-9"}`}>
+              <div role="alert" className="rounded-md bg-amber-50 dark:bg-amber-900/20 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+                <span className="font-medium">{t("specNotApprovedBlocked")}</span>{" "}
+                <span className="text-amber-600/80 dark:text-amber-400/80">{block.message}</span>
+                {block.currentDraftVersion != null && (
+                  <span className="text-amber-600/70 dark:text-amber-400/70"> · {t("specCurrentDraft", { version: block.currentDraftVersion })}</span>
+                )}
+                {block.goalId && onOpenSpec && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const goalId = block.goalId!;
+                      setSpecBlocks((prev) => { const next = { ...prev }; delete next[task.id]; return next; });
+                      onOpenSpec(goalId);
+                    }}
+                    className="ml-2 rounded-full bg-amber-500 px-2 py-0.5 font-medium text-white hover:bg-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-400"
+                  >
+                    {t("specOpenApproval")}
+                  </button>
+                )}
+              </div>
+            </div>
+          );
         })()}
         {/* 재작업 버튼 — 이월된(done+fail) 태스크를 다시 열어 재해결 */}
         {task.status === "done" && task.verification_verdict === "fail" && (
