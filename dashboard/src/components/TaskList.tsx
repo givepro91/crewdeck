@@ -32,6 +32,7 @@ interface TaskItem {
   status: string;
   assignee_id: string | null;
   parent_task_id?: string | null;
+  origin_task_id?: string | null;
   goal_id?: string;
   depends_on?: string | null;
   verification_id: string | null;
@@ -131,18 +132,24 @@ export function TaskList({ tasks, agents, projectId, onUpdate, autopilotMode = "
     return null;
   };
 
-  // Separate root tasks and subtasks
-  const rootTasks = useMemo(() => tasks.filter((t) => !t.parent_task_id), [tasks]);
+  // Separate root tasks and children — 위임 subtask(parent_task_id)와 fix task(origin_task_id)를
+  // 모두 원본 밑에 묶는다. fix의 origin이 현재 목록에 없으면(필터/페이지 밖) 고아가 되지 않게 root로 둔다.
+  const rootTasks = useMemo(
+    () => tasks.filter((t) => !t.parent_task_id && !(t.origin_task_id && taskById[t.origin_task_id])),
+    [tasks, taskById],
+  );
   const subtaskMap = useMemo(() => {
     const map: Record<string, TaskItem[]> = {};
     for (const t of tasks) {
-      if (t.parent_task_id) {
-        if (!map[t.parent_task_id]) map[t.parent_task_id] = [];
-        map[t.parent_task_id].push(t);
+      const parent = t.parent_task_id
+        ?? (t.origin_task_id && taskById[t.origin_task_id] ? t.origin_task_id : null);
+      if (parent) {
+        if (!map[parent]) map[parent] = [];
+        map[parent].push(t);
       }
     }
     return map;
-  }, [tasks]);
+  }, [tasks, taskById]);
 
   const groupedTasks = useMemo(() => groupBy(rootTasks, "status"), [rootTasks]);
 

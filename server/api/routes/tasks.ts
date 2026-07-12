@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { AppContext } from "../../index.js";
 import { loadProviderConfig } from "../../core/agent/provider.js";
+import { resolveRootOriginTaskId } from "../../core/orchestration/fix-relations.js";
 import { MAX_TITLE_LEN, MAX_DESC_LEN, MAX_TASK_RETRIES, MAX_REASSIGNS } from "../../utils/constants.js";
 import type {
   AgentProvider,
@@ -150,7 +151,12 @@ export function createTaskRoutes(ctx: AppContext): Router {
       return res.status(400).json({ error: "projectId or goalId query param required" });
     }
     const globalDefault = loadProviderConfig().defaultProvider;
-    res.json(tasks.map((task) => serializeTask(task, globalDefault)));
+    // origin_task_id: fix task면 근본 원본 태스크 id(파생·read-only, 스키마 무변경).
+    // 대시보드가 fix task를 원본 밑에 그룹핑하는 데 쓴다(관계는 verification_issue_tasks에 이미 존재).
+    res.json(tasks.map((task) => ({
+      ...serializeTask(task, globalDefault),
+      origin_task_id: resolveRootOriginTaskId(db, String(task.id)),
+    })));
   });
 
   // Get single task (includes verification badge fields)
