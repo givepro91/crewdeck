@@ -22,8 +22,9 @@ npm run build                       # server (tsup) + dashboard (vite)
 npm start                           # 빌드 산출물 실행 (dist/bin/crewdeck.js)
 
 npm run typecheck                   # server tsc --noEmit
-cd dashboard && npx tsc -b          # dashboard typecheck — ⚠ `tsc --noEmit`은 files:[]+references 구조라 no-op
-npm test                            # vitest run (unit only — 통합/E2E 없음)
+cd dashboard && npx tsc -b          # dashboard typecheck (app + test 프로젝트) — ⚠ `tsc --noEmit`은 files:[]+references 구조라 no-op
+npm test                            # server vitest run (unit only — 통합/E2E 없음)
+cd dashboard && npm test            # dashboard 컴포넌트 테스트 (vitest + jsdom)
 
 # 상시 기동 (macOS launchd — 로그인 자동 시작, 개인 도구 운영 모드)
 scripts/service-macos.sh install|start|stop|restart|status|logs
