@@ -1042,53 +1042,31 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
       : "";
 
     const specPrompt = `
-# Structured Spec Generation
+# Goal Spec Generation
 
-You are a senior product manager. Generate a structured specification for this goal.
+You are a senior product manager. Produce an execution-ready spec for this goal — the single approved blueprint that task decomposition, implementation, and the Quality Gate all follow.
 
 **Project**: ${project?.name || "Unknown"}${techInfo}
 **Goal**: ${goal.title ? `"${goal.title}"` : `"${goal.description}"`}${goal.title && goal.description ? `\n**Details**: ${goal.description}` : ""}${projectDocsContext}${sourceMaterialContext}
 
-Generate a comprehensive spec in this EXACT JSON format:
+Return ONLY this JSON (no surrounding prose) in this EXACT format:
 \`\`\`json
 {
-  "prd_summary": {
-    "background": "Why this goal exists — context and motivation",
-    "objective": "Core objective in one sentence",
-    "scope": "What is included and excluded",
-    "success_metrics": ["Metric 1", "Metric 2"]
-  },
-  "feature_specs": [
-    {
-      "name": "Feature name",
-      "description": "What this feature does",
-      "requirements": ["Req 1", "Req 2"],
-      "priority": "must"
-    }
-  ],
-  "user_flow": [
-    {
-      "step": 1,
-      "action": "User does X",
-      "expected": "System responds with Y"
-    }
-  ],
-  "acceptance_criteria": [
-    "Given X, when Y, then Z"
-  ],
-  "tech_considerations": [
-    "Consider X for performance",
-    "Use Y pattern for maintainability"
-  ]
+  "scope": "What this goal includes — the boundary of work to be done",
+  "out_of_scope": "What is explicitly excluded, to prevent scope creep",
+  "acceptance_criteria": ["Given X, when Y, then Z"],
+  "expected_tasks": ["Concrete unit of work this goal will be decomposed into"],
+  "verification_methods": ["How an acceptance criterion is proven — build passes, unit test, E2E flow, manual check"]
 }
 \`\`\`
 
 Rules:
-- Be specific to this project and goal, not generic
-${goal.source_material ? "- The Source Material above is the user's prepared brief — treat it as the primary source of truth. Derive prd_summary, features, user flow and acceptance criteria from it (preserve its intent, scope and terminology); do not invent scope it doesn't imply.\n" : ""}- Feature priority: "must" (essential), "should" (important), "could" (nice to have)
-- Acceptance criteria in Given/When/Then format
-- Tech considerations should reference the actual tech stack
-- Keep it concise but comprehensive (3-7 features, 5-10 flow steps)
+- Be specific to this project and goal, not generic.
+${goal.source_material ? "- The Source Material above is the user's prepared brief — treat it as the primary source of truth. Derive scope, out_of_scope, acceptance criteria, expected tasks and verification methods from it (preserve its intent, scope and terminology); do not invent scope it doesn't imply.\n" : ""}- scope and out_of_scope are prose strings; the other three are arrays of non-empty strings.
+- acceptance_criteria: Given/When/Then format, one testable outcome each.
+- expected_tasks: 3-7 concrete tasks in rough execution order (planned units before approval, not the final task list).
+- verification_methods: actual ways to verify the acceptance criteria (build/test/E2E/manual), referencing the real tech stack — NOT architectural advice.
+- Keep it concise but complete.
 `;
 
     const specSessionKey = `spec-${goalId}`;
@@ -1115,8 +1093,8 @@ ${goal.source_material ? "- The Source Material above is the user's prepared bri
       if (jsonMatch) {
         specData = JSON.parse(jsonMatch[1]);
       } else {
-        // Fallback: try to find raw JSON object with prd_summary key
-        const rawJsonMatch = parsed.text.match(/\{[\s\S]*"prd_summary"[\s\S]*\}/);
+        // Fallback: try to find raw JSON object with an acceptance_criteria key
+        const rawJsonMatch = parsed.text.match(/\{[\s\S]*"acceptance_criteria"[\s\S]*\}/);
         if (rawJsonMatch) {
           specData = JSON.parse(rawJsonMatch[0]);
         } else {
@@ -1124,53 +1102,45 @@ ${goal.source_material ? "- The Source Material above is the user's prepared bri
         }
       }
 
-      // Keep the generation sentinel until the immutable snapshot exists.
-      // Pollers must never observe terminal idle before the generated draft.
-      const features = Array.isArray(specData.feature_specs) ? specData.feature_specs : [];
-      saveSpecDraft(db, goalId, {
-        scope: specData.prd_summary?.scope ?? "",
-        out_of_scope: "",
-        acceptance_criteria: Array.isArray(specData.acceptance_criteria) ? specData.acceptance_criteria : [],
-        expected_tasks: features.map((feature: any) => {
-          const name = typeof feature?.name === "string" ? feature.name : "";
-          const description = typeof feature?.description === "string" ? feature.description : "";
-          return [name, description].filter(Boolean).join(": ");
-        }).filter(Boolean),
-        verification_methods: Array.isArray(specData.tech_considerations) ? specData.tech_considerations : [],
+      const asStringArray = (value: any): string[] =>
+        Array.isArray(value) ? value.filter((entry) => typeof entry === "string" && entry.trim() !== "") : [];
+
+      // Persist the generated spec directly as a flat draft snapshot. This IS
+      // the execution contract — decompose, implementation, and the Quality
+      // Gate read only this (via getExecutionSpec/formatExecutionSpecContext).
+      // No rich→flat projection: the model produces the flat shape itself, so
+      // out_of_scope and verification_methods are first-class (not "" / tech
+      // considerations), and feature priority/user_flow — which nothing
+      // downstream consumed — are no longer generated.
+      const savedVersion = saveSpecDraft(db, goalId, {
+        scope: typeof specData.scope === "string" ? specData.scope : "",
+        out_of_scope: typeof specData.out_of_scope === "string" ? specData.out_of_scope : "",
+        acceptance_criteria: asStringArray(specData.acceptance_criteria),
+        expected_tasks: asStringArray(specData.expected_tasks),
+        verification_methods: asStringArray(specData.verification_methods),
       });
 
-      // Upsert into goal_specs. Replacing the sentinel is the terminal write.
-      const existing = db.prepare("SELECT id, version FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
-
+      // Clear the '{"_status":"generating"}' sentinel on the legacy goal_specs
+      // row so _status pollers (goals.ts), the scheduler hasSpec check, and the
+      // summon-context legacy fallback observe a completed spec. We keep only a
+      // minimal prd_summary (scope) — the rich PRD columns are intentionally
+      // left empty because nothing downstream reads them.
+      const minimalPrd = JSON.stringify({ scope: savedVersion.scope });
+      const existing = db.prepare("SELECT id FROM goal_specs WHERE goal_id = ?").get(goalId) as { id: string } | undefined;
       if (existing) {
         db.prepare(`
           UPDATE goal_specs SET
-            prd_summary = ?, feature_specs = ?, user_flow = ?,
-            acceptance_criteria = ?, tech_considerations = ?,
+            prd_summary = ?, feature_specs = '[]', user_flow = '[]',
+            acceptance_criteria = ?, tech_considerations = '[]',
             generated_by = 'ai', version = version + 1, updated_at = datetime('now')
           WHERE goal_id = ?
-        `).run(
-          JSON.stringify(specData.prd_summary || {}),
-          JSON.stringify(specData.feature_specs || []),
-          JSON.stringify(specData.user_flow || []),
-          JSON.stringify(specData.acceptance_criteria || []),
-          JSON.stringify(specData.tech_considerations || []),
-          goalId,
-        );
+        `).run(minimalPrd, JSON.stringify(savedVersion.acceptance_criteria), goalId);
       } else {
         db.prepare(`
           INSERT INTO goal_specs (goal_id, prd_summary, feature_specs, user_flow, acceptance_criteria, tech_considerations, generated_by)
-          VALUES (?, ?, ?, ?, ?, ?, 'ai')
-        `).run(
-          goalId,
-          JSON.stringify(specData.prd_summary || {}),
-          JSON.stringify(specData.feature_specs || []),
-          JSON.stringify(specData.user_flow || []),
-          JSON.stringify(specData.acceptance_criteria || []),
-          JSON.stringify(specData.tech_considerations || []),
-        );
+          VALUES (?, ?, '[]', '[]', ?, '[]', 'ai')
+        `).run(goalId, minimalPrd, JSON.stringify(savedVersion.acceptance_criteria));
       }
-      const saved = db.prepare("SELECT * FROM goal_specs WHERE goal_id = ?").get(goalId) as any;
 
       broadcast("project:updated", { projectId: goal.project_id });
 
@@ -1183,14 +1153,7 @@ ${goal.source_material ? "- The Source Material above is the user's prepared bri
       // (`decompose-${goalId}`)로 두 번 spawn되면서 race condition 발생 → 첫 번째
       // 세션이 SIGTERM으로 죽고 textLen=0/exitCode=null로 실패한다.
 
-      return {
-        ...saved,
-        prd_summary: JSON.parse(saved.prd_summary),
-        feature_specs: JSON.parse(saved.feature_specs),
-        user_flow: JSON.parse(saved.user_flow),
-        acceptance_criteria: JSON.parse(saved.acceptance_criteria),
-        tech_considerations: JSON.parse(saved.tech_considerations),
-      };
+      return getSpecState(db, goalId);
     } catch (err: any) {
       // Clear the '{"_status":"generating"}' placeholder so the row doesn't
       // stay stuck forever. A stuck 'generating' row makes processNextGoal
