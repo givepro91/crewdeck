@@ -969,6 +969,18 @@ const en = {
   activityActDelegate: "Delegate",
   activityActTodo: "Update todos",
   activityActSkill: "Run skill",
+  recoveryHistory: "Recovery history",
+  recoveryHistoryEmpty: "No recovery events for this goal",
+  recoveryHistoryLoadFailed: "Could not load recovery history",
+  recoveryPhaseImplementation: "Implementation",
+  recoveryPhaseVerification: "Verification",
+  recoveryPhaseFix: "Fix",
+  recoveryPhaseApproval: "Apply approval",
+  recoveryDecisionResume: "Resumed",
+  recoveryDecisionAdvance: "Advanced safely",
+  recoveryDecisionWaitApproval: "Waiting for approval",
+  recoveryDecisionBlocked: "Needs attention",
+  recoveryUserAction: "Your action",
 } as const;
 
 export default en;

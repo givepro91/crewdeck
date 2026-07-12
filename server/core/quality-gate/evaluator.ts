@@ -158,9 +158,21 @@ export function createQualityGate(
       // same evaluator agent without aborting each other (spawnAgent cleanup
       // only affects the same sessionKey).
       const evaluatorId = `evaluator-${taskId}`;
-      const implementationSessionIdentities = task.assignee_id
+      const liveImplementationSessionIdentities = task.assignee_id
         ? resolveSessionIdentities(sessionManager.getSessionRecord(task.assignee_id))
         : [];
+      const persistedImplementationSessions = task.assignee_id
+        ? db.prepare(`
+          SELECT id, runtime_session_id
+          FROM sessions
+          WHERE task_id = ? AND agent_id = ?
+        `).all(taskId, task.assignee_id) as Array<{ id: string; runtime_session_id: string | null }>
+        : [];
+      const implementationSessionIdentities = [...new Set([
+        ...liveImplementationSessionIdentities,
+        ...persistedImplementationSessions.flatMap((row) => [row.id, row.runtime_session_id])
+          .filter((id): id is string => !!id),
+      ])];
       const implementationSessionId = implementationSessionIdentities[0] ?? null;
       // 과거 fix session의 두 식별자를 모두 수집한다. session_id(sessions row id)는
       // evaluator의 새 row id와 절대 충돌하지 않으므로, 실제 맥락 누수를 잡는 건
@@ -355,6 +367,39 @@ export function createQualityGate(
           taskId,
         );
 
+        const sendForEvaluation = async (prompt: string) => {
+          try {
+            const result = await session.send(prompt);
+            // Goal cancellation intentionally terminates the evaluator. A
+            // deleted task is an expected abort, not a recovery incident.
+            assertTaskStillExists("session response");
+            if (result.exitCode !== 0) {
+              const recoveryDecision = sessionManager.recoverAbnormalExit?.(
+                evaluatorId,
+                "verification",
+                "reconcile",
+                `verification session exited with code ${result.exitCode ?? "signal"}`,
+              ) ?? null;
+              const error = new Error(`Verification session exited with code ${result.exitCode ?? "signal"}`);
+              (error as Error & { recoveryDecision?: string }).recoveryDecision = recoveryDecision ?? undefined;
+              throw error;
+            }
+            return result;
+          } catch (err) {
+            const recoveryDecision = (err as { recoveryDecision?: string })?.recoveryDecision
+              ?? sessionManager.recoverAbnormalExit?.(
+              evaluatorId,
+              "verification",
+              "reconcile",
+              "verification session exited before producing a final result",
+              ) ?? undefined;
+            if (err && typeof err === "object") {
+              (err as { recoveryDecision?: string }).recoveryDecision = recoveryDecision;
+            }
+            throw err;
+          }
+        };
+
         // Surface the review activity on the evaluator agent so the UI can
         // show "누가 무엇을 검토 중인지". Without this, the evaluator agent
         // just turns "working" in the org chart with no task context.
@@ -370,7 +415,7 @@ export function createQualityGate(
           activity: reviewActivity,
         });
 
-        const runResult = await session.send(evaluationPrompt);
+        const runResult = await sendForEvaluation(evaluationPrompt);
         assertTaskStillExists("initial response");
         let evaluatorSessionId = resolveSessionIdentity(
           sessionManager.getSessionRecord(evaluatorId),
@@ -396,7 +441,7 @@ export function createQualityGate(
           log.info("Parse failed, retrying with explicit JSON reminder...");
           const retryPrompt = `이전 응답에서 JSON을 파싱하지 못했습니다. 반드시 \`\`\`json 블록으로만 응답하세요.\n\n${evaluationPrompt}`;
           assertTaskStillExists("parse retry");
-          const retryResult = await session.send(retryPrompt);
+          const retryResult = await sendForEvaluation(retryPrompt);
           assertTaskStillExists("parse retry response");
           evaluatorSessionId = resolveSessionIdentity(
             sessionManager.getSessionRecord(evaluatorId),

@@ -970,6 +970,18 @@ const ko = {
   activityActDelegate: "작업 위임",
   activityActTodo: "할 일 갱신",
   activityActSkill: "스킬 실행",
+  recoveryHistory: "복구 이력",
+  recoveryHistoryEmpty: "이 목표의 복구 이력이 없습니다",
+  recoveryHistoryLoadFailed: "복구 이력을 불러오지 못했습니다",
+  recoveryPhaseImplementation: "구현",
+  recoveryPhaseVerification: "검증",
+  recoveryPhaseFix: "수정",
+  recoveryPhaseApproval: "목표 반영 승인",
+  recoveryDecisionResume: "재개됨",
+  recoveryDecisionAdvance: "안전 지점으로 진행",
+  recoveryDecisionWaitApproval: "승인 대기",
+  recoveryDecisionBlocked: "확인 필요",
+  recoveryUserAction: "필요한 조치",
 } as const;
 
 export default ko;

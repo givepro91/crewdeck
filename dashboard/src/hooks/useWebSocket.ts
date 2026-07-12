@@ -75,6 +75,14 @@ export function useWebSocket() {
               // activity:created(범용 recordActivity 싱크)와 provider:*(typed)를 모두 넘기되,
               // 중복은 activityStore에서 걸러진다(provider:*가 provider 항목을 소유).
               useActivityStore.getState().ingestWsEvent(msg.type, msg.payload);
+              // recovery incident/blocked 사용자 조치는 열린 Goal 상세(RecoveryHistory)가
+              // crewdeck:refresh로만 재조회하므로, 새로고침 없이 즉시 보이도록 함께 발생시킨다.
+              if (
+                msg.type === "activity:created" &&
+                ["recovery_incident", "recovery_manual_action", "recovery_promoted"].includes(msg.payload?.type)
+              ) {
+                window.dispatchEvent(new CustomEvent("crewdeck:refresh", { detail: msg }));
+              }
               break;
             case "team_design:status":
               window.dispatchEvent(new CustomEvent("crewdeck:team-design-status", { detail: msg.payload }));

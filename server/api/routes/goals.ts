@@ -14,6 +14,8 @@ import {
   detectDivergence,
   predictMergeConflict,
   mergeBaseIntoWorktree,
+  recoverSquashCommitEvidence,
+  worktreeHasUncommittedChanges,
   verifyWorktreeSynced,
   type GitMode,
   type GitHubConfig,
@@ -120,7 +122,57 @@ export function createGoalRoutes(ctx: AppContext): Router {
     gitMode: GitMode,
     baseBranch?: string,
   ): { ok: boolean; sha?: string | null; prUrl?: string | null; error?: string } => {
-    const mergeResult = squashMergeGoal(projectWorkdir, goal.worktree_branch, commitMessage, gitMode, baseBranch);
+    const effectiveBaseBranch = baseBranch ?? getDefaultBranch(projectWorkdir);
+    const persisted = db.prepare(
+      "SELECT squash_checkpoint_base_sha, squash_commit_sha FROM goals WHERE id = ?",
+    ).get(goalId) as { squash_checkpoint_base_sha: string | null; squash_commit_sha: string | null } | undefined;
+    let checkpointBaseSha = persisted?.squash_checkpoint_base_sha ?? null;
+    if (!checkpointBaseSha) {
+      const baseHead = spawnSync("git", ["rev-parse", effectiveBaseBranch], {
+        cwd: projectWorkdir,
+        stdio: "pipe",
+        timeout: 10_000,
+        encoding: "utf-8",
+      });
+      if (baseHead.status !== 0 || !baseHead.stdout.trim()) {
+        const error = `Squash base checkpoint 생성 실패: ${(baseHead.stderr || baseHead.stdout || "unknown").trim()}`;
+        db.prepare("UPDATE goals SET squash_status = 'blocked' WHERE id = ?").run(goalId);
+        return { ok: false, error };
+      }
+      checkpointBaseSha = baseHead.stdout.trim();
+      db.prepare(
+        "UPDATE goals SET squash_checkpoint_base_sha = ? WHERE id = ?",
+      ).run(checkpointBaseSha, goalId);
+    }
+
+    const evidence = recoverSquashCommitEvidence(
+      projectWorkdir,
+      effectiveBaseBranch,
+      goal.worktree_branch,
+      checkpointBaseSha,
+      persisted?.squash_commit_sha,
+      goal.worktree_path,
+    );
+    if (evidence.status === "manual_action_required") {
+      const error = `Squash recovery evidence is ambiguous: ${evidence.reason ?? "unknown"}`;
+      db.prepare("UPDATE goals SET squash_status = 'blocked' WHERE id = ?").run(goalId);
+      db.prepare(
+        "INSERT INTO activities (project_id, type, message) VALUES (?, 'git_error', ?)",
+      ).run(goal.project_id, `[recovery] ${error.slice(0, 400)}`);
+      return { ok: false, error };
+    }
+
+    const mergeResult = squashMergeGoal(
+      projectWorkdir,
+      goal.worktree_branch,
+      commitMessage,
+      gitMode,
+      effectiveBaseBranch,
+      {
+        existingSquashSha: evidence.commitSha,
+        checkpointBaseSha,
+      },
+    );
 
     if (mergeResult.error) {
       // nothing-to-commit도 실패다 — goal 브랜치에 반영할 커밋이 없다는 건
@@ -136,6 +188,24 @@ export function createGoalRoutes(ctx: AppContext): Router {
       broadcast("goal:squash_failed", { goalId, error: mergeResult.error });
       broadcast("project:updated", { projectId: goal.project_id });
       return { ok: false, error: mergeResult.error };
+    }
+
+    // 사용자 WIP 보존 가드: squash 자체는 성공(commit이 base에 반영)했더라도, goal
+    // worktree에 미커밋 변경(tracked/untracked WIP)이 남아 있으면 아래 removeWorktree(--force)가
+    // 그것을 영구 삭제한다. squash SHA는 보존(재승인 시 재사용)하되 worktree는 지우지 않고
+    // blocked + 수동 조치로 남겨 사용자가 WIP를 확인·정리한 뒤 재승인하게 한다.
+    if (goal.worktree_path && worktreeHasUncommittedChanges(goal.worktree_path)) {
+      db.prepare("UPDATE goals SET squash_status = 'blocked', squash_commit_sha = ? WHERE id = ?")
+        .run(mergeResult.sha ?? null, goalId);
+      db.prepare(
+        "INSERT INTO activities (project_id, type, message) VALUES (?, 'recovery_manual_action', ?)",
+      ).run(
+        goal.project_id,
+        `[goal-as-unit] Squash는 완료됐으나 goal 작업 공간에 미커밋 변경(WIP)이 남아 자동 정리를 보류합니다 (sha=${mergeResult.sha ?? "none"}). ${String(goal.worktree_path).slice(0, 200)}의 변경을 확인·보존한 뒤 재승인하세요`.slice(0, 400),
+      );
+      broadcast("goal:squash_blocked", { goalId, reason: "goal worktree has uncommitted changes" });
+      broadcast("project:updated", { projectId: goal.project_id });
+      return { ok: false, error: "goal worktree has uncommitted changes" };
     }
 
     // merge는 성공했지만 알릴 것이 있으면 (예: 보존한 로컬 변경 복원 충돌) 활동으로 표면화
@@ -1283,7 +1353,7 @@ ${focusRules}
       return res.status(400).json({ error: "This goal does not use the Goal-as-Unit model" });
     }
     // blocked 도 허용 — squash 실패 후 "재시도"는 승인 재실행과 동일한 경로다
-    if (!["pending_approval", "blocked"].includes(goal.squash_status)) {
+    if (!["pending_approval", "blocked", "approved"].includes(goal.squash_status)) {
       return res.status(400).json({ error: `Cannot approve — current squash_status is '${goal.squash_status}'` });
     }
 
@@ -1335,8 +1405,30 @@ ${focusRules}
     // goal 브랜치는 생성 시점 base에 고정된다. base가 전진(다른 goal 반영·사용자
     // 직접 커밋)했으면 squash 전에 base를 goal worktree로 merge-in한다. 충돌이
     // 예측되면 에이전트가 worktree 안에서 의미 기반으로 해결한 뒤 squash한다.
+    // ── 복구 우선 순서 보장 ──
+    // 이전에 checkpoint가 저장돼 있으면(= squash를 한 번 시도한 뒤 중단됐을 수 있음),
+    // divergence sync(goal 브랜치 자동 merge-in)로 브랜치를 바꾸기 전에 기존 squash 증거를
+    // 먼저 확인한다. 이미 squash가 만들어졌거나(promote/recorded) 상태가 모호하면
+    // (manual_action_required) 브랜치를 건드리지 않는다 — 재사용/차단은 performSquash가
+    // 결정한다. squash가 아직 없을 때(not_created)만 divergence sync를 진행한다.
+    let skipDivergenceSync = false;
+    const persistedForRecovery = db.prepare(
+      "SELECT squash_checkpoint_base_sha, squash_commit_sha FROM goals WHERE id = ?",
+    ).get(goalId) as { squash_checkpoint_base_sha: string | null; squash_commit_sha: string | null } | undefined;
+    if (persistedForRecovery?.squash_checkpoint_base_sha) {
+      const recovery = recoverSquashCommitEvidence(
+        projectWorkdir,
+        baseBranch,
+        goal.worktree_branch,
+        persistedForRecovery.squash_checkpoint_base_sha,
+        persistedForRecovery.squash_commit_sha,
+        goal.worktree_path,
+      );
+      if (recovery.status !== "not_created") skipDivergenceSync = true;
+    }
+
     const worktreeUsable = !!goal.worktree_path && existsSync(goal.worktree_path);
-    if (worktreeUsable && detectDivergence(projectWorkdir, baseBranch, goal.worktree_branch)) {
+    if (!skipDivergenceSync && worktreeUsable && detectDivergence(projectWorkdir, baseBranch, goal.worktree_branch)) {
       let needsAgent = predictMergeConflict(projectWorkdir, baseBranch, goal.worktree_branch);
       if (!needsAgent) {
         const sync = mergeBaseIntoWorktree(goal.worktree_path, baseBranch);

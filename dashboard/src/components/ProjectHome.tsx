@@ -1819,7 +1819,7 @@ export function ProjectHome() {
         ) : tab === "sessions" ? (
           <SessionList projectId={currentProjectId!} />
         ) : tab === "overview" ? (
-          <div className="flex gap-6">
+          <div className="flex flex-col gap-6 xl:flex-row">
             {/* Main column — scrollable, takes remaining width */}
             <div className="flex-1 min-w-0">
               {/* Autopilot Trigger */}
@@ -2645,7 +2645,7 @@ export function ProjectHome() {
             </div>
 
             {/* Side panel — sticky, fixed width, scrollable within */}
-            <div className="w-[360px] max-w-[calc(100vw-2rem)] shrink-0 sticky top-0 self-start max-h-[calc(100vh-140px)] overflow-y-auto space-y-4">
+            <div className="w-full shrink-0 space-y-4 xl:sticky xl:top-0 xl:max-h-[calc(100vh-140px)] xl:w-[360px] xl:self-start xl:overflow-y-auto">
               {/* Task Timeline */}
               <div className="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden">
                 <div className="flex items-center gap-2 px-4 py-2.5 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">

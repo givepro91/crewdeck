@@ -11,6 +11,7 @@ import { providerCliCheck } from "./core/preflight/provider-check.js";
 import { pidLockCheck, runStartupPreflight } from "./core/preflight/index.js";
 import { loadProviderConfig, setRuntimeProviderSubstitution } from "./core/agent/provider.js";
 import { recoverOnStartup, rebroadcastPendingApprovals } from "./core/recovery.js";
+import { resumeRecoveredGoalSquashes } from "./core/orchestration/engine.js";
 import { createProjectRoutes } from "./api/routes/projects.js";
 import { createAgentRoutes } from "./api/routes/agents.js";
 import { createTaskRoutes } from "./api/routes/tasks.js";
@@ -20,6 +21,7 @@ import { createOrchestrationRoutes } from "./api/routes/orchestration.js";
 import { createActivityRoutes } from "./api/routes/activities.js";
 import { createFsRoutes } from "./api/routes/fs.js";
 import { createSessionRoutes } from "./api/routes/sessions.js";
+import { createRecoveryRoutes } from "./api/routes/recovery.js";
 import { createWSHandler } from "./api/websocket.js";
 import { agentActivityLog } from "./core/agent/activity-log.js";
 import { flushVerificationBroadcastOutbox } from "./core/quality-gate/outbox.js";
@@ -277,6 +279,10 @@ export async function startServer(config: ServerConfig): Promise<void> {
   // WebSocket handler
   createWSHandler(wss, apiKey, () => {
     flushVerificationBroadcastOutbox(db, broadcast);
+    // Startup reconciliation runs before any client can connect. Replay the
+    // preserved approval surface after authentication without duplicating the
+    // durable recovery incident/activity recorded above.
+    rebroadcastPendingApprovals(db, broadcast, { recordIncident: false });
   });
 
   // API routes
@@ -289,6 +295,13 @@ export async function startServer(config: ServerConfig): Promise<void> {
   app.use("/api/activities", createActivityRoutes(ctx));
   app.use("/api/fs", createFsRoutes());
   app.use("/api/sessions", createSessionRoutes(ctx));
+  app.use("/api/recovery", createRecoveryRoutes(ctx));
+
+  if (ctx.sessionManager) {
+    void resumeRecoveredGoalSquashes(db, broadcast, ctx.sessionManager).catch((err) => {
+      console.warn(`[crewdeck] Could not resume recovered goal squash pipeline: ${err?.message ?? err}`);
+    });
+  }
 
   // Health check
   app.get("/api/health", (_req, res) => {

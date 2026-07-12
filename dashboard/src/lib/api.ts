@@ -32,6 +32,19 @@ export interface GoalStatusResponse {
   activity_events: GoalActivityEvent[];
 }
 
+export type RecoveryPhase = "implementation" | "verification" | "fix" | "approval";
+export type RecoveryDecision = "resume" | "advance" | "wait_approval" | "blocked";
+
+export interface RecoveryIncident {
+  id: string;
+  goal_id: string;
+  phase: RecoveryPhase;
+  decision: RecoveryDecision;
+  reason: string;
+  user_action: string | null;
+  created_at: string;
+}
+
 export type VerificationTimelineStatus = "passed" | "fixing" | "stopped" | "manual_approval";
 export type VerificationRoundVerdict = "pass" | "fail" | "stopped" | "manual_approval";
 export type VerificationIssueStatus = "open" | "resolved" | "regression";
@@ -445,6 +458,9 @@ export const api = {
   },
   activities: {
     list: (projectId: string) => request<any[]>(`/activities?projectId=${projectId}`),
+  },
+  recovery: {
+    incidents: () => request<{ incidents: RecoveryIncident[] }>("/recovery/incidents"),
   },
   verifications: {
     list: (projectId: string) => request<any[]>(`/verifications?projectId=${projectId}`),

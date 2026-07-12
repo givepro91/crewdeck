@@ -22,6 +22,7 @@ import { makeSpawnFailedError, makeTimeoutError } from "../../../utils/errors.js
 import type { RunResult } from "./claude-code.js";
 import type { AgentBackend, AgentBackendConfig, AgentSession } from "./backend.js";
 import { parseCodexJson } from "./codex-stream-parser.js";
+import { terminateProcessGroup, terminateProcessGroupSync } from "../process-identity.js";
 
 const log = createLogger("codex-adapter");
 
@@ -51,7 +52,12 @@ function buildCodexArgs(config: AgentBackendConfig): string[] {
   return args;
 }
 
-export function createCodexAdapter(): AgentBackend {
+export function createCodexAdapter(runtime: {
+  taskTimeoutMs?: number;
+  sigkillTimeoutMs?: number;
+} = {}): AgentBackend {
+  const taskTimeoutMs = runtime.taskTimeoutMs ?? TASK_TIMEOUT_MS;
+  const sigkillTimeoutMs = runtime.sigkillTimeoutMs ?? SIGKILL_TIMEOUT_MS;
   return {
     provider: "codex",
 
@@ -103,22 +109,29 @@ export function createCodexAdapter(): AgentBackend {
             cwd: resolvePath(config.workdir),
             stdio: ["pipe", "pipe", "pipe"] as const,
             env: safeEnv,
+            detached: process.platform !== "win32",
           });
           session.process = proc;
-          if (proc.pid) session.emit("pid", proc.pid);
+          if (proc.pid) {
+            session.emit("pid", proc.pid);
+            if (process.platform !== "win32") session.emit("process-group-id", proc.pid);
+          }
 
           // Hard wall-clock timeout (stuck-process guard)
-          const HARD_TIMEOUT_MS = TASK_TIMEOUT_MS * 3;
+          const HARD_TIMEOUT_MS = taskTimeoutMs * 3;
           const startTime = Date.now();
-          let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
+          let timeoutTermination: Promise<void> | null = null;
           const hardTimer = setTimeout(() => {
             if (!session.process) return;
             log.warn(`Codex session ${session.id} hard timeout, sending SIGTERM`);
-            session.process.kill("SIGTERM");
-            session.emit("crewdeck:error", makeTimeoutError(Date.now() - startTime).toJSON());
-            sigkillTimer = setTimeout(() => {
-              if (session.process) session.process.kill("SIGKILL");
-            }, SIGKILL_TIMEOUT_MS);
+            timeoutTermination = proc.pid
+              ? terminateProcessGroup(proc.pid, sigkillTimeoutMs)
+              : Promise.resolve().then(() => { proc.kill("SIGTERM"); });
+            void timeoutTermination.then(() => {
+              session.emit("crewdeck:error", makeTimeoutError(Date.now() - startTime).toJSON());
+            }).catch((error) => {
+              log.error(`Codex session ${session.id} process group termination failed`, error);
+            });
           }, HARD_TIMEOUT_MS);
 
           let stdout = "";
@@ -143,9 +156,17 @@ export function createCodexAdapter(): AgentBackend {
           proc.stdin!.write(parts.join("\n\n---\n\n"));
           proc.stdin!.end();
 
-          proc.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+          proc.on("close", async (code: number | null, signal: NodeJS.Signals | null) => {
             clearTimeout(hardTimer);
-            if (sigkillTimer) clearTimeout(sigkillTimer);
+            if (timeoutTermination) {
+              try {
+                await timeoutTermination;
+              } catch (error) {
+                log.error(`Codex session ${session.id} process group termination could not be confirmed`, error);
+                reject(error);
+                return;
+              }
+            }
             const wasKilled = proc.killed;
             session.process = null;
 
@@ -186,7 +207,6 @@ export function createCodexAdapter(): AgentBackend {
 
           proc.on("error", (err: Error) => {
             clearTimeout(hardTimer);
-            if (sigkillTimer) clearTimeout(sigkillTimer);
             session.process = null;
             session.status = "failed";
             session.emit("status", "failed");
@@ -202,16 +222,23 @@ export function createCodexAdapter(): AgentBackend {
       session.kill = () => {
         const proc = session.process;
         if (!proc) return;
-        // 의도적 중단 — close 핸들러(interrupting 분기)가 상태 정리를 담당. SIGKILL 에스컬레이션은
-        // 이 proc이 아직 현재 프로세스일 때만(교체된 다음 턴 오폭 방지).
+        // 의도적 중단은 실패가 아니다. descendant까지 종료한 뒤 close 핸들러가
+        // interrupted 결과를 resolve하도록 표식을 보존한다.
         interrupting = true;
+        if (proc.pid) {
+          terminateProcessGroupSync(proc.pid, sigkillTimeoutMs);
+          session.process = null;
+          session.status = "idle";
+          session.emit("status", "idle");
+          return;
+        }
         proc.kill("SIGTERM");
         setTimeout(() => {
           if (session.process === proc) {
             log.warn(`Codex session ${session.id} did not exit after SIGTERM (kill), sending SIGKILL`);
             proc.kill("SIGKILL");
           }
-        }, SIGKILL_TIMEOUT_MS).unref?.();
+        }, sigkillTimeoutMs).unref?.();
       };
 
       session.cleanup = () => {

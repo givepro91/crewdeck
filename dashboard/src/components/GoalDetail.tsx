@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ActivityLog } from "./ActivityLog";
+import { RecoveryHistory } from "./RecoveryHistory";
 import {
   type GoalStatus,
   type GoalStatusResponse,
@@ -624,6 +625,8 @@ export function GoalDetail({
           )}
         </div>
       )}
+
+      <RecoveryHistory goalId={goalId} />
 
       {status?.status === "failed" && (
         <div className="mt-3">

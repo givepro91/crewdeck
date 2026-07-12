@@ -151,6 +151,19 @@ export interface ActivityLogEntry {
   createdAt: string;
 }
 
+export type RecoveryPhase = "implementation" | "verification" | "fix" | "approval";
+export type RecoveryDecision = "resume" | "advance" | "wait_approval" | "blocked";
+
+export interface RecoveryIncident {
+  id: string;
+  goal_id: string;
+  phase: RecoveryPhase;
+  decision: RecoveryDecision;
+  reason: string;
+  user_action: string | null;
+  created_at: string;
+}
+
 // ─── Goal & Task ───────────────────────────────────────
 
 export type Priority = "critical" | "high" | "medium" | "low";

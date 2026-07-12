@@ -588,6 +588,47 @@ describe("claimTaskForExecution", () => {
       [candidateTaskId]: "todo",
     });
   });
+  it("해제된 claim의 settle lease가 유효한 동안 중복 claim을 거절한다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    const taskId = seedTask(db, goalId, projectId, "todo", agentId);
+    db.prepare(`
+      UPDATE tasks SET started_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+      WHERE id = ?
+    `).run(taskId);
+
+    const claim = claimTaskForExecution(db, taskId);
+
+    expect(claim).toMatchObject({
+      claimed: false,
+      reason: "conflict",
+      status: "todo",
+    });
+    expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId))
+      .toEqual({ status: "todo" });
+  });
+
+  it("stale settle lease는 회수해 같은 task를 1회만 claim한다", () => {
+    const { projectId, agentId } = seedProject(db, "/tmp");
+    const goalId = seedGoal(db, projectId);
+    const taskId = seedTask(db, goalId, projectId, "todo", agentId);
+    db.prepare(`
+      UPDATE tasks SET started_at = datetime('now', '-6 seconds')
+      WHERE id = ?
+    `).run(taskId);
+
+    const first = claimTaskForExecution(db, taskId);
+    const duplicate = claimTaskForExecution(db, taskId);
+
+    expect(first).toEqual({ claimed: true, taskId });
+    expect(duplicate).toMatchObject({
+      claimed: false,
+      reason: "conflict",
+      status: "in_progress",
+    });
+    expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId))
+      .toEqual({ status: "in_progress" });
+  });
 });
 
 describe("executeTask — claim 해제", () => {

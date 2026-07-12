@@ -155,6 +155,49 @@ describe("scheduler failure redispatch ordering", () => {
       .toEqual({ status: "todo" });
   });
 
+  it("dirty recovery blocked 판단을 rate-limit failover가 todo로 덮지 않는다", async () => {
+    seedAgent("worker");
+    seedGoal("blocked-goal", 0);
+    seedTask({ id: "blocked-recovery", goalId: "blocked-goal", agentId: "worker" });
+    runtime.executeTask.mockImplementation(async (taskId: string) => {
+      db.prepare(`
+        UPDATE tasks SET status = 'blocked', recovery_manual_action_required = 1
+        WHERE id = ?
+      `).run(taskId);
+      const error = new Error("rate limit reached") as Error & { recoveryDecision: string };
+      error.recoveryDecision = "blocked";
+      throw error;
+    });
+
+    scheduler.startQueue(projectId);
+    await vi.advanceTimersByTimeAsync(1);
+    scheduler.stopQueue(projectId);
+
+    expect(db.prepare(`
+      SELECT status, recovery_manual_action_required FROM tasks WHERE id = 'blocked-recovery'
+    `).get()).toEqual({ status: "blocked", recovery_manual_action_required: 1 });
+    expect(sessionManager.setProviderOverride).not.toHaveBeenCalled();
+  });
+
+  it("clean recovery resume 판단을 generic task error가 blocked로 덮지 않는다", async () => {
+    seedAgent("worker");
+    seedGoal("resume-goal", 0);
+    seedTask({ id: "resume-recovery", goalId: "resume-goal", agentId: "worker" });
+    runtime.executeTask.mockImplementation(async (taskId: string) => {
+      db.prepare("UPDATE tasks SET status = 'todo' WHERE id = ?").run(taskId);
+      const error = new Error("invalid agent output") as Error & { recoveryDecision: string };
+      error.recoveryDecision = "resume";
+      throw error;
+    });
+
+    scheduler.startQueue(projectId);
+    await vi.advanceTimersByTimeAsync(1);
+    scheduler.stopQueue(projectId);
+
+    expect(db.prepare("SELECT status, retry_count FROM tasks WHERE id = 'resume-recovery'").get())
+      .toEqual({ status: "todo", retry_count: 0 });
+  });
+
   it("failover callback과 poll이 겹쳐도 같은 task만 한 번 재claim하고 새 session을 연결한다", async () => {
     seedAgent("worker");
     seedAgent("next-agent");
@@ -386,5 +429,57 @@ describe("scheduler failure redispatch ordering", () => {
       .toEqual({ status: "in_progress", retry_count: 1 });
     expect(db.prepare("SELECT status FROM tasks WHERE id = 'same-goal-next'").get())
       .toEqual({ status: "todo" });
+  });
+
+  it("양쪽 provider가 연속 실패해도 왕복 재디스패치와 중복 실행을 막고 사유를 남긴다", async () => {
+    seedAgent("worker");
+    seedGoal("failed-goal", 0);
+    seedTask({ id: "failed", goalId: "failed-goal", agentId: "worker" });
+
+    let attempt = 0;
+    runtime.executeTask.mockImplementation(async (taskId: string) => {
+      attempt++;
+      const provider = attempt === 1 ? "claude" : "codex";
+      db.prepare(`
+        INSERT INTO sessions (id, agent_id, status, provider, task_id)
+        VALUES (?, 'worker', 'failed', ?, ?)
+      `).run(`session-${provider}`, provider, taskId);
+      db.prepare("UPDATE tasks SET status = 'todo' WHERE id = ?").run(taskId);
+      throw new Error("rate limit reached");
+    });
+
+    scheduler.startQueue(projectId);
+    scheduler.notifyGoalReady(projectId);
+    scheduler.notifyGoalReady(projectId);
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(runtime.executeTask.mock.calls.map(([taskId]) => taskId))
+      .toEqual(["failed", "failed"]);
+    expect(sessionManager.setProviderOverride).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(sessionManager.setProviderOverride).mock.calls)
+      .toEqual([["worker", "codex"], ["worker", "codex"]]);
+    expect(db.prepare(`
+      SELECT provider_failover_redispatched, provider_failover_loop_guard_blocked,
+             provider_failover_original_session_id, provider_failover_redispatched_session_id
+      FROM tasks WHERE id = 'failed'
+    `).get()).toEqual({
+      provider_failover_redispatched: 1,
+      provider_failover_loop_guard_blocked: 1,
+      provider_failover_original_session_id: "session-claude",
+      provider_failover_redispatched_session_id: "session-codex",
+    });
+    const decisions = db.prepare(`
+      SELECT message, metadata FROM activities
+      WHERE project_id = ? AND type = 'provider_failover_decision'
+      ORDER BY id
+    `).all(projectId) as Array<{ message: string; metadata: string }>;
+    expect(decisions).toHaveLength(2);
+    expect(decisions[1]?.message).toContain("왕복 방지를 위해 추가 전환을 차단했습니다");
+    expect(JSON.parse(decisions[1]!.metadata)).toMatchObject({
+      fromProvider: "codex",
+      toProvider: "claude",
+      redispatched: false,
+      loopGuardBlocked: true,
+    });
   });
 });

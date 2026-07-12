@@ -103,6 +103,11 @@ export function migrate(db: Database.Database): void {
       id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
       agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
       pid INTEGER,          -- OS process ID
+      process_group_id INTEGER, -- POSIX process group ID for crash-safe tree termination
+      process_started_at TEXT, -- OS start identity used to reject reused PID/PGID ownership
+      process_executable TEXT, -- executable captured with the start identity
+      process_parent_id INTEGER, -- parent at spawn; recovery accepts only it or OS reparenting to PID 1
+      process_owner_token TEXT, -- CREWDECK_AGENT_ID captured before spawn for ownership proof
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       ended_at TEXT,
       status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'failed', 'killed')),
@@ -118,6 +123,7 @@ export function migrate(db: Database.Database): void {
       provider_failover_original_session_id TEXT,
       provider_failover_redispatched_session_id TEXT,
       task_id TEXT,         -- task this session was spawned to execute (redispatch correlation)
+      runtime_session_id TEXT, -- provider conversation id (session separation/recovery evidence)
       token_usage INTEGER DEFAULT 0,
       cost_usd REAL DEFAULT 0,
       last_output TEXT      -- Last output snippet for display
@@ -134,6 +140,18 @@ export function migrate(db: Database.Database): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- Durable recovery audit trail. Each row is the user-facing result of one
+    -- startup or abnormal-session reconciliation decision.
+    CREATE TABLE IF NOT EXISTS recovery_incidents (
+      id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+      goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+      phase TEXT NOT NULL CHECK (phase IN ('implementation', 'verification', 'fix', 'approval')),
+      decision TEXT NOT NULL CHECK (decision IN ('resume', 'advance', 'wait_approval', 'blocked')),
+      reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+      user_action TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Indexes
     CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project_id);
     CREATE INDEX IF NOT EXISTS idx_goals_project ON goals(project_id);
@@ -143,6 +161,7 @@ export function migrate(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_verifications_task ON verifications(task_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
     CREATE INDEX IF NOT EXISTS idx_activities_project ON activities(project_id);
+    CREATE INDEX IF NOT EXISTS idx_recovery_incidents_goal ON recovery_incidents(goal_id, created_at DESC);
   `);
 
   // Incremental migrations for existing databases
@@ -170,6 +189,21 @@ export function migrate(db: Database.Database): void {
   // session that lands in the same rowid window as the real redispatch spawn.
   if (!sessionColumns.some((c) => c.name === "task_id")) {
     db.exec("ALTER TABLE sessions ADD COLUMN task_id TEXT");
+  }
+  if (!sessionColumns.some((c) => c.name === "process_group_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN process_group_id INTEGER");
+  }
+  if (!sessionColumns.some((c) => c.name === "process_started_at")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN process_started_at TEXT");
+  }
+  if (!sessionColumns.some((c) => c.name === "process_executable")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN process_executable TEXT");
+  }
+  if (!sessionColumns.some((c) => c.name === "process_parent_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN process_parent_id INTEGER");
+  }
+  if (!sessionColumns.some((c) => c.name === "process_owner_token")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN process_owner_token TEXT");
   }
 
   // Agent hierarchy: parent_id + expanded roles
@@ -427,6 +461,9 @@ export function migrate(db: Database.Database): void {
   if (!sessionColsProv.some((c) => c.name === "provider")) {
     db.exec("ALTER TABLE sessions ADD COLUMN provider TEXT");
   }
+  if (!sessionColsProv.some((c) => c.name === "runtime_session_id")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN runtime_session_id TEXT");
+  }
   const sessionProviderTraceColumns = [
     ["provider_trace_resolved_provider", "ALTER TABLE sessions ADD COLUMN provider_trace_resolved_provider TEXT"],
     ["provider_trace_resolution_source", "ALTER TABLE sessions ADD COLUMN provider_trace_resolution_source TEXT"],
@@ -495,6 +532,24 @@ export function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN acceptance_script TEXT");
   }
 
+  // Crash recovery evidence — captured immediately before a Goal-as-Unit task
+  // starts mutating its shared worktree. Startup recovery compares these
+  // values read-only before deciding whether the task may run again.
+  const taskRecoveryColumns = [
+    ["recovery_checkpoint_head_sha", "ALTER TABLE tasks ADD COLUMN recovery_checkpoint_head_sha TEXT"],
+    ["recovery_worktree_branch", "ALTER TABLE tasks ADD COLUMN recovery_worktree_branch TEXT"],
+    ["recovery_worktree_dirty", "ALTER TABLE tasks ADD COLUMN recovery_worktree_dirty INTEGER"],
+    ["recovery_worktree_diff_hash", "ALTER TABLE tasks ADD COLUMN recovery_worktree_diff_hash TEXT"],
+    ["recovery_manual_action_required", "ALTER TABLE tasks ADD COLUMN recovery_manual_action_required INTEGER NOT NULL DEFAULT 0"],
+    ["recovery_manual_action_reason", "ALTER TABLE tasks ADD COLUMN recovery_manual_action_reason TEXT"],
+    ["recovery_commit_ready", "ALTER TABLE tasks ADD COLUMN recovery_commit_ready INTEGER NOT NULL DEFAULT 0"],
+    ["recovery_commit_sha", "ALTER TABLE tasks ADD COLUMN recovery_commit_sha TEXT"],
+    ["recovery_resume_phase", "ALTER TABLE tasks ADD COLUMN recovery_resume_phase TEXT CHECK (recovery_resume_phase IN ('implementation', 'verification', 'fix'))"],
+  ];
+  for (const [name, sql] of taskRecoveryColumns) {
+    if (!taskColsLate.some((c) => c.name === name)) db.exec(sql);
+  }
+
   // Goal-as-Unit: goals 테이블 컬럼 추가
   // 증분 마이그레이션 — 기존 goals는 DEFAULT 값으로 자동 적용 (legacy 호환)
   const goalColsLate = db.prepare("PRAGMA table_info(goals)").all() as { name: string }[];
@@ -515,6 +570,9 @@ export function migrate(db: Database.Database): void {
   }
   if (!goalColsLate.some((c) => c.name === "squash_status")) {
     db.exec("ALTER TABLE goals ADD COLUMN squash_status TEXT NOT NULL DEFAULT 'none'");
+  }
+  if (!goalColsLate.some((c) => c.name === "squash_checkpoint_base_sha")) {
+    db.exec("ALTER TABLE goals ADD COLUMN squash_checkpoint_base_sha TEXT");
   }
 
   // Phase 3: QA 회귀 태스크 ID — squash 진입 전 1회만 생성 보장 (idempotent)

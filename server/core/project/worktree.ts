@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, appendFileSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createLogger } from "../../utils/logger.js";
 import { ensureGitIdentity } from "./git-workflow.js";
 
@@ -11,6 +11,133 @@ const log = createLogger("worktree");
 export interface WorktreeInfo {
   path: string;
   branch: string;
+}
+
+export interface WorktreeRecoveryState {
+  status: "safe" | "manual_action_required";
+  registered: boolean;
+  branch: string | null;
+  headSha: string | null;
+  dirty: boolean;
+  diffHash: string | null;
+  reasons: string[];
+}
+
+interface GitReadResult {
+  status: number | null;
+  stdout: string;
+}
+
+function runGitReadOnly(cwd: string, args: string[]): GitReadResult {
+  const result = spawnSync("git", args, {
+    cwd,
+    stdio: "pipe",
+    timeout: 10_000,
+    encoding: "utf-8",
+  });
+  return { status: result.status, stdout: result.stdout?.toString() ?? "" };
+}
+
+/**
+ * Recovery checkpoint와 대조할 수 있는 안정적인 dirty snapshot hash.
+ * tracked diff와 untracked file object id를 모두 포함하며 Git 상태를 변경하지 않는다.
+ */
+export function getWorktreeDiffHash(worktreePath: string): string | null {
+  const status = runGitReadOnly(worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (status.status !== 0) return null;
+  if (!status.stdout) return null;
+
+  const diff = runGitReadOnly(worktreePath, ["diff", "--binary", "HEAD", "--"]);
+  if (diff.status !== 0) return null;
+  const untracked = runGitReadOnly(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  if (untracked.status !== 0) return null;
+
+  const hash = createHash("sha256");
+  hash.update(status.stdout);
+  hash.update("\0tracked-diff\0");
+  hash.update(diff.stdout ?? "");
+
+  const paths = (untracked.stdout ?? "").split("\0").filter(Boolean).sort();
+  for (const path of paths) {
+    const object = runGitReadOnly(worktreePath, ["hash-object", "--no-filters", "--", path]);
+    if (object.status !== 0) return null;
+    hash.update("\0untracked\0");
+    hash.update(path);
+    hash.update("\0");
+    hash.update(object.stdout.trim());
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * 재시작 시 DB checkpoint의 worktree/branch/dirty 증거와 대조할 Git 상태를
+ * read-only로 수집한다. 불일치나 손상은 자동 checkout/reset하지 않고 수동 조치로 차단한다.
+ */
+export function inspectWorktreeRecoveryState(
+  worktreePath: string,
+  expectedBranch: string,
+  expectedDirty?: boolean,
+  expectedDiffHash?: string | null,
+  expectedHeadSha?: string | null,
+): WorktreeRecoveryState {
+  const reasons: string[] = [];
+  if (!existsSync(worktreePath)) {
+    return {
+      status: "manual_action_required",
+      registered: false,
+      branch: null,
+      headSha: null,
+      dirty: false,
+      diffHash: null,
+      reasons: ["worktree path does not exist"],
+    };
+  }
+
+  const list = runGitReadOnly(worktreePath, ["worktree", "list", "--porcelain"]);
+  const canonicalExpected = (() => {
+    try { return realpathSync(worktreePath); } catch { return resolve(worktreePath); }
+  })();
+  const registered = list.status === 0 && (list.stdout ?? "")
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .some((line) => {
+      const candidate = line.slice("worktree ".length);
+      try { return realpathSync(candidate) === canonicalExpected; } catch { return resolve(candidate) === canonicalExpected; }
+    });
+  if (!registered) reasons.push("worktree is not registered in Git metadata");
+
+  const branchResult = runGitReadOnly(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  const branch = branchResult.status === 0 ? branchResult.stdout.trim() || null : null;
+  if (branch !== expectedBranch) reasons.push(`worktree branch mismatch: expected ${expectedBranch}, got ${branch ?? "detached"}`);
+
+  const headResult = runGitReadOnly(worktreePath, ["rev-parse", "--verify", "HEAD"]);
+  const headSha = headResult.status === 0 ? headResult.stdout.trim() || null : null;
+  if (!headSha) reasons.push("worktree HEAD is unavailable");
+  if (expectedHeadSha !== undefined && (expectedHeadSha ?? null) !== headSha) {
+    reasons.push(`worktree HEAD mismatch: expected ${expectedHeadSha ?? "none"}, got ${headSha ?? "none"}`);
+  }
+
+  const statusResult = runGitReadOnly(worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (statusResult.status !== 0) reasons.push("worktree status is unavailable");
+  const dirty = statusResult.status === 0 && !!statusResult.stdout;
+  const diffHash = dirty ? getWorktreeDiffHash(worktreePath) : null;
+  if (dirty && !diffHash) reasons.push("dirty worktree diff hash is unavailable");
+  if (expectedDirty !== undefined && dirty !== expectedDirty) {
+    reasons.push(`dirty state mismatch: expected ${expectedDirty}, got ${dirty}`);
+  }
+  if (expectedDiffHash !== undefined && (expectedDiffHash ?? null) !== diffHash) {
+    reasons.push("dirty worktree diff hash mismatch");
+  }
+
+  return {
+    status: reasons.length === 0 ? "safe" : "manual_action_required",
+    registered,
+    branch,
+    headSha,
+    dirty,
+    diffHash,
+    reasons,
+  };
 }
 
 /**
@@ -249,35 +376,9 @@ export function cleanupStaleWorktrees(projectWorkdir: string, excludePaths: stri
     }
   } catch { /* best effort */ }
 
-  // 서버 재시작 시 dangling crewdeck-checkpoint- stash 정리
-  try {
-    const stashListResult = spawnSync("git", ["stash", "list"], {
-      cwd: projectWorkdir,
-      stdio: "pipe",
-      timeout: 10_000,
-      encoding: "utf-8",
-    });
-    if (stashListResult.status === 0 && stashListResult.stdout) {
-      const stashLines = stashListResult.stdout.split("\n").filter(Boolean);
-      // 역순으로 처리해야 stash index가 올바름 (뒤에서부터 drop)
-      const checkpointIndices: number[] = [];
-      stashLines.forEach((line, idx) => {
-        if (line.includes("crewdeck-checkpoint-")) {
-          checkpointIndices.push(idx);
-        }
-      });
-      // 높은 인덱스부터 drop (낮은 인덱스 변동 방지)
-      for (const idx of checkpointIndices.sort((a, b) => b - a)) {
-        spawnSync("git", ["stash", "drop", `stash@{${idx}}`], {
-          cwd: projectWorkdir,
-          stdio: "pipe",
-          timeout: 10_000,
-        });
-        log.info(`Cleaned up stale crewdeck-checkpoint stash at index ${idx}`);
-        cleaned++;
-      }
-    }
-  } catch { /* best effort */ }
+  // checkpoint stash는 재시작 후 dirty/WIP 복구 증거다. 소유 goal과
+  // 저장 checkpoint를 대조하기 전에는 stale로 간주해 일괄 삭제하지 않는다.
+  // 정상 성공/롤백 경로는 dropCheckpoint/restoreCheckpoint가 개별 정리한다.
 
   if (cleaned > 0) log.info(`Cleaned up ${cleaned} stale worktrees/branches in ${projectWorkdir}`);
   return cleaned;

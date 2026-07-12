@@ -120,7 +120,10 @@ export function pickParallelGoals(db: Database, projectId: string, maxGoals: num
         SELECT 1 FROM tasks retrying
         WHERE retrying.goal_id = g.id
           AND retrying.status = 'blocked'
-          AND NOT (retrying.retry_count >= ? AND retrying.reassign_count >= ?)
+          AND (
+            retrying.recovery_manual_action_required = 1
+            OR NOT (retrying.retry_count >= ? AND retrying.reassign_count >= ?)
+          )
       )
       AND EXISTS (
         SELECT 1 FROM tasks t
@@ -511,6 +514,7 @@ export function createScheduler(
         AND (
           (
             status = 'blocked'
+            AND recovery_manual_action_required = 0
             AND NOT (retry_count >= ? AND reassign_count >= ?)
           )
           OR (
@@ -940,6 +944,7 @@ export function createScheduler(
     const blockedWithRetries = db.prepare(`
       SELECT id, title FROM tasks
       WHERE project_id = ? AND status = 'blocked'
+        AND recovery_manual_action_required = 0
         AND NOT (retry_count >= ? AND reassign_count >= ?)
     `).all(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS) as { id: string; title: string }[];
 
@@ -988,6 +993,7 @@ export function createScheduler(
       const retried = db.prepare(`
         UPDATE tasks SET status = 'todo', retry_count = retry_count + 1, updated_at = datetime('now')
         WHERE project_id = ? AND status = 'blocked' AND retry_count = ?
+          AND recovery_manual_action_required = 0
           AND updated_at <= datetime('now', '-${levelCooldown} seconds')
       `).run(projectId, level);
       totalRetried += retried.changes;
@@ -1005,6 +1011,7 @@ export function createScheduler(
     const exhausted = db.prepare(`
       SELECT t.id, t.assignee_id, t.title, t.reassign_count FROM tasks t
       WHERE t.project_id = ? AND t.status = 'blocked' AND t.retry_count >= ? AND t.reassign_count < ?
+        AND t.recovery_manual_action_required = 0
         AND t.updated_at <= datetime('now', '-${reassignCooldown} seconds')
     `).all(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS) as { id: string; assignee_id: string | null; title: string; reassign_count: number }[];
 
@@ -1090,6 +1097,7 @@ export function createScheduler(
     const stuck = db.prepare(`
       SELECT t.id, t.title, t.goal_id FROM tasks t
       WHERE t.project_id = ? AND t.status = 'blocked'
+        AND t.recovery_manual_action_required = 0
         AND t.retry_count >= ? AND t.reassign_count >= ?
     `).all(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS) as { id: string; title: string; goal_id: string }[];
 
@@ -1129,7 +1137,7 @@ export function createScheduler(
    */
   function updateGoalProgressExcludingBlocked(projectId: string): void {
     const goals = db.prepare(
-      "SELECT DISTINCT goal_id FROM tasks WHERE project_id = ? AND status = 'blocked' AND retry_count >= ? AND reassign_count >= ?",
+      "SELECT DISTINCT goal_id FROM tasks WHERE project_id = ? AND status = 'blocked' AND recovery_manual_action_required = 0 AND retry_count >= ? AND reassign_count >= ?",
     ).all(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS) as { goal_id: string }[];
 
     for (const { goal_id } of goals) {
@@ -1137,7 +1145,7 @@ export function createScheduler(
         SELECT
           COUNT(*) as total,
           SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done,
-          SUM(CASE WHEN status = 'blocked' AND retry_count >= ? AND reassign_count >= ? THEN 1 ELSE 0 END) as permanently_blocked
+          SUM(CASE WHEN status = 'blocked' AND recovery_manual_action_required = 0 AND retry_count >= ? AND reassign_count >= ? THEN 1 ELSE 0 END) as permanently_blocked
         FROM tasks WHERE goal_id = ? AND parent_task_id IS NULL
       `).get(MAX_TASK_RETRIES, MAX_REASSIGNS, goal_id) as { total: number; done: number; permanently_blocked: number };
 
@@ -1447,7 +1455,12 @@ export function createScheduler(
               SELECT COUNT(*) as remaining FROM tasks
               WHERE goal_id = ? AND id != ?
                 AND status != 'done'
-                AND NOT (status = 'blocked' AND retry_count >= ? AND reassign_count >= ?)
+                AND NOT (
+                  status = 'blocked'
+                  AND recovery_manual_action_required = 0
+                  AND retry_count >= ?
+                  AND reassign_count >= ?
+                )
                 AND assignee_id NOT IN (SELECT id FROM agents WHERE project_id = ? AND role IN ('qa-reviewer', 'reviewer', 'qa'))
             `).get(task.goal_id, task.id, MAX_TASK_RETRIES, MAX_REASSIGNS, projectId) as { remaining: number };
 
@@ -1473,12 +1486,14 @@ export function createScheduler(
         if (rawDeps.length > 0) {
           const pendingDeps = rawDeps.filter((depId) => {
             const dep = db.prepare(
-              "SELECT status, retry_count, reassign_count FROM tasks WHERE id = ?"
-            ).get(depId) as { status: string; retry_count: number; reassign_count: number } | undefined;
+              "SELECT status, retry_count, reassign_count, recovery_manual_action_required FROM tasks WHERE id = ?"
+            ).get(depId) as { status: string; retry_count: number; reassign_count: number; recovery_manual_action_required: number } | undefined;
             if (!dep) return false; // 존재하지 않는 ID는 무시 (안전하게)
             if (dep.status === "done") return false;
             // permanently blocked → done과 동일 취급
-            if (dep.retry_count >= MAX_TASK_RETRIES && dep.reassign_count >= MAX_REASSIGNS) return false;
+            if (!dep.recovery_manual_action_required
+              && dep.retry_count >= MAX_TASK_RETRIES
+              && dep.reassign_count >= MAX_REASSIGNS) return false;
             return true; // 아직 미완료
           });
 
@@ -1547,7 +1562,8 @@ export function createScheduler(
         AND (
           (SELECT COUNT(*) FROM tasks t WHERE t.goal_id = g.id AND t.status NOT IN ('done', 'blocked')) > 0
           OR (SELECT COUNT(*) FROM tasks t WHERE t.goal_id = g.id AND t.status = 'blocked'
-              AND (t.retry_count < ? OR t.reassign_count < ?)) > 0
+              AND (t.recovery_manual_action_required = 1
+                OR t.retry_count < ? OR t.reassign_count < ?)) > 0
         )
     `).get(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS) as { cnt: number }).cnt;
 
@@ -1625,7 +1641,8 @@ export function createScheduler(
       SELECT COUNT(*) as cnt FROM tasks
       WHERE project_id = ?
         AND status = 'blocked'
-        AND NOT (retry_count >= ? AND reassign_count >= ?)
+        AND (recovery_manual_action_required = 1
+          OR NOT (retry_count >= ? AND reassign_count >= ?))
     `).get(projectId, MAX_TASK_RETRIES, MAX_REASSIGNS) as { cnt: number };
 
     if (retryable.cnt > 0) return false;
@@ -2259,6 +2276,17 @@ export function createScheduler(
         return;
       }
 
+      const recoveryDecision = err?.recoveryDecision as
+        | "resume" | "advance" | "wait_approval" | "blocked" | undefined;
+      // Recovery already made the authoritative Git/worktree-safe state
+      // transition. blocked/advance/wait_approval must never be overwritten by
+      // provider failover or generic retry handling.
+      if (recoveryDecision && recoveryDecision !== "resume") {
+        broadcastTaskSnapshot(task.id);
+        log.warn(`Scheduler preserved recovery decision ${recoveryDecision} for task "${task.title}"`);
+        return;
+      }
+
       // 책임 소재 분류는 errors.ts의 classifyAgentFailure 단일 정본 사용 —
       // engine의 태스크 상태 전이와 판단이 갈리면 전역 오류가 태스크 재시도
       // 예산을 태운다 (세션 소진 실측, 07-08).
@@ -2280,6 +2308,15 @@ export function createScheduler(
         : "claude";
 
       const failureClass = classifyAgentFailure(err, { provider: currentProvider });
+
+      // A clean checkpoint was safely returned to todo. Provider-level errors
+      // may still select a backend below, but a generic task_error must not
+      // rewrite the audited resume decision to blocked.
+      if (recoveryDecision === "resume" && failureClass === "task_error") {
+        broadcastTaskSnapshot(task.id);
+        log.warn(`Scheduler preserved recovery resume for task "${task.title}"`);
+        return;
+      }
 
       // ── Codex/Claude failover — 트리거 실패면 대체 백엔드로 즉시 재디스패치(쿨다운 대신) ──
       if (failureClass === "rate_limit" || failureClass === "session_exhausted" || failureClass === "env_error") {

@@ -181,7 +181,7 @@ export function Sidebar() {
       )}
       {toast && <Toast message={toast} onDismiss={() => setToast(null)} />}
 
-      <aside className="w-[260px] h-screen border-r border-gray-200 dark:border-gray-700 bg-gray-50/50 dark:bg-[#16162a] flex flex-col shrink-0">
+      <aside className="hidden h-screen w-[260px] shrink-0 flex-col border-r border-gray-200 bg-gray-50/50 dark:border-gray-700 dark:bg-[#16162a] sm:flex">
         {/* Logo */}
         <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
           <h1 className="text-sm font-semibold text-gray-800 dark:text-gray-200 tracking-tight">

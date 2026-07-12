@@ -6,11 +6,11 @@ import { parseAgentOutput } from "../agent/adapters/stream-parser.js";
 import { createQualityGate } from "../quality-gate/evaluator.js";
 import { createDelegationEngine } from "./delegation.js";
 import { artifactsDirForGoal, collectScreenshots, initialWorkReport, generateGoalWorkReport, extractWrapUp } from "./work-report.js";
-import { executeGitWorkflow, getDefaultBranch, squashMergeGoal, type GitHubConfig, type GitMode, type GitWorkflowResult } from "../project/git-workflow.js";
+import { commitTaskResult, executeGitWorkflow, getDefaultBranch, recoverTaskCommitEvidence, squashMergeGoal, type GitHubConfig, type GitMode, type GitWorkflowResult } from "../project/git-workflow.js";
 import type { WorktreeInfo } from "../project/worktree.js";
 import { createLogger } from "../../utils/logger.js";
 import { MAX_TITLE_LEN, MAX_DESC_LEN, MAX_SUMMARY_LEN, MAX_TASKS_PER_GOAL, MAX_TASK_RETRIES, MAX_REASSIGNS, MAX_FIX_ROUNDS, MAX_NO_PROGRESS_ROUNDS, MAX_FIX_TASKS_PER_VERIFICATION } from "../../utils/constants.js";
-import type { VerificationScope } from "../../../shared/types.js";
+import type { VerificationResult, VerificationScope } from "../../../shared/types.js";
 import { appendMemory } from "../agent/memory.js";
 import { createMethodologyEngine } from "../methodology/index.js";
 import { autoDetectScope } from "../quality-gate/evaluator.js";
@@ -40,6 +40,7 @@ interface TaskRow {
   parent_task_id: string | null;
   status: string;
   verification_id: string | null;
+  recovery_resume_phase: "implementation" | "verification" | "fix" | null;
   target_files: string | null;  // JSON array of paths (P2: scope anchoring)
   stack_hint: string | null;    // Short stack constraint (P2: scope anchoring)
   depends_on: string | null;    // JSON array of task IDs (DAG dependency)
@@ -83,6 +84,42 @@ interface VerificationIssueRow {
   actual_result: string;
   fix_instruction: string;
   assignee_id: string;
+}
+
+function loadInterruptedFixVerification(db: Database, taskId: string): VerificationResult | null {
+  const row = db.prepare(`
+    SELECT v.id, v.task_id, v.verdict, v.scope, v.dimensions, v.issues,
+           v.severity, v.evaluator_session_id, v.termination_reason, v.created_at
+      FROM verification_fix_rounds r
+      JOIN verifications v ON v.id = r.source_verification_id
+     WHERE r.task_id = ?
+     ORDER BY r.round_number DESC, r.started_at DESC
+     LIMIT 1
+  `).get(taskId) as {
+    id: string;
+    task_id: string;
+    verdict: VerificationResult["verdict"];
+    scope: VerificationResult["scope"];
+    dimensions: string;
+    issues: string;
+    severity: VerificationResult["severity"];
+    evaluator_session_id: string | null;
+    termination_reason: VerificationResult["terminationReason"];
+    created_at: string;
+  } | undefined;
+  if (!row) return null;
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    verdict: row.verdict,
+    scope: row.scope,
+    dimensions: JSON.parse(row.dimensions),
+    issues: JSON.parse(row.issues),
+    severity: row.severity,
+    evaluatorSessionId: row.evaluator_session_id ?? `recovered-${row.id}`,
+    terminationReason: row.termination_reason,
+    createdAt: row.created_at,
+  };
 }
 
 export interface CreatedFixTask {
@@ -961,9 +998,13 @@ export function createOrchestrationEngine(
       if (!existsSync(workdir)) {
         releaseClaimOnSetupFailure(new Error(`Working directory does not exist: ${workdir}`));
       }
+      // A recovered task has already passed delegation and architecture in its
+      // original execution. Re-running either phase could create a new
+      // generator session before the persisted verification/fix checkpoint.
+      const recoveryResumePhase = task.recovery_resume_phase;
 
       // Phase 0: Attempt delegation to subordinates (only for root tasks)
-      if (!task.parent_task_id) {
+      if (!task.parent_task_id && recoveryResumePhase === null) {
         try {
           const delegation = await delegationEngine.attemptDelegation(taskId);
           if (delegation.delegated) {
@@ -1040,7 +1081,7 @@ export function createOrchestrationEngine(
       const complexity = detectComplexity(task);
       let architectContext = "";
 
-      if (complexity !== "simple" && !task.parent_task_id && !isReviewerTask) {
+      if (complexity !== "simple" && !task.parent_task_id && !isReviewerTask && recoveryResumePhase === null) {
         const ctoAgent = db.prepare(
           "SELECT * FROM agents WHERE project_id = ? AND role = 'cto' AND id != ? LIMIT 1",
         ).get(task.project_id, task.assignee_id) as AgentRow | undefined;
@@ -1248,25 +1289,61 @@ export function createOrchestrationEngine(
       }
 
       // Phase 2: Execute via assigned agent
+      const resumePhase = isGoalAsUnit ? recoveryResumePhase : null;
+      const runsImplementation = resumePhase === null || resumePhase === "implementation";
+      // Goal-as-Unit recovery checkpoint. Capture this after the optional
+      // architect phase (which can defensively commit residue) and immediately
+      // before the implementation process starts.
+      if (isGoalAsUnit && resumePhase === null) {
+        const { inspectWorktreeRecoveryState } = await import("../project/worktree.js");
+        const state = inspectWorktreeRecoveryState(effectiveWorkdir, goal!.worktree_branch!);
+        if (state.status !== "safe" || !state.headSha) {
+          releaseClaimOnSetupFailure(new Error(`Cannot checkpoint goal worktree: ${state.reasons.join("; ")}`));
+        }
+        db.prepare(`
+          UPDATE tasks SET
+            recovery_checkpoint_head_sha = ?,
+            recovery_worktree_branch = ?,
+            recovery_worktree_dirty = ?,
+            recovery_worktree_diff_hash = ?,
+            recovery_manual_action_required = 0,
+            recovery_manual_action_reason = NULL,
+            recovery_commit_ready = 0,
+            recovery_commit_sha = NULL,
+            recovery_resume_phase = NULL,
+            updated_at = datetime('now')
+          WHERE id = ?
+        `).run(
+          state.headSha,
+          goal!.worktree_branch,
+          state.dirty ? 1 : 0,
+          state.diffHash,
+          task.id,
+        );
+      }
+
       let session;
-      try {
-        // taskId를 넘겨 sessions.task_id를 찍는다 — failover 재디스패치 backfill이
-        // 이 세션을 task에 정확히 귀속하려면 agent+provider+rowid만으론 부족하다.
-        session = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir, undefined, taskId);
-      } catch (spawnErr: any) {
-        log.error(`Failed to spawn agent for task "${task.title}"`, spawnErr);
-        const error = spawnErr instanceof AgentError
-          ? spawnErr
-          : new Error(`Agent spawn failed: ${spawnErr.message}`);
-        return releaseClaimOnSetupFailure(error);
+      let abnormalRecoveryDecision: "resume" | "advance" | "wait_approval" | "blocked" | null = null;
+      if (runsImplementation) {
+        try {
+          // taskId를 넘겨 sessions.task_id를 찍는다 — failover 재디스패치 backfill이
+          // 이 세션을 task에 정확히 귀속하려면 agent+provider+rowid만으론 부족하다.
+          session = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir, undefined, taskId);
+        } catch (spawnErr: any) {
+          log.error(`Failed to spawn agent for task "${task.title}"`, spawnErr);
+          const error = spawnErr instanceof AgentError
+            ? spawnErr
+            : new Error(`Agent spawn failed: ${spawnErr.message}`);
+          return releaseClaimOnSetupFailure(error);
+        }
       }
 
       // Stream agent output to WebSocket
-      session.on("output", (text: string) => {
+      session?.on("output", (text: string) => {
         broadcast("agent:output", { agentId: task.assignee_id, output: text, taskId });
       });
 
-      session.on("rate-limit", (info: { waitMs: number; stderr: string }) => {
+      session?.on("rate-limit", (info: { waitMs: number; stderr: string }) => {
         broadcast("system:rate-limit", {
           agentId: task.assignee_id,
           agentName,
@@ -1289,7 +1366,7 @@ export function createOrchestrationEngine(
       });
 
       // Sprint 5: broadcast structured errors for Trust UX
-      session.on("crewdeck:error", (error: unknown) => {
+      session?.on("crewdeck:error", (error: unknown) => {
         broadcast("system:error", {
           agentId: task.assignee_id,
           agentName,
@@ -1297,13 +1374,42 @@ export function createOrchestrationEngine(
           error,
         });
       });
-      const execActivity = `task:${task.title?.slice(0, 80) ?? ""}`;
+      const execActivity = `${resumePhase && resumePhase !== "implementation" ? `resume-${resumePhase}` : "task"}:${task.title?.slice(0, 80) ?? ""}`;
       db.prepare("UPDATE agents SET status = 'working', current_task_id = ?, current_activity = ? WHERE id = ?")
         .run(taskId, execActivity, task.assignee_id);
       broadcast("agent:status", { id: task.assignee_id, name: agentName, status: "working", taskId, activity: execActivity });
       broadcast("task:started", { taskId, agentId: task.assignee_id, startedAt: new Date().toISOString() });
 
       try {
+        const persistGoalTaskCommit = (): void => {
+          if (!isGoalAsUnit) return;
+          const checkpoint = db.prepare(
+            "SELECT recovery_checkpoint_head_sha FROM tasks WHERE id = ?",
+          ).get(task.id) as { recovery_checkpoint_head_sha: string | null } | undefined;
+          if (!checkpoint?.recovery_checkpoint_head_sha) {
+            throw new Error("Goal task recovery checkpoint is missing");
+          }
+          db.prepare(
+            "UPDATE tasks SET recovery_commit_ready = 1, updated_at = datetime('now') WHERE id = ?",
+          ).run(task.id);
+          commitTaskResult(effectiveWorkdir, task.title, agentName);
+          const evidence = recoverTaskCommitEvidence(
+            effectiveWorkdir,
+            checkpoint.recovery_checkpoint_head_sha,
+          );
+          if (evidence.status === "manual_action_required") {
+            throw new Error(`Goal task commit evidence is ambiguous: ${evidence.reason ?? "unknown"}`);
+          }
+          if (evidence.commitSha) {
+            db.prepare(`
+              UPDATE tasks SET recovery_commit_sha = ?, recovery_resume_phase = 'verification',
+                updated_at = datetime('now') WHERE id = ?
+            `).run(evidence.commitSha, task.id);
+          }
+        };
+
+        const executionSpecContext = formatExecutionSpecContext(getTaskExecutionSpec(db, task.id));
+        if (runsImplementation) {
         const methodology = createMethodologyEngine();
         const autoApplyRules = methodology.getAutoApplyRules();
 
@@ -1352,7 +1458,6 @@ introduce a different framework / language / build tool to solve this task.` : "
         // (기존에는 autoFix 경로에만 있어, blocked→재시도가 같은 이슈를 백지에서 재발견했다)
         const priorFailureContext = buildFailureHistoryContext(db, task.id);
 
-        const executionSpecContext = formatExecutionSpecContext(getTaskExecutionSpec(db, task.id));
         const implementationPrompt = `
 # Task: ${task.title}
 
@@ -1383,7 +1488,18 @@ writing files for review/QA tasks.
 When complete, provide a summary of changes made.
 `;
 
-        const implResult = await session.send(implementationPrompt);
+        let implResult;
+        try {
+          implResult = await session!.send(implementationPrompt);
+        } catch (sendErr) {
+          abnormalRecoveryDecision = sessionManager.recoverAbnormalExit?.(
+            task.assignee_id,
+            "implementation",
+            "reconcile",
+            "implementation session exited before producing a final result",
+          ) ?? null;
+          throw sendErr;
+        }
         const implParsed = parseAgentOutput(implResult.stdout, implResult.provider);
 
         // Hard gate: detect silent failures where the CLI crashed, the stream
@@ -1392,6 +1508,12 @@ When complete, provide a summary of changes made.
         // "API Error: Unable to connect to API (ECONNRESET)" as its summary.
         const implFailure = detectAgentRunFailure(implResult, implParsed);
         if (implFailure) {
+          abnormalRecoveryDecision = sessionManager.recoverAbnormalExit?.(
+            task.assignee_id,
+            "implementation",
+            "reconcile",
+            `implementation session failed: ${implFailure.message}`,
+          ) ?? null;
           log.error(`Implementation failed [${implFailure.code}]: ${implFailure.message}`, {
             taskId,
             taskTitle: task.title,
@@ -1472,6 +1594,11 @@ When complete, provide a summary of changes made.
           duration: implParsed.usage?.durationMs,
         });
 
+        // The implementation boundary is the durable hand-off to verification.
+        // Commit before changing task status so startup can resume verification
+        // without ever executing the generator twice.
+        persistGoalTaskCommit();
+
         // Sprint 6: result_summary 저장 — 마무리 텍스트를 문단 경계로 (mid-sentence 잘림 방지)
         const summary = extractWrapUp(implParsed.text ?? "", MAX_SUMMARY_LEN);
         db.prepare("UPDATE tasks SET result_summary = ? WHERE id = ?").run(summary, task.id);
@@ -1513,6 +1640,7 @@ When complete, provide a summary of changes made.
           INSERT INTO activities (project_id, agent_id, type, message)
           VALUES (?, ?, 'task_completed', ?)
         `).run(task.project_id, task.assignee_id, `Completed: ${task.title}`);
+        }
 
         // Subtasks skip verification (design decision: parent task level QG only)
         if (task.parent_task_id) {
@@ -1524,10 +1652,15 @@ When complete, provide a summary of changes made.
         transitionTask(db, broadcast, task, "in_review");
 
         // Phase 4: Quality Gate verification (worktree 경로 전달)
-        const verification = await qualityGate.verify(taskId, {
-          scope: effectiveVerificationScope,
-          workdir: effectiveWorkdir,
-        });
+        const verification = resumePhase === "fix"
+          ? loadInterruptedFixVerification(db, taskId)
+          : await qualityGate.verify(taskId, {
+            scope: effectiveVerificationScope,
+            workdir: effectiveWorkdir,
+          });
+        if (!verification) {
+          throw new Error(`Interrupted fix checkpoint for task ${taskId} has no source verification`);
+        }
 
         const stopForEvaluatorError = async (result: typeof verification): Promise<boolean> => {
           if (result.terminationReason !== "evaluator_error") return false;
@@ -1647,11 +1780,11 @@ When complete, provide a summary of changes made.
             if (mappedFixTasks.length > 0) {
               const placeholders = mappedFixTasks.map(() => "?").join(", ");
               db.prepare(`
-                UPDATE tasks SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now')
+                UPDATE tasks SET status = 'pending_approval', updated_at = datetime('now')
                 WHERE id IN (${placeholders})
               `).run(...mappedFixTasks.map((fixTask) => fixTask.taskId));
               for (const fixTask of mappedFixTasks) {
-                broadcast("task:updated", { id: fixTask.taskId, status: "in_progress" });
+                broadcast("task:updated", { id: fixTask.taskId, status: "pending_approval" });
               }
             }
 
@@ -1683,6 +1816,10 @@ Fix ONLY these issues. Do not modify other code.
             }
 
             // Spawn a NEW session for fix (prevent context pollution — Crewdeck rule)
+            if (isGoalAsUnit) {
+              db.prepare("UPDATE tasks SET recovery_resume_phase = 'fix', updated_at = datetime('now') WHERE id = ?")
+                .run(task.id);
+            }
             db.prepare("UPDATE agents SET status = 'working', current_task_id = ?, current_activity = ? WHERE id = ?")
               .run(taskId, `fix(${round}): ${task.title?.slice(0, 72) ?? ""}`, task.assignee_id);
             const fixSession = sessionManager.spawnAgent(task.assignee_id, effectiveWorkdir, undefined, taskId);
@@ -1747,10 +1884,20 @@ Fix ONLY these issues. Do not modify other code.
                 }
                 log.error(`Auto-fix round ${round} failed [${fixFailure.code}]: ${fixFailure.message}`, { taskId, taskTitle: task.title, detail: fixFailure.detail });
                 broadcast("system:error", { agentId: task.assignee_id, agentName, taskId, error: fixFailure.toJSON() });
-                // task_error(진짜 코드 미수정)만 재검증이 태스크 운명을 결정한다.
+                // 정상 종료된 task_error는 재검증이 태스크 운명을 결정한다. 비정상 종료나
+                // 의도적 interrupt는 출력이 완결되지 않았으므로 fix 재개 checkpoint를 유지한다.
+                if (fixResult.exitCode !== 0 || fixResult.interrupted) {
+                  throw fixFailure;
+                }
               }
             } catch (err) {
               fixRunFailed = true;
+              abnormalRecoveryDecision = sessionManager.recoverAbnormalExit?.(
+                task.assignee_id,
+                "fix",
+                "reconcile",
+                "fix session exited before producing a final result",
+              ) ?? null;
               throw err;
             } finally {
               db.prepare(`
@@ -1761,7 +1908,7 @@ Fix ONLY these issues. Do not modify other code.
               `).run(fixRunFailed ? "failed" : "completed", fixRuntimeSessionId, sourceVerificationId);
               if (mappedFixTasks.length > 0) {
                 const placeholders = mappedFixTasks.map(() => "?").join(", ");
-                const fixTaskStatus = fixRunFailed ? "blocked" : "done";
+                const fixTaskStatus = fixRunFailed ? "pending_approval" : "done";
                 db.prepare(`
                   UPDATE tasks SET status = ?, updated_at = datetime('now')
                   WHERE id IN (${placeholders})
@@ -1774,10 +1921,56 @@ Fix ONLY these issues. Do not modify other code.
               sessionManager.clearProviderOverride(task.assignee_id);
             }
 
-            // Re-verify (worktree 경로 전달)
             if (!db.prepare("SELECT 1 FROM tasks WHERE id = ?").get(taskId)) {
-              log.info(`Task ${taskId} deleted during auto-fix — aborting re-verification`);
+              log.info(`Task ${taskId} deleted during auto-fix — aborting before fix commit and re-verification`);
               return { success: false, verdict: "aborted" };
+            }
+            if (isGoalAsUnit) {
+              const currentCommit = db.prepare(
+                "SELECT recovery_checkpoint_head_sha, recovery_commit_sha FROM tasks WHERE id = ?",
+              ).get(task.id) as {
+                recovery_checkpoint_head_sha: string | null;
+                recovery_commit_sha: string | null;
+              } | undefined;
+              if (!currentCommit?.recovery_commit_sha) {
+                throw new Error("Goal task fix checkpoint is missing its implementation commit");
+              }
+
+              // Make successful fix output durable before spawning the next
+              // evaluator. Moving the checkpoint first makes both crash
+              // windows deterministic: no new commit => resume fix; exactly
+              // one new commit => resume verification.
+              db.prepare(`
+                UPDATE tasks SET recovery_checkpoint_head_sha = ?,
+                  recovery_commit_sha = NULL, recovery_resume_phase = 'fix',
+                  updated_at = datetime('now')
+                WHERE id = ?
+              `).run(currentCommit.recovery_commit_sha, task.id);
+              const fixCommit = commitTaskResult(effectiveWorkdir, `${task.title} (fix round ${round})`, agentName);
+              const fixEvidence = recoverTaskCommitEvidence(
+                effectiveWorkdir,
+                currentCommit.recovery_commit_sha,
+              );
+              if (fixEvidence.status === "manual_action_required") {
+                throw new Error(`Goal task fix commit evidence is ambiguous: ${fixEvidence.reason ?? "unknown"}`);
+              }
+              db.prepare(`
+                UPDATE tasks SET recovery_checkpoint_head_sha = ?, recovery_commit_sha = ?,
+                  recovery_resume_phase = 'verification',
+                  updated_at = datetime('now') WHERE id = ?
+              `).run(
+                fixCommit.committed
+                  ? currentCommit.recovery_commit_sha
+                  : currentCommit.recovery_checkpoint_head_sha,
+                fixEvidence.commitSha ?? currentCommit.recovery_commit_sha,
+                task.id,
+              );
+            }
+
+            // Re-verify (worktree 경로 전달)
+            if (isGoalAsUnit) {
+              db.prepare("UPDATE tasks SET recovery_resume_phase = 'verification', updated_at = datetime('now') WHERE id = ?")
+                .run(task.id);
             }
             reVerification = await qualityGate.verify(taskId, {
               scope: effectiveVerificationScope,
@@ -2002,6 +2195,7 @@ Fix ONLY these issues. Do not modify other code.
         };
       } catch (err: any) {
         log.error(`Task execution failed: ${task.title}`, err);
+        abnormalRecoveryDecision = abnormalRecoveryDecision ?? err?.recoveryDecision ?? null;
 
         // Goal cancellation CASCADE-deletes the task. Treat any subprocess
         // completion racing with that delete as an expected abort and avoid
@@ -2025,6 +2219,14 @@ Fix ONLY these issues. Do not modify other code.
         // ⚠ 과거 2: 세션 소진(CLI exit 1 + 빈 stderr)이 여기 분류에 없어서 blocked로
         //   빠짐 — 사용량 한도만으로 재시도 2회가 증발, 무고한 태스크가 재배정/스킵
         //   직전까지 감 (탑과 용병단 실측 07-08). scheduler만 알던 분류를 정본으로 승격.
+        if (abnormalRecoveryDecision) {
+          log.warn(`Task "${task.title}" session exit reconciled as ${abnormalRecoveryDecision}`);
+          if (err && typeof err === "object") {
+            err.recoveryDecision = abnormalRecoveryDecision;
+          }
+          throw err;
+        }
+
         const failureClass = classifyAgentFailure(err);
         const fallbackStatus = failureClass === "task_error" ? "blocked" : "todo";
         transitionTask(db, broadcast, task, fallbackStatus);
@@ -2739,8 +2941,12 @@ function transitionTask(
   task: TaskRow,
   newStatus: string,
 ): void {
-  db.prepare("UPDATE tasks SET status = ?, updated_at = datetime('now') WHERE id = ?")
-    .run(newStatus, task.id);
+  const clearsRecoveryPhase = newStatus === "done" || newStatus === "pending_approval";
+  db.prepare(`
+    UPDATE tasks SET status = ?,
+      recovery_resume_phase = CASE WHEN ? THEN NULL ELSE recovery_resume_phase END,
+      updated_at = datetime('now') WHERE id = ?
+  `).run(newStatus, clearsRecoveryPhase ? 1 : 0, task.id);
   broadcast("task:updated", { ...task, status: newStatus });
 
   // Update agent activity based on task state
@@ -2867,7 +3073,7 @@ async function runGitWorkflow(
  *
  * CAS 락: squash_status = 'triggering' 으로 조건부 UPDATE → changes === 0 이면 이미 다른 호출이 진입한 것으로 중복 방지.
  */
-async function checkAndTriggerGoalSquash(
+export async function checkAndTriggerGoalSquash(
   db: Database,
   broadcast: (event: string, data: unknown) => void,
   sessionManager: SessionManager,
@@ -2916,6 +3122,35 @@ async function checkAndTriggerGoalSquash(
       ).run(goalId);
     }
     throw err;
+  }
+}
+
+/** Continue the normal Goal-as-Unit completion pipeline for tasks promoted
+ * from verified commit evidence during startup recovery. */
+export async function resumeRecoveredGoalSquashes(
+  db: Database,
+  broadcast: (event: string, data: unknown) => void,
+  sessionManager: SessionManager,
+): Promise<void> {
+  const goals = db.prepare(`
+    SELECT DISTINCT g.id, g.worktree_path
+      FROM goals g
+      JOIN tasks t ON t.goal_id = g.id
+     WHERE g.goal_model = 'goal_as_unit'
+       AND g.squash_status = 'none'
+       AND g.worktree_path IS NOT NULL
+       AND t.status = 'done'
+       AND t.recovery_commit_ready = 1
+       AND t.recovery_commit_sha IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM tasks remaining
+          WHERE remaining.goal_id = g.id
+            AND remaining.parent_task_id IS NULL
+            AND remaining.status != 'done'
+       )
+  `).all() as Array<{ id: string; worktree_path: string }>;
+  for (const goal of goals) {
+    await checkAndTriggerGoalSquash(db, broadcast, sessionManager, goal.id, goal.worktree_path);
   }
 }
 

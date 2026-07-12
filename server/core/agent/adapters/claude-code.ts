@@ -17,6 +17,7 @@ import {
   type AgentErrorData,
 } from "../../../utils/errors.js";
 import { loadProviderConfig } from "../provider.js";
+import { terminateProcessGroup, terminateProcessGroupSync } from "../process-identity.js";
 
 const log = createLogger("claude-code-adapter");
 
@@ -70,7 +71,12 @@ export interface ClaudeCodeSession extends EventEmitter {
  *
  * @see /Users/keunsik/develop/swk/paperclip/packages/adapters/claude-local/src/server/execute.ts
  */
-export function createClaudeCodeAdapter() {
+export function createClaudeCodeAdapter(runtime: {
+  taskTimeoutMs?: number;
+  sigkillTimeoutMs?: number;
+} = {}) {
+  const taskTimeoutMs = runtime.taskTimeoutMs ?? TASK_TIMEOUT_MS;
+  const sigkillTimeoutMs = runtime.sigkillTimeoutMs ?? SIGKILL_TIMEOUT_MS;
   return {
     spawn(config: ClaudeCodeConfig): ClaudeCodeSession {
       const session = new EventEmitter() as ClaudeCodeSession;
@@ -114,7 +120,7 @@ export function createClaudeCodeAdapter() {
               args: args.join(" "),
             });
 
-            const TIMEOUT_MS = TASK_TIMEOUT_MS;
+            const TIMEOUT_MS = taskTimeoutMs;
 
             const ALLOWED_ENV_KEYS = [
               "PATH", "HOME", "SHELL", "USER", "LANG", "LC_ALL", "TERM",
@@ -140,6 +146,7 @@ export function createClaudeCodeAdapter() {
               cwd: resolvePath(config.workdir),
               stdio: ["pipe", "pipe", "pipe"] as const,
               env: safeEnv,
+              detached: process.platform !== "win32",
             });
 
             session.process = proc;
@@ -149,31 +156,31 @@ export function createClaudeCodeAdapter() {
             // session.process?.pid is null at that point.
             if (proc.pid) {
               session.emit("pid", proc.pid);
+              if (process.platform !== "win32") session.emit("process-group-id", proc.pid);
             }
 
             // Two-layer timeout:
             // 1. Hard timeout: absolute max wall-clock time (prevents truly stuck processes)
             // 2. Idle timeout: no output for TIMEOUT_MS (catches broken pipes, crashed processes)
             //    BUT: idle timer only starts AFTER first output (TTFT can be long for complex prompts)
-            let sigkillTimer: ReturnType<typeof setTimeout> | null = null;
             let lastActivity = Date.now();
             let hasReceivedOutput = false;
+            let timeoutTermination: Promise<void> | null = null;
 
             const HARD_TIMEOUT_MS = TIMEOUT_MS * 3; // 3x idle timeout as absolute max
 
             /** Clear all pending timers to prevent leaks */
             const clearAllTimers = () => {
               if (idleTimer) { clearTimeout(idleTimer); idleTimer = null as any; }
-              if (sigkillTimer) { clearTimeout(sigkillTimer); sigkillTimer = null; }
             };
 
             /** Reset idle timer on activity (prevents stale timer from firing) */
             const resetIdleTimer = () => {
               if (idleTimer) clearTimeout(idleTimer);
-              idleTimer = setTimeout(checkTimeout, hasReceivedOutput ? TIMEOUT_MS : 30000);
+              idleTimer = scheduleTimeoutCheck(hasReceivedOutput ? TIMEOUT_MS : 30000);
             };
 
-            const checkTimeout = () => {
+            const checkTimeout = async () => {
               if (!session.process) return;
 
               const elapsed = Date.now() - lastActivity;
@@ -184,17 +191,15 @@ export function createClaudeCodeAdapter() {
                 if (totalElapsed >= HARD_TIMEOUT_MS) {
                   clearAllTimers();
                   log.warn(`Session ${session.id} hard timeout: ${Math.round(totalElapsed / 1000)}s with no output at all, sending SIGTERM`);
-                  session.process.kill("SIGTERM");
+                  if (proc.pid) {
+                    timeoutTermination = terminateProcessGroup(proc.pid, sigkillTimeoutMs);
+                    await timeoutTermination;
+                  }
+                  else proc.kill("SIGTERM");
                   const agentError = makeTimeoutError(totalElapsed);
                   session.emit("crewdeck:error", agentError.toJSON());
-                  sigkillTimer = setTimeout(() => {
-                    if (session.process) {
-                      log.warn(`Session ${session.id} did not exit after SIGTERM, sending SIGKILL`);
-                      session.process.kill("SIGKILL");
-                    }
-                  }, SIGKILL_TIMEOUT_MS);
                 } else {
-                  idleTimer = setTimeout(checkTimeout, 30000); // Re-check every 30s
+                  idleTimer = scheduleTimeoutCheck(Math.min(30000, HARD_TIMEOUT_MS - totalElapsed));
                 }
                 return;
               }
@@ -203,21 +208,24 @@ export function createClaudeCodeAdapter() {
               if (elapsed >= TIMEOUT_MS) {
                 clearAllTimers();
                 log.warn(`Session ${session.id} idle for ${Math.round(elapsed / 1000)}s (no output after first response), sending SIGTERM`);
-                session.process.kill("SIGTERM");
+                if (proc.pid) {
+                  timeoutTermination = terminateProcessGroup(proc.pid, sigkillTimeoutMs);
+                  await timeoutTermination;
+                }
+                else proc.kill("SIGTERM");
                 const agentError = makeTimeoutError(elapsed);
                 session.emit("crewdeck:error", agentError.toJSON());
-                sigkillTimer = setTimeout(() => {
-                  if (session.process) {
-                    log.warn(`Session ${session.id} did not exit after SIGTERM, sending SIGKILL`);
-                    session.process.kill("SIGKILL");
-                  }
-                }, SIGKILL_TIMEOUT_MS);
               } else {
-                idleTimer = setTimeout(checkTimeout, TIMEOUT_MS - elapsed + 100);
+                idleTimer = scheduleTimeoutCheck(TIMEOUT_MS - elapsed + 100);
               }
             };
+            const scheduleTimeoutCheck = (delayMs: number) => setTimeout(() => {
+              void checkTimeout().catch((error) => {
+                log.error(`Session ${session.id} process group termination failed`, error);
+              });
+            }, delayMs);
             const startTime = Date.now();
-            let idleTimer: ReturnType<typeof setTimeout> | null = setTimeout(checkTimeout, TIMEOUT_MS);
+            let idleTimer: ReturnType<typeof setTimeout> | null = scheduleTimeoutCheck(TIMEOUT_MS);
 
             let stdout = "";
             let stderr = "";
@@ -244,8 +252,20 @@ export function createClaudeCodeAdapter() {
             proc.stdin!.write(message);
             proc.stdin!.end();
 
-            proc.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+            proc.on("close", async (code: number | null, signal: NodeJS.Signals | null) => {
               clearAllTimers();
+              if (timeoutTermination) {
+                try {
+                  await timeoutTermination;
+                } catch (error) {
+                  session.process = null;
+                  session.status = "failed";
+                  session.emit("status", "failed");
+                  log.error(`Session ${session.id} process group termination could not be confirmed`, error);
+                  reject(error);
+                  return;
+                }
+              }
               const wasKilled = proc.killed;
               session.process = null;
 
@@ -383,19 +403,23 @@ export function createClaudeCodeAdapter() {
       session.kill = () => {
         const proc = session.process;
         if (!proc) return;
-        // 의도적 중단 — close 핸들러(interrupting 분기)가 상태 정리 + interrupted resolve를 담당한다.
-        // process를 여기서 null로 만들지 않는 이유: SIGKILL 에스컬레이션과 close 핸들러가 이 proc을
-        // 참조해야 하기 때문(내부 타임아웃 경로와 동일한 수명주기).
+        // 의도적 중단은 실패가 아니다. detached process group 전체를 동기적으로
+        // 종료해 descendant를 남기지 않되, close 핸들러가 interrupted 결과를 resolve한다.
         interrupting = true;
+        if (proc.pid) {
+          terminateProcessGroupSync(proc.pid, sigkillTimeoutMs);
+          session.process = null;
+          session.status = "idle";
+          session.emit("status", "idle");
+          return;
+        }
         proc.kill("SIGTERM");
-        // SIGTERM에 안 죽으면 SIGKILL. resume가 새 proc으로 교체하면(session.process !== proc)
-        // 건드리지 않아, 다음 턴을 오폭하지 않는다.
         setTimeout(() => {
           if (session.process === proc) {
             log.warn(`Session ${session.id} did not exit after SIGTERM (kill), sending SIGKILL`);
             proc.kill("SIGKILL");
           }
-        }, SIGKILL_TIMEOUT_MS).unref?.();
+        }, sigkillTimeoutMs).unref?.();
       };
 
       session.cleanup = () => {

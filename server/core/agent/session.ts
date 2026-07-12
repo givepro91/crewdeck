@@ -9,6 +9,9 @@ import { loadMemory } from "./memory.js";
 import { agentActivityLog, parseActivityEvents } from "./activity-log.js";
 import { ROLE_DEFAULT_MODEL } from "../../utils/constants.js";
 import { buildSummonContext } from "./summon-context.js";
+import { recordRecoveryIncident, recoverInterruptedTask } from "../recovery.js";
+import type { RecoveryDecision, RecoveryPhase } from "../../../shared/types.js";
+import { readProcessIdentity } from "./process-identity.js";
 
 const log = createLogger("session-manager");
 
@@ -31,6 +34,13 @@ export interface SessionManager {
   /** failover: 다음 spawn(sessionKey)이 강제로 이 provider를 쓰도록 override 설정 */
   setProviderOverride: (sessionKey: string, provider: AgentProvider) => void;
   clearProviderOverride: (sessionKey: string) => void;
+  /** Called by the owning pipeline only after adapter-internal retries finish. */
+  recoverAbnormalExit?: (
+    sessionKey: string,
+    phase: RecoveryPhase,
+    mode: "reconcile" | "advance",
+    reason: string,
+  ) => RecoveryDecision | null;
 }
 
 export interface ExecutionSessionContext {
@@ -46,7 +56,10 @@ export interface SessionRecord {
   runtimeSessionId: string | null;
 }
 
-export function createSessionManager(db: Database): SessionManager {
+export function createSessionManager(
+  db: Database,
+  broadcast?: (event: string, data: unknown) => void,
+): SessionManager {
   const sessions = new Map<string, AgentSession>();
   /** Maps session key → real agent ID (for DB operations) */
   const keyToAgentId = new Map<string, string>();
@@ -214,8 +227,8 @@ export function createSessionManager(db: Database): SessionManager {
           INSERT INTO sessions (
             agent_id, status, provider,
             provider_trace_resolved_provider, provider_trace_resolution_source, task_id,
-            execution_run_id, execution_spec_version_id
-          ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?) RETURNING id
+            process_owner_token, execution_run_id, execution_spec_version_id
+          ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?) RETURNING id
         `)
         // resolved_provider = 실제로 실행된 provider(failover override 반영). 기본 해석과
         // override가 갈릴 때 sessions.provider와 provider_trace_resolved_provider가 어긋나지
@@ -227,6 +240,7 @@ export function createSessionManager(db: Database): SessionManager {
           provider,
           providerResolution.source,
           taskId ?? null,
+          session.id,
           executionRunId,
           executionSpecVersionId,
         ) as { id: string };
@@ -245,13 +259,29 @@ export function createSessionManager(db: Database): SessionManager {
         if (runtimeSessionId) {
           const record = keyToSessionRecord.get(key);
           if (record) record.runtimeSessionId = runtimeSessionId;
+          db.prepare("UPDATE sessions SET runtime_session_id = ? WHERE id = ?")
+            .run(runtimeSessionId, sessionRow.id);
         }
         return result;
       };
 
       // Capture PID immediately after spawn (before "working" event)
       session.on("pid", (pid: number) => {
-        db.prepare("UPDATE sessions SET pid = ? WHERE id = ?").run(pid, sessionRow.id);
+        const identity = readProcessIdentity(pid);
+        db.prepare(`
+          UPDATE sessions
+             SET pid = ?, process_started_at = ?, process_executable = ?, process_parent_id = ?
+           WHERE id = ?
+        `).run(
+          pid,
+          identity?.startToken ?? null,
+          identity?.executable ?? null,
+          identity?.parentProcessId ?? null,
+          sessionRow.id,
+        );
+      });
+      session.on("process-group-id", (processGroupId: number) => {
+        db.prepare("UPDATE sessions SET process_group_id = ? WHERE id = ?").run(processGroupId, sessionRow.id);
       });
 
       // Listen for status changes
@@ -261,9 +291,18 @@ export function createSessionManager(db: Database): SessionManager {
           db.prepare("UPDATE sessions SET pid = COALESCE(pid, ?) WHERE id = ?").run(session.process.pid, sessionRow.id);
         }
         if (status === "working") {
+          // Adapters may start a fresh internal attempt after a failed resume
+          // or rate-limit wait. Keep the durable row active until send() has a
+          // terminal outcome; callers reconcile only that final outcome.
+          db.prepare("UPDATE sessions SET status = 'active', ended_at = NULL WHERE id = ?")
+            .run(sessionRow.id);
           db.prepare("UPDATE agents SET status = 'working' WHERE id = ?").run(agentId);
         } else {
           db.prepare("UPDATE agents SET status = 'idle', current_activity = NULL WHERE id = ?").run(agentId);
+        }
+        if (status === "completed" || status === "failed") {
+          db.prepare("UPDATE sessions SET status = ?, ended_at = datetime('now') WHERE id = ? AND status = 'active'")
+            .run(status, sessionRow.id);
         }
       });
 
@@ -325,7 +364,7 @@ export function createSessionManager(db: Database): SessionManager {
         // to the legacy behavior. This prevents killing sibling active sessions
         // that share the same agent_id.
         if (sessionRowId) {
-          db.prepare("UPDATE sessions SET status = 'killed', ended_at = datetime('now') WHERE id = ?")
+          db.prepare("UPDATE sessions SET status = 'killed', ended_at = datetime('now') WHERE id = ? AND status = 'active'")
             .run(sessionRowId);
         } else {
           db.prepare("UPDATE sessions SET status = 'killed', ended_at = datetime('now') WHERE agent_id = ? AND status = 'active'")
@@ -349,7 +388,7 @@ export function createSessionManager(db: Database): SessionManager {
         session.removeAllListeners();
         session.cleanup();
         if (sessionRowId) {
-          db.prepare("UPDATE sessions SET status = 'killed', ended_at = datetime('now') WHERE id = ?")
+          db.prepare("UPDATE sessions SET status = 'killed', ended_at = datetime('now') WHERE id = ? AND status = 'active'")
             .run(sessionRowId);
         } else {
           db.prepare("UPDATE sessions SET status = 'killed', ended_at = datetime('now') WHERE agent_id = ? AND status = 'active'")
@@ -397,6 +436,37 @@ export function createSessionManager(db: Database): SessionManager {
 
     clearProviderOverride(sessionKey: string): void {
       providerOverrides.delete(sessionKey);
+    },
+
+    recoverAbnormalExit(
+      sessionKey: string,
+      phase: RecoveryPhase,
+      mode: "reconcile" | "advance",
+      reason: string,
+    ): RecoveryDecision | null {
+      const rowId = keyToSessionRowId.get(sessionKey);
+      if (!rowId) return null;
+      const owner = db.prepare(`
+        SELECT s.task_id, t.goal_id, t.project_id
+          FROM sessions s
+          JOIN tasks t ON t.id = s.task_id
+         WHERE s.id = ?
+      `).get(rowId) as { task_id: string; goal_id: string; project_id: string } | undefined;
+      if (!owner) return null;
+
+      if (mode === "advance") {
+        recordRecoveryIncident(db, {
+          projectId: owner.project_id,
+          goalId: owner.goal_id,
+          phase,
+          decision: "advance",
+          reason,
+          userAction: null,
+          source: "session_exit",
+        }, broadcast);
+        return "advance";
+      }
+      return recoverInterruptedTask(db, owner.task_id, "session_exit", undefined, phase, broadcast);
     },
   };
 }

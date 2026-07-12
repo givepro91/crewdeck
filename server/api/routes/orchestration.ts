@@ -22,7 +22,7 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
   const router = Router();
   const { db, broadcast } = ctx;
 
-  const sessionManager = createSessionManager(db);
+  const sessionManager = createSessionManager(db, broadcast);
   const engine = createOrchestrationEngine(db, sessionManager, broadcast);
   const scheduler = createScheduler(db, sessionManager, broadcast);
   const qualityGate = createQualityGate(db, sessionManager, broadcast);

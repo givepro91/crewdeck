@@ -308,9 +308,14 @@ class FakeSessionManager implements SessionManager {
     verificationResponse?: string;
     verificationResponses?: string[];
     failVerificationOnce?: boolean;
+    fixWritesChange?: boolean;
+    fixExitCode?: number;
+    abnormalRecoveryDecision?: "resume" | "advance" | "wait_approval" | "blocked";
     onPrompt?: (message: string) => void;
     decompositionResponse?: string;
   } = {}) {}
+
+  readonly recoveries: Array<{ phase: string; mode: string; reason: string }> = [];
 
   spawnAgent(
     agentId: string,
@@ -348,9 +353,15 @@ class FakeSessionManager implements SessionManager {
     };
     const rawSend = session.send.bind(session);
     session.send = async (message: string) => {
+      if (this.opts.fixWritesChange && message.includes("# Fix Required")) {
+        writeFileSync(join(projectWorkdir, "feature-one.txt"), "fixed\n");
+      }
       this.prompts.push(message);
       this.opts.onPrompt?.(message);
       let result = await rawSend(message);
+      if (this.opts.fixExitCode !== undefined && message.includes("# Fix Required")) {
+        result = { ...result, exitCode: this.opts.fixExitCode };
+      }
       if (this.opts.failVerificationOnce && message.includes("Quality Verification") && this.verificationCount++ === 0) {
         result = streamJson(failVerification(), result.sessionId ?? undefined);
       }
@@ -383,6 +394,15 @@ class FakeSessionManager implements SessionManager {
   resumeSession(): void {}
   setProviderOverride(_sessionKey: string, _provider: AgentProvider): void {}
   clearProviderOverride(): void {}
+  recoverAbnormalExit(
+    _sessionKey: string,
+    phase: "implementation" | "verification" | "fix" | "approval",
+    mode: "reconcile" | "advance",
+    reason: string,
+  ): "resume" | "advance" | "wait_approval" | "blocked" | null {
+    this.recoveries.push({ phase, mode, reason });
+    return this.opts.abnormalRecoveryDecision ?? null;
+  }
 }
 
 async function startGoalApi(db: Database.Database): Promise<{ baseUrl: string; close: () => Promise<void> }> {
@@ -1484,6 +1504,91 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
     });
   });
 
+  it("non-zero fix 종료는 재검증을 spawn하지 않고 fix 재개 지점을 유지한다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-nonzero-fix";
+    const taskId = "task-nonzero-fix";
+    const sessions = new FakeSessionManager({
+      verificationResponse: failVerification(),
+      fixExitCode: 1,
+      abnormalRecoveryDecision: "resume",
+    });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Non-zero fix fixture', 'Stop before re-verification', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Implement first fixture', 'Create the first fixture file.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    await expect(engine.executeTask(taskId, { autoFix: true, maxFixRetries: 2 })).rejects.toThrow();
+
+    expect(sessions.spawns.filter((spawn) => spawn.sessionKey?.startsWith("evaluator-"))).toHaveLength(1);
+    expect(sessions.recoveries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: "fix", mode: "reconcile" }),
+    ]));
+    expect(db.prepare(`
+      SELECT recovery_resume_phase FROM tasks WHERE id = ?
+    `).get(taskId)).toEqual({ recovery_resume_phase: "fix" });
+    expect(db.prepare(`
+      SELECT status FROM verification_fix_rounds WHERE task_id = ?
+    `).get(taskId)).toEqual({ status: "failed" });
+  });
+
+  it("성공한 fix를 commit해 재검증 중단 후에도 verification만 재개한다", { timeout: 30_000 }, async () => {
+    const repo = makeRepo();
+    const db = makeDb();
+    const projectId = seedFullAutoProject(db, repo);
+    const goalId = "goal-fix-reverify-recovery";
+    const taskId = "task-fix-reverify-recovery";
+    const brokenEvaluation = "```json\n{\"verdict\":\"fail\",\"severity\":\"hard-block\",\"issues\":[]}\n```";
+    const sessions = new FakeSessionManager({
+      verificationResponses: [failVerification(), brokenEvaluation],
+      fixWritesChange: true,
+    });
+
+    db.prepare(`
+      INSERT INTO goals (id, project_id, title, description, priority, goal_model)
+      VALUES (?, ?, 'Fix reverify recovery', 'Preserve successful fix output', 'high', 'goal_as_unit')
+    `).run(goalId, projectId);
+    db.prepare(`
+      INSERT INTO tasks (id, goal_id, project_id, title, description, assignee_id, status, task_type)
+      VALUES (?, ?, ?, 'Implement first fixture', 'Create the first fixture file.', 'agent-coder', 'todo', 'code')
+    `).run(taskId, goalId, projectId);
+
+    const engine = createOrchestrationEngine(db, sessions, () => {});
+    await engine.executeTask(taskId, { autoFix: true, maxFixRetries: 2 });
+
+    const task = db.prepare(`
+      SELECT worktree_path, recovery_checkpoint_head_sha, recovery_commit_sha, recovery_resume_phase
+      FROM tasks JOIN goals ON goals.id = tasks.goal_id WHERE tasks.id = ?
+    `).get(taskId) as {
+      worktree_path: string;
+      recovery_checkpoint_head_sha: string;
+      recovery_commit_sha: string;
+      recovery_resume_phase: string;
+    };
+    expect(git(task.worktree_path, "status", "--porcelain")).toBe("");
+    expect(task.recovery_resume_phase).toBe("verification");
+    expect(git(task.worktree_path, "rev-parse", "HEAD")).toBe(task.recovery_commit_sha);
+    expect(git(task.worktree_path, "rev-list", "--count", `${task.recovery_checkpoint_head_sha}..HEAD`)).toBe("1");
+
+    db.prepare("UPDATE tasks SET status = 'in_review' WHERE id = ?").run(taskId);
+    recoverOnStartup(db);
+    expect(db.prepare(`
+      SELECT status, recovery_resume_phase, recovery_manual_action_required FROM tasks WHERE id = ?
+    `).get(taskId)).toEqual({
+      status: "todo",
+      recovery_resume_phase: "verification",
+      recovery_manual_action_required: 0,
+    });
+  });
+
   it("auto-fix 세션을 실행 task에 귀속시킨다", { timeout: 30_000 }, async () => {
     const repo = makeRepo();
     const db = makeDb();
@@ -1608,7 +1713,7 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
     expect(activity?.message).toContain("반영할 커밋이 없음");
   });
 
-  it("기존 커밋이 있어도 마지막 WIP commit이 실패하면 pending_approval 대신 squash를 차단한다", { timeout: 30_000 }, async () => {
+  it("검증 후 task commit이 실패하면 task를 차단하고 squash 승인을 열지 않는다", { timeout: 30_000 }, async () => {
     const repo = makeRepo();
     const db = makeDb();
     const projectId = seedFullAutoProject(db, repo);
@@ -1647,26 +1752,17 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
     `).run(implTaskId, goalId, projectId);
 
     const engine = createOrchestrationEngine(db, sessions, (event, data) => events.push({ event, data }));
-    const result = await engine.executeTask(implTaskId, { autoFix: false });
-    expect(result).toMatchObject({ success: true, verdict: "pass" });
+    await expect(engine.executeTask(implTaskId, { autoFix: false }))
+      .rejects.toThrow("wip commit rejected");
 
     const goal = db.prepare(
       "SELECT squash_status, squash_commit_sha FROM goals WHERE id = ?",
     ).get(goalId) as { squash_status: string; squash_commit_sha: string | null } | undefined;
-    expect(goal?.squash_status).toBe("blocked");
+    expect(goal?.squash_status).toBe("none");
     expect(goal?.squash_commit_sha).toBeNull();
     expect(events.some((e) => e.event === "goal:squash_ready")).toBe(false);
-    expect(events).toContainEqual(expect.objectContaining({
-      event: "goal:squash_blocked",
-      data: expect.objectContaining({ goalId, reason: "wip-commit-failed" }),
-    }));
-
-    const activity = db.prepare(`
-      SELECT type, message FROM activities
-      WHERE project_id = ? AND type = 'goal_squash_blocked'
-      ORDER BY id DESC LIMIT 1
-    `).get(projectId) as { type: string; message: string } | undefined;
-    expect(activity?.message).toContain("WIP commit 실패");
+    expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(implTaskId))
+      .toMatchObject({ status: "blocked" });
     expect(git(worktreePath, "status", "--porcelain")).toContain("feature-two.txt");
   });
 
@@ -1752,7 +1848,7 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
     expect(existsSync(join(runningWorktree.path, "running-recovery.txt"))).toBe(true);
     expect(existsSync(join(pendingWorktree.path, "pending-recovery.txt"))).toBe(true);
     expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(runningTaskId))
-      .toMatchObject({ status: "todo" });
+      .toMatchObject({ status: "blocked" });
     expect(broadcasts).toContainEqual(expect.objectContaining({
       event: "goal:squash_ready",
       data: expect.objectContaining({ goalId: pendingGoalId }),
@@ -1763,7 +1859,7 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
       const runningStatus = await readGoalStatus(api.baseUrl, runningGoalId);
       expect(runningStatus).toMatchObject({
         goal_id: runningGoalId,
-        status: "running",
+        status: "failed",
         worktree_path: runningWorktree.path,
         worktree_branch: runningWorktree.branch,
         evaluator_session_id: "eval-running-before-restart",
@@ -2005,7 +2101,7 @@ describe("Goal-as-Unit E2E — Full Auto worktree 기록", () => {
       expect(readyGoal.squash_status).toBe("pending_approval");
       expect(readyGoal.worktree_path).toBe(goalAfterFirst.worktree_path);
       expect(readyGoal.worktree_branch).toBe(goalAfterFirst.worktree_branch);
-      expect(Number(git(repo, "rev-list", "--count", readyGoal.worktree_branch!))).toBe(initialMainCount + 1);
+      expect(Number(git(repo, "rev-list", "--count", readyGoal.worktree_branch!))).toBe(initialMainCount + 2);
       expect(existsSync(join(repo, "feature-one.txt"))).toBe(false);
       expect(existsSync(join(repo, "feature-two.txt"))).toBe(false);
       expect(git(repo, "status", "--porcelain")).toBe("");

@@ -428,8 +428,205 @@ export interface SquashMergeResult {
   sha: string | null;
   prUrl: string | null;
   error?: string;
+  /** 재시작 전에 이미 생성된 squash commit을 재사용했는지 */
+  reused?: boolean;
   /** merge 자체는 성공/실패했지만 사용자에게 알릴 부수 상황 (예: 보존한 로컬 변경 복원 충돌) */
   warning?: string;
+}
+
+export interface CommitRecoveryEvidence {
+  status: "recorded" | "promote" | "not_created" | "manual_action_required";
+  commitSha: string | null;
+  reason?: string;
+}
+
+function isCanonicalCommitSha(workdir: string, sha: string): boolean {
+  if (!/^[0-9a-f]{40}$/.test(sha)) return false;
+  const result = spawnSync("git", ["cat-file", "-e", `${sha}^{commit}`], {
+    cwd: workdir,
+    stdio: "pipe",
+    timeout: 5_000,
+  });
+  return result.status === 0;
+}
+
+function isAncestor(workdir: string, ancestor: string, descendant: string): boolean {
+  const result = spawnSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+    cwd: workdir,
+    stdio: "pipe",
+    timeout: 5_000,
+  });
+  return result.status === 0;
+}
+
+function treesMatch(workdir: string, left: string, right: string): boolean {
+  const result = spawnSync("git", ["diff", "--quiet", `${left}^{tree}`, `${right}^{tree}`], {
+    cwd: workdir,
+    stdio: "pipe",
+    timeout: 10_000,
+  });
+  return result.status === 0;
+}
+
+/**
+ * Task commit 생성 후 DB 기록 전 종료를 판별한다.
+ * checkpoint HEAD의 정확히 한 commit 뒤이고 worktree가 clean할 때만 승격한다.
+ */
+export function recoverTaskCommitEvidence(
+  worktreePath: string,
+  checkpointHeadSha: string,
+  recordedTaskCommitSha?: string | null,
+): CommitRecoveryEvidence {
+  try {
+    if (!isCanonicalCommitSha(worktreePath, checkpointHeadSha)) {
+      return { status: "manual_action_required", commitSha: null, reason: "checkpoint HEAD commit is missing" };
+    }
+
+    const status = gitExec(worktreePath, ["status", "--porcelain=v1"]).stdout.trim();
+    if (status) {
+      return { status: "manual_action_required", commitSha: null, reason: "worktree is dirty; commit evidence is ambiguous" };
+    }
+
+    if (recordedTaskCommitSha) {
+      if (!isCanonicalCommitSha(worktreePath, recordedTaskCommitSha)) {
+        return { status: "manual_action_required", commitSha: null, reason: "recorded task commit is missing" };
+      }
+      const head = gitExec(worktreePath, ["rev-parse", "HEAD"]).stdout.trim();
+      const recordedCount = Number(gitExec(
+        worktreePath,
+        ["rev-list", "--count", `${checkpointHeadSha}..${recordedTaskCommitSha}`],
+      ).stdout.trim());
+      if (recordedCount !== 1
+        || !isAncestor(worktreePath, checkpointHeadSha, recordedTaskCommitSha)
+        || head !== recordedTaskCommitSha) {
+        return { status: "manual_action_required", commitSha: null, reason: "worktree HEAD does not match recorded task commit" };
+      }
+      return { status: "recorded", commitSha: recordedTaskCommitSha };
+    }
+
+    const head = gitExec(worktreePath, ["rev-parse", "HEAD"]).stdout.trim();
+    if (head === checkpointHeadSha) return { status: "not_created", commitSha: null };
+    if (!isAncestor(worktreePath, checkpointHeadSha, head)) {
+      return { status: "manual_action_required", commitSha: null, reason: "worktree HEAD diverged from checkpoint HEAD" };
+    }
+    const count = Number(gitExec(worktreePath, ["rev-list", "--count", `${checkpointHeadSha}..${head}`]).stdout.trim());
+    if (count !== 1) {
+      return { status: "manual_action_required", commitSha: null, reason: `expected one task commit after checkpoint, found ${count}` };
+    }
+    return { status: "promote", commitSha: head };
+  } catch (err: any) {
+    return { status: "manual_action_required", commitSha: null, reason: err.message ?? String(err) };
+  }
+}
+
+/**
+ * goalBranch가 체크아웃된 linked worktree 경로를 read-only로 찾는다. 없으면 null.
+ * squash 재사용(promote/recorded) 판정 전에 그 worktree에 사용자 미커밋 변경(WIP)이
+ * 남았는지 확인하기 위함 — 재사용 판정은 removeWorktree(--force)로 이어지기 때문.
+ */
+function findGoalWorktreePath(projectWorkdir: string, goalBranch: string): string | null {
+  const result = spawnSync("git", ["worktree", "list", "--porcelain"], {
+    cwd: projectWorkdir,
+    stdio: "pipe",
+    timeout: 10_000,
+    encoding: "utf-8",
+  });
+  if (result.status !== 0) return null;
+  const targetRef = `refs/heads/${goalBranch}`;
+  let currentPath: string | null = null;
+  for (const line of (result.stdout ?? "").split("\n")) {
+    if (line.startsWith("worktree ")) {
+      currentPath = line.slice("worktree ".length).trim();
+    } else if (line.startsWith("branch ") && line.slice("branch ".length).trim() === targetRef) {
+      return currentPath;
+    }
+  }
+  return null;
+}
+
+/**
+ * worktree에 tracked/untracked 미커밋 변경(WIP)이 있는지 read-only로 검사한다.
+ * `git status --porcelain=v1 -z` 출력이 비어 있지 않으면 dirty. worktree가 없으면 false.
+ * status를 읽을 수 없으면(손상 등) 판정 불가이므로 안전하게 true(수동 조치)로 취급한다.
+ */
+export function worktreeHasUncommittedChanges(worktreePath: string): boolean {
+  if (!existsSync(worktreePath)) return false;
+  const result = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+    cwd: worktreePath,
+    stdio: "pipe",
+    timeout: 10_000,
+    encoding: "utf-8",
+  });
+  if (result.status !== 0) return true;
+  return !!(result.stdout && result.stdout.length > 0);
+}
+
+/**
+ * Squash commit 생성 후 DB 기록 전 종료를 read-only로 판별한다.
+ * base HEAD가 checkpoint base의 정확히 한 commit 뒤이며 goal tree와 같을 때만 재사용한다.
+ * goalWorktreePath(미전달 시 goalBranch로 자동 해석)에 사용자 미커밋 WIP가 있으면
+ * promote/recorded 판정을 취소하고 수동 조치로 차단한다 — 재사용은 worktree 삭제로 이어져
+ * WIP를 영구 파괴하기 때문.
+ */
+export function recoverSquashCommitEvidence(
+  projectWorkdir: string,
+  baseBranch: string,
+  goalBranch: string,
+  checkpointBaseSha: string,
+  recordedSquashCommitSha?: string | null,
+  goalWorktreePath?: string | null,
+): CommitRecoveryEvidence {
+  try {
+    // 재사용(promote/recorded) 직전에만 적용하는 WIP 보존 가드. dirty면 재사용을 막고
+    // 수동 조치로 차단한다 (승인 재개 경로가 removeWorktree로 WIP를 지우지 못하게).
+    const resolvedWorktree = goalWorktreePath ?? findGoalWorktreePath(projectWorkdir, goalBranch);
+    const dirtyGuard = (): CommitRecoveryEvidence | null =>
+      resolvedWorktree && worktreeHasUncommittedChanges(resolvedWorktree)
+        ? { status: "manual_action_required", commitSha: null, reason: "goal worktree has uncommitted changes (WIP); reuse would discard them" }
+        : null;
+
+    if (!isCanonicalCommitSha(projectWorkdir, checkpointBaseSha)) {
+      return { status: "manual_action_required", commitSha: null, reason: "checkpoint base commit is missing" };
+    }
+    const baseHead = gitExec(projectWorkdir, ["rev-parse", baseBranch]).stdout.trim();
+    if (recordedSquashCommitSha) {
+      if (!isCanonicalCommitSha(projectWorkdir, recordedSquashCommitSha)) {
+        return { status: "manual_action_required", commitSha: null, reason: "recorded squash commit is missing" };
+      }
+      const recordedCount = Number(gitExec(
+        projectWorkdir,
+        ["rev-list", "--count", `${checkpointBaseSha}..${recordedSquashCommitSha}`],
+      ).stdout.trim());
+      if (recordedCount !== 1
+        || !isAncestor(projectWorkdir, checkpointBaseSha, recordedSquashCommitSha)
+        || !isAncestor(projectWorkdir, recordedSquashCommitSha, baseHead)) {
+        return { status: "manual_action_required", commitSha: null, reason: "recorded squash commit is not on the base branch" };
+      }
+      if (!treesMatch(projectWorkdir, recordedSquashCommitSha, goalBranch)) {
+        return { status: "manual_action_required", commitSha: null, reason: "recorded squash commit tree does not match goal branch tree" };
+      }
+      return dirtyGuard() ?? { status: "recorded", commitSha: recordedSquashCommitSha };
+    }
+    if (baseHead === checkpointBaseSha) return { status: "not_created", commitSha: null };
+    if (!isAncestor(projectWorkdir, checkpointBaseSha, baseHead)) {
+      return { status: "manual_action_required", commitSha: null, reason: "base branch diverged from checkpoint" };
+    }
+    const count = Number(gitExec(projectWorkdir, ["rev-list", "--count", `${checkpointBaseSha}..${baseHead}`]).stdout.trim());
+    if (count !== 1) {
+      return { status: "manual_action_required", commitSha: null, reason: `expected one squash commit after base checkpoint, found ${count}` };
+    }
+    if (!treesMatch(projectWorkdir, baseHead, goalBranch)) {
+      return { status: "manual_action_required", commitSha: null, reason: "base HEAD tree does not match goal branch tree" };
+    }
+    return dirtyGuard() ?? { status: "promote", commitSha: baseHead };
+  } catch (err: any) {
+    return { status: "manual_action_required", commitSha: null, reason: err.message ?? String(err) };
+  }
+}
+
+export interface SquashMergeRecoveryOptions {
+  existingSquashSha?: string | null;
+  checkpointBaseSha?: string | null;
 }
 
 /**
@@ -451,6 +648,7 @@ export function squashMergeGoal(
   commitMessage: string,
   mode: GitMode,
   baseBranch?: string,
+  recovery: SquashMergeRecoveryOptions = {},
 ): SquashMergeResult {
   try {
     if (mode === "pr") {
@@ -485,6 +683,39 @@ export function squashMergeGoal(
       } catch {
         defaultBranch = "main";
       }
+    }
+
+    if (recovery.existingSquashSha) {
+      const existing = recovery.existingSquashSha;
+      if (!isCanonicalCommitSha(projectWorkdir, existing)) {
+        return { sha: null, prUrl: null, error: `Recorded squash commit is missing: ${existing}` };
+      }
+      const checkpoint = recovery.checkpointBaseSha;
+      if (!checkpoint || !isCanonicalCommitSha(projectWorkdir, checkpoint)) {
+        return { sha: null, prUrl: null, error: "Squash checkpoint base commit is missing" };
+      }
+      const commitCount = Number(gitExec(
+        projectWorkdir,
+        ["rev-list", "--count", `${checkpoint}..${existing}`],
+      ).stdout.trim());
+      if (commitCount !== 1 || !isAncestor(projectWorkdir, checkpoint, existing)) {
+        return { sha: null, prUrl: null, error: `Recorded squash commit is not directly after checkpoint ${checkpoint}: ${existing}` };
+      }
+      const baseHead = gitExec(projectWorkdir, ["rev-parse", defaultBranch]).stdout.trim();
+      if (!isAncestor(projectWorkdir, existing, baseHead)) {
+        return { sha: null, prUrl: null, error: `Recorded squash commit is not on ${defaultBranch}: ${existing}` };
+      }
+      if (!treesMatch(projectWorkdir, existing, goalBranch)) {
+        return { sha: null, prUrl: null, error: `Recorded squash commit tree does not match ${goalBranch}: ${existing}` };
+      }
+      if (mode === "main_direct") {
+        const pushed = pushBranch(projectWorkdir, defaultBranch);
+        if (!pushed.ok) {
+          return { sha: null, prUrl: null, error: `Squash commit push failed (${defaultBranch}): ${pushed.error ?? "unknown"}` };
+        }
+      }
+      log.info(`squashMergeGoal: reusing existing squash commit ${existing}`);
+      return { sha: existing, prUrl: null, reused: true };
     }
 
     // ── 사용자 잔여 보존 가드 ──
