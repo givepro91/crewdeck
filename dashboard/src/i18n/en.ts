@@ -6,6 +6,7 @@ const en = {
   sidebarWorking: "Working",
   sidebarWaiting: "Needs approval",
   sidebarSpecPending: "{{count}} blueprint(s) awaiting approval",
+  sidebarEngine: "Execution engine: {{engine}}",
   newProject: "+ New Project",
   importLocal: "Import Local",
   connectGitHub: "Connect GitHub",

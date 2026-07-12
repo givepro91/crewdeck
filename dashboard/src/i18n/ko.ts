@@ -6,6 +6,7 @@ const ko = {
   sidebarWorking: "작업 중",
   sidebarWaiting: "승인 대기",
   sidebarSpecPending: "기획서 승인 대기 {{count}}건",
+  sidebarEngine: "실행 엔진: {{engine}}",
   newProject: "+ 새 프로젝트",
   importLocal: "로컬 가져오기",
   connectGitHub: "GitHub 연결",

@@ -8,6 +8,7 @@ import { analyzeProject } from "../../core/project/analyzer.js";
 import { connectGitHub } from "../../core/project/github.js";
 import { createLogger } from "../../utils/logger.js";
 import { promptLanguageRule } from "../../utils/language.js";
+import { loadProviderConfig } from "../../core/agent/provider.js";
 import { MAX_TASK_RETRIES, MAX_REASSIGNS } from "../../utils/constants.js";
 
 const log = createLogger("projects");
@@ -27,10 +28,31 @@ export function createProjectRoutes(ctx: AppContext): Router {
     };
   }
 
-  // List all projects
+  // List all projects — enrich each with the execution engine(s) its agents
+  // resolve to (agent.provider → project.default_provider → global default),
+  // so the sidebar can show whether a project runs on Claude, Codex, or both.
   router.get("/", (_req, res) => {
-    const projects = db.prepare("SELECT * FROM projects ORDER BY updated_at DESC").all();
-    res.json(projects.map(toProjectResponse));
+    const projects = db.prepare("SELECT * FROM projects ORDER BY updated_at DESC").all() as any[];
+    const globalDefault = loadProviderConfig().defaultProvider ?? "claude";
+    const defaultByProject = new Map<string, string>(
+      projects.map((p) => [p.id, p.default_provider || globalDefault]),
+    );
+    const providerSets = new Map<string, Set<string>>(projects.map((p) => [p.id, new Set<string>()]));
+    const agentRows = db.prepare("SELECT project_id, provider FROM agents").all() as { project_id: string; provider: string | null }[];
+    for (const a of agentRows) {
+      const set = providerSets.get(a.project_id);
+      if (!set) continue;
+      set.add(a.provider || defaultByProject.get(a.project_id)!);
+    }
+    // Deterministic order (claude, then codex). Empty project (no agents) falls
+    // back to its configured/default engine so the chip still reflects intent.
+    const order = ["claude", "codex"];
+    res.json(projects.map((p) => {
+      const set = providerSets.get(p.id)!;
+      const providers = (set.size > 0 ? [...set] : [defaultByProject.get(p.id)!])
+        .sort((x, y) => order.indexOf(x) - order.indexOf(y));
+      return { ...toProjectResponse(p), providers };
+    }));
   });
 
   // Cross-project live activity — powers the sidebar working/waiting indicators.

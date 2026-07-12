@@ -20,6 +20,8 @@ interface Project {
   github?: GitHubConfig;
   dev_port?: number;
   base_branch?: string;
+  /** Execution engine(s) this project's agents resolve to (Claude/Codex). */
+  providers?: ("claude" | "codex")[];
 }
 
 interface Agent {

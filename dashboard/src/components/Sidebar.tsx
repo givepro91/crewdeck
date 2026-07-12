@@ -59,6 +59,33 @@ export function Sidebar() {
 
   const showToast = (msg: string) => setToast(msg);
 
+  // 실행 엔진 칩 — 이 프로젝트의 에이전트들이 해석하는 백엔드(Claude/Codex).
+  // Codex는 상단 바와 동일한 sky 톤, Claude(기본 엔진)는 중립 회색으로 절제.
+  const renderEngines = (p: { providers?: ("claude" | "codex")[] }) => {
+    const providers = p.providers;
+    if (!providers || providers.length === 0) return null;
+    return (
+      <span className="shrink-0 flex items-center gap-0.5">
+        {providers.map((prov) => {
+          const label = prov === "codex" ? "Codex" : "Claude";
+          return (
+            <span
+              key={prov}
+              className={`rounded px-1 text-[9px] font-medium leading-tight ${
+                prov === "codex"
+                  ? "bg-sky-50 text-sky-600 dark:bg-sky-900/30 dark:text-sky-400"
+                  : "bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400"
+              }`}
+              title={t("sidebarEngine", { engine: label })}
+            >
+              {label}
+            </span>
+          );
+        })}
+      </span>
+    );
+  };
+
   // working = 인디고 pulse(+진행 태스크 수), waiting = 앰버(+승인 대기 수), idle = 표시 없음.
   // 기획서 승인 대기는 별도 앰버 pill(✎N)로 — 작업 중이어도 승인이 필요함을 항상 드러낸다.
   const renderActivity = (projectId: string) => {
@@ -232,6 +259,7 @@ export function Sidebar() {
                     : "\uD83D\uDCC1"}
               </span>
               <span className="truncate flex-1 min-w-0">{p.name}</span>
+              {renderEngines(p)}
               {renderActivity(p.id)}
             </button>
           ))}
