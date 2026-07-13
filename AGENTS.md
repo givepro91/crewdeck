@@ -82,4 +82,5 @@ test: 테스트
 ## Self-Learning Rules
 <!-- Append one concise rule per correction. `/learn` writes here automatically; newest first. -->
 <!-- LEARN:ANCHOR -->
+- (2026-07-13) 라이브 배포 drain에서 stop-queue 후 activeTasks=0을 무작정 폴링하지 않는다 — 진행 중 goal-as-unit이 있으면 in_review 재검증 세션이 계속 재spawn돼 자연 종료가 안 끝난다. 몇 분 내 안 내려가면 진행 중 goal을 확인하고 restart 강행(재개 내성으로 손실은 검증 1회분) 여부를 사용자에게 즉시 제시한다.
 <!-- CC-RULES:END -->
