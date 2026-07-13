@@ -298,12 +298,21 @@ export function commitTaskResult(
  * crewdeck을 써도 그 사람의 계정 기준으로 동작한다. 못 찾으면 null →
  * 호출부는 ambient 자격증명(git/gh 기본 동작)으로 진행한다.
  */
+/**
+ * git origin URL에서 GitHub owner/repo를 추출한다. https / ssh / 멀티계정 SSH alias
+ * (git@github.com-<alias>:owner/repo)를 지원하고, .git 접미사를 제거하며 점 포함 repo명을 보존한다.
+ * GitHub URL이 아니면 null. (resolveGitHubToken·checkBranchProtection·getOriginRemote 공용)
+ */
+export function parseGitHubRepo(remoteUrl: string): string | null {
+  const m = remoteUrl.match(/github\.com(?:-[\w.-]+)?[:/]([^/]+)\/([^/\s]+?)(?:\.git)?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
 export function resolveGitHubToken(workdir: string): string | null {
   const urlRes = spawnSync("git", ["remote", "get-url", "origin"], { cwd: workdir, stdio: "pipe", timeout: 5000, encoding: "utf-8" });
   const url = urlRes.stdout?.toString().trim() ?? "";
-  const m = url.match(/github\.com[:/]([^/]+)\/([^/\s.]+)/);
-  if (!m) return null;
-  const repo = `${m[1]}/${m[2]}`;
+  const repo = parseGitHubRepo(url);
+  if (!repo) return null;
 
   const statusRes = spawnSync("gh", ["auth", "status"], { stdio: "pipe", timeout: 8000, encoding: "utf-8" });
   const statusText = (statusRes.stdout?.toString() ?? "") + (statusRes.stderr?.toString() ?? "");
@@ -456,9 +465,8 @@ export function checkBranchProtection(
 ): "protected" | "unprotected" | "unknown" {
   const urlRes = spawnSync("git", ["remote", "get-url", "origin"], { cwd: workdir, stdio: "pipe", timeout: 5000, encoding: "utf-8" });
   const url = urlRes.stdout?.toString().trim() ?? "";
-  const m = url.match(/github\.com[:/]([^/]+)\/([^/\s.]+)/);
-  if (!m) return "unknown";
-  const repo = `${m[1]}/${m[2]}`;
+  const repo = parseGitHubRepo(url);
+  if (!repo) return "unknown";
   const env = token ? { ...process.env, GH_TOKEN: token, GH_HOST: "github.com" } : process.env;
   const res = spawnSync("gh", ["api", `repos/${repo}/branches/${branch}/protection`], {
     env, stdio: "pipe", timeout: 8000, encoding: "utf-8",
@@ -507,11 +515,9 @@ export function getOriginRemote(workdir: string): {
   const res = spawnSync("git", ["remote", "get-url", "origin"], { cwd: workdir, stdio: "pipe", timeout: 5000, encoding: "utf-8" });
   const url = res.status === 0 ? (res.stdout?.toString().trim() ?? "") : "";
   if (!url) return { hasOrigin: false, isGitHub: false, repo: null, remoteUrl: null };
-  // owner/repo 추출. 멀티계정 SSH alias(git@github.com-<alias>:owner/repo.git)도 지원하고,
-  // .git 접미사만 제거하며 점 포함 repo명은 보존한다.
-  const m = url.match(/github\.com(?:-[\w.-]+)?[:/]([^/]+)\/([^/\s]+?)(?:\.git)?$/);
-  if (!m) return { hasOrigin: true, isGitHub: false, repo: null, remoteUrl: url };
-  return { hasOrigin: true, isGitHub: true, repo: `${m[1]}/${m[2]}`, remoteUrl: url };
+  const repo = parseGitHubRepo(url);
+  if (!repo) return { hasOrigin: true, isGitHub: false, repo: null, remoteUrl: url };
+  return { hasOrigin: true, isGitHub: true, repo, remoteUrl: url };
 }
 
 // ─── Goal-as-Unit: Squash Merge ────────────────────────

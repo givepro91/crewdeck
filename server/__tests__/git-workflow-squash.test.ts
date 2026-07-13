@@ -11,6 +11,7 @@ import {
   verifyWorktreeSynced,
   parsePrNumber,
   getOriginRemote,
+  parseGitHubRepo,
 } from '../core/project/git-workflow.js';
 
 /**
@@ -116,6 +117,17 @@ describe('getOriginRemote', () => {
     }
     // origin remote가 없는 repo
     expect(getOriginRemote(makeRepo()).hasOrigin).toBe(false);
+  });
+});
+
+describe('parseGitHubRepo', () => {
+  it('https / ssh / ssh-alias / .git / 점 repo명 / non-github / 빈문자열', () => {
+    expect(parseGitHubRepo('https://github.com/TeamSPWK/swk-infra-console.git')).toBe('TeamSPWK/swk-infra-console');
+    expect(parseGitHubRepo('git@github.com:owner/repo.git')).toBe('owner/repo');
+    expect(parseGitHubRepo('git@github.com-givepro91:givepro91/crewdeck.git')).toBe('givepro91/crewdeck'); // 멀티계정 SSH alias
+    expect(parseGitHubRepo('git@github.com-work:owner/my.repo.git')).toBe('owner/my.repo');                // 점 포함 repo명
+    expect(parseGitHubRepo('https://gitlab.com/x/y.git')).toBeNull();
+    expect(parseGitHubRepo('')).toBeNull();
   });
 });
 
