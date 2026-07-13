@@ -125,6 +125,7 @@ describe("CLI_ERROR_LEAK_PATTERNS — export for extensibility", () => {
 // engine(태스크 상태)과 scheduler(큐 상태)가 같은 분류를 쓰는지가 계약의 핵심:
 // 세션 소진이 task_error로 새면 사용량 한도만으로 재시도 예산이 증발한다 (07-08 실측).
 import { classifyAgentFailure, AgentError } from "../utils/errors.js";
+import { AgentHandoffConsumptionError } from "../core/agent/handoff-consumer.js";
 
 describe("classifyAgentFailure", () => {
   it("rate limit 문자열 변형들 → rate_limit", () => {
@@ -246,5 +247,18 @@ describe("classifyAgentFailure", () => {
   it("일반 오류/코드 없는 Error → task_error", () => {
     expect(classifyAgentFailure(new Error("something broke"))).toBe("task_error");
     expect(classifyAgentFailure({})).toBe("task_error");
+  });
+
+  it("handoff 계약 위반(HANDOFF_CONTRACT_VIOLATION)은 'not found' 메시지여도 → task_error (env_error 오분류·왕복 failover 방지)", () => {
+    // 실측 회귀(2026-07-13 nova): "Required preceding handoff (decompose) was not found."가
+    // envSignature('not found')에 걸려 env_error로 분류 → Claude↔Codex 왕복 + 무한 재시도.
+    const handoffErr = new AgentHandoffConsumptionError("implementation", [{
+      field: "$",
+      code: "missing_field",
+      message: "Required preceding handoff (decompose) was not found.",
+    }]);
+    expect(handoffErr.message).toContain("not found");
+    expect(classifyAgentFailure(handoffErr)).toBe("task_error");
+    expect(classifyAgentFailure(handoffErr, { provider: "codex" })).toBe("task_error");
   });
 });

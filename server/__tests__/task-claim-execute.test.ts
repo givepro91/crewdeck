@@ -673,26 +673,30 @@ describe("executeTask — claim 해제", () => {
     expect(row.status).toBe("blocked");
   });
 
-  it("decompose handoff가 없으면 delegation·implementation subprocess spawn 전에 차단한다", async () => {
+  it("decompose handoff가 없어도 implementation을 차단하지 않는다 — 계약 이전 goal 백로그 복구 (부재=soft)", async () => {
+    // decompose handoff는 보조 컨텍스트이고 implementation 프롬프트가 부재를 정상
+    // 처리한다. 계약 배포 전 분해된 goal(handoff row 0)을 하드 차단하면 백로그
+    // 전체가 실행 불가가 된다 → 부재는 통과, spawn까지 진행해야 한다.
     const { projectId, agentId } = seedProject(db, process.cwd());
     db.prepare("UPDATE agents SET needs_worktree = 0 WHERE id = ?").run(agentId);
     const goalId = seedGoal(db, projectId);
     const taskId = seedTask(db, goalId, projectId, "todo", agentId);
+    // decompose handoff를 일부러 seed하지 않는다 (계약 이전 goal 재현).
     const baseSessionManager = createSessionManager(db);
-    const spawnAgent = vi.fn(baseSessionManager.spawnAgent);
+    const spawnAgent = vi.fn(() => {
+      throw new Error("synthetic spawn failure");
+    });
     const engine = createOrchestrationEngine(db, { ...baseSessionManager, spawnAgent }, () => {});
     const claim = claimTaskForExecution(db, taskId);
     if (!claim.claimed) throw new Error("unreachable");
 
-    await expect(engine.executeTask(taskId, {}, claim))
-      .rejects.toBeInstanceOf(AgentHandoffConsumptionError);
-
-    expect(spawnAgent).not.toHaveBeenCalled();
-    expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId))
-      .toEqual({ status: "blocked" });
-    expect(db.prepare(`
-      SELECT status, pid FROM sessions WHERE task_id = ? ORDER BY rowid DESC LIMIT 1
-    `).get(taskId)).toEqual({ status: "failed", pid: null });
+    // 하드게이트에 막히지 않고 spawn까지 진행 → 계약 위반이 아닌 spawn 오류로만 실패한다.
+    const rejection = await engine.executeTask(taskId, {}, claim).then(
+      () => null,
+      (err) => err,
+    );
+    expect(rejection).not.toBeInstanceOf(AgentHandoffConsumptionError);
+    expect(spawnAgent).toHaveBeenCalled();
   });
 
   it("claim 성공 후 session spawn 오류가 나면 태스크를 in_progress 에 방치하지 않고 blocked 로 해제한다", async () => {

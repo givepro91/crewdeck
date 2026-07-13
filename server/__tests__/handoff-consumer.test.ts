@@ -290,4 +290,37 @@ describe("agent handoff consumption preflight", () => {
       diagnostics: [expect.objectContaining({ field: "stage", code: "invalid_value" })],
     }));
   });
+
+  it("optional: 완전 부재(row 없음)면 null 반환 — handoff 계약 이전 goal 백로그 복구", () => {
+    // decompose handoff row가 하나도 없다 (계약 배포 전 분해된 goal).
+    const result = loadRequiredAgentHandoff(db, {
+      goalId: "goal-1",
+      taskId: null,
+      phase: "implementation",
+      expectedStages: ["decompose"],
+      optional: true,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("optional이어도 존재하나 손상된 row는 여전히 block — stale/corrupt fallback 방지 유지", () => {
+    insertSession("decompose-session", "agent-1", null);
+    db.prepare(`
+      INSERT INTO agent_handoffs
+        (goal_id, task_id, session_id, contract_version, stage, payload)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run("goal-1", null, "decompose-session", 1, "decompose", JSON.stringify({ version: 1, stage: "decompose" }));
+
+    expect(() => loadRequiredAgentHandoff(db, {
+      goalId: "goal-1",
+      taskId: null,
+      phase: "implementation",
+      expectedStages: ["decompose"],
+      optional: true,
+    })).toThrowError(expect.objectContaining({
+      diagnostics: expect.arrayContaining([
+        expect.objectContaining({ field: "changed_files", code: "missing_field" }),
+      ]),
+    }));
+  });
 });

@@ -24,6 +24,11 @@ export interface RequiredAgentHandoff {
 }
 
 export class AgentHandoffConsumptionError extends Error {
+  // classifyAgentFailure의 단일 정본이 이 code를 보고 task_error(terminal)로
+  // 분류한다. 이게 없으면 "was not found" 메시지가 envSignature('not found')에
+  // 걸려 env_error로 오분류돼, 재시도로는 절대 풀리지 않는 계약 위반이 provider
+  // 왕복 failover + 무한 재시도 루프를 유발한다 (실측: 2026-07-13 nova).
+  public readonly code = "HANDOFF_CONTRACT_VIOLATION";
   constructor(
     public phase: AgentHandoffStage,
     public diagnostics: AgentHandoffDiagnostic[],
@@ -37,6 +42,24 @@ function invalidValue(field: string, message: string): AgentHandoffDiagnostic {
   return { field, code: "invalid_value", message };
 }
 
+interface LoadAgentHandoffInput {
+  goalId: string;
+  taskId: string | null;
+  phase: AgentHandoffStage;
+  expectedStages: readonly AgentHandoffStage[];
+  /**
+   * When true, a completely absent preceding handoff returns null instead of
+   * throwing. A row that EXISTS but is malformed/stale still throws — the
+   * design's "don't fall back to a corrupt newer row" guarantee is preserved.
+   *
+   * Used only at the decompose→implementation boundary: the decompose handoff
+   * is supplementary context (the implementer already has the task spec), and
+   * goals decomposed before the handoff contract shipped have no decompose row.
+   * A hard block there would strand the entire pre-contract backlog.
+   */
+  optional?: boolean;
+}
+
 /**
  * Loads and strictly validates the immediately preceding task handoff.
  * The newest row is authoritative: a malformed newer row blocks execution
@@ -44,13 +67,16 @@ function invalidValue(field: string, message: string): AgentHandoffDiagnostic {
  */
 export function loadRequiredAgentHandoff(
   db: Database,
-  input: {
-    goalId: string;
-    taskId: string | null;
-    phase: AgentHandoffStage;
-    expectedStages: readonly AgentHandoffStage[];
-  },
-): RequiredAgentHandoff {
+  input: LoadAgentHandoffInput & { optional: true },
+): RequiredAgentHandoff | null;
+export function loadRequiredAgentHandoff(
+  db: Database,
+  input: LoadAgentHandoffInput & { optional?: false },
+): RequiredAgentHandoff;
+export function loadRequiredAgentHandoff(
+  db: Database,
+  input: LoadAgentHandoffInput,
+): RequiredAgentHandoff | null {
   const taskScope = input.taskId === null
     ? "handoff.task_id IS NULL AND session.task_id IS NULL"
     : "handoff.task_id = ? AND task.id = handoff.task_id AND task.goal_id = handoff.goal_id AND session.task_id = handoff.task_id";
@@ -66,6 +92,7 @@ export function loadRequiredAgentHandoff(
   `).get(...(input.taskId === null ? [input.goalId] : [input.goalId, input.taskId])) as HandoffCandidateRow | undefined;
 
   if (!row) {
+    if (input.optional) return null;
     throw new AgentHandoffConsumptionError(input.phase, [{
       field: "$",
       code: "missing_field",

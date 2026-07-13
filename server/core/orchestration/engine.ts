@@ -1071,6 +1071,9 @@ export function createOrchestrationEngine(
             taskId: null,
             phase: "implementation",
             expectedStages: ["decompose"],
+            // 부재(row 없음)는 soft — decompose handoff 계약 이전에 분해된 goal
+            // 백로그를 살린다. 존재하나 손상된 row는 아래 catch에서 여전히 block.
+            optional: true,
           });
         } catch (error) {
           if (error instanceof AgentHandoffConsumptionError) {

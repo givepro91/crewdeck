@@ -104,6 +104,14 @@ export function classifyAgentFailure(
   },
   opts?: { provider?: "claude" | "codex" },
 ): AgentFailureClass {
+  // Handoff 계약 위반은 결정론적 데이터/로직 오류다 — 재시도·provider 전환으로는
+  // 절대 풀리지 않는다. 메시지("...was not found.")가 아래 envSignature('not found')에
+  // 걸려 env_error로 오분류되면 무의미한 Claude↔Codex 왕복 + 60초 무한 재시도를 낳는다.
+  // 코드로 최우선 단락해 terminal task_error로 확정한다.
+  if (err.code === "HANDOFF_CONTRACT_VIOLATION") {
+    return "task_error";
+  }
+
   const msg = (err.message ?? "").toLowerCase();
   const detail = (err.detail ?? "").toLowerCase();
 
