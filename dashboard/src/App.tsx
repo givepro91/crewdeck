@@ -173,8 +173,10 @@ function App() {
         <RateLimitBanner />
         {/* Top bar */}
         <header className="h-10 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between px-4 shrink-0 bg-white dark:bg-[#1a1a2e]">
-          <StatusBar />
-          <div className="flex items-center gap-3">
+          <div className="min-w-0 flex-1 overflow-x-auto no-scrollbar">
+            <StatusBar />
+          </div>
+          <div className="flex items-center gap-3 shrink-0 pl-3">
             <LanguageToggle />
             <ThemeToggle />
 

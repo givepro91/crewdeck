@@ -43,6 +43,7 @@ body {
 /* Notion-like scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -53,6 +54,21 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #a3a3a3;
+}
+/* Dark mode — light-gray thumb reads as a bright bar on dark surfaces */
+.dark ::-webkit-scrollbar-thumb {
+  background: #3a3a52;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #50506e;
+}
+/* Hide scrollbar but keep scrollability — used by the dense top telemetry
+   strip so it scrolls (instead of clipping metrics) on narrow/zoomed windows. */
+.no-scrollbar {
+  scrollbar-width: none; /* Firefox */
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 /* Shimmer animation for loading states */
@@ -73,4 +89,28 @@ body {
 /* Live activity — new event slide-in (reuses slideUp keyframes) */
 .animate-activity-in {
   animation: slideUp 0.25s ease-out;
+}
+
+/* Keyboard focus — one consistent, visible ring on any focused control.
+   :focus-visible keeps mouse clicks quiet while showing keyboard users where
+   they are. Many buttons had no focus style at all; this covers them globally. */
+:focus-visible {
+  outline: 2px solid #6366f1; /* indigo-500 — app accent */
+  outline-offset: 2px;
+}
+.dark :focus-visible {
+  outline-color: #818cf8; /* indigo-400 — brighter on dark surfaces */
+}
+
+/* Respect reduced-motion — collapse shimmer/slide/hover transitions for users
+   who opt out of animation (vestibular safety). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

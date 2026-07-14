@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useModalA11y } from "../hooks/useModalA11y";
 
 interface RejectDialogProps {
   taskTitle: string;
@@ -12,18 +13,11 @@ export function RejectDialog({ taskTitle, onReject, onCancel }: RejectDialogProp
   const [feedback, setFeedback] = useState("");
   const [autoRerun, setAutoRerun] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dialogRef = useModalA11y<HTMLDivElement>(onCancel);
 
   useEffect(() => {
     textareaRef.current?.focus();
   }, []);
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [onCancel]);
 
   const handleSubmit = () => {
     onReject(feedback.trim(), autoRerun);
@@ -35,7 +29,9 @@ export function RejectDialog({ taskTitle, onReject, onCancel }: RejectDialogProp
       onClick={onCancel}
     >
       <div
-        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[440px] max-w-[calc(100vw-2rem)] overflow-hidden"
+        ref={dialogRef}
+        tabIndex={-1}
+        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[440px] max-w-[calc(100vw-2rem)] overflow-hidden focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -101,7 +97,7 @@ export function RejectDialog({ taskTitle, onReject, onCancel }: RejectDialogProp
 
         {/* Footer */}
         <div className="px-5 py-3 border-t border-gray-100 dark:border-gray-700 flex justify-between items-center">
-          <span className="text-[10px] text-gray-300 dark:text-gray-600">
+          <span className="text-[10px] text-gray-400 dark:text-gray-500">
             Cmd+Enter
           </span>
           <div className="flex gap-2">

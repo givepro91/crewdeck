@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useModalA11y } from "../hooks/useModalA11y";
 
 type AutopilotMode = "off" | "goal" | "full";
 
@@ -24,6 +25,7 @@ const MODES: { id: AutopilotMode; color: string; activeColor: string; border: st
 export function AutopilotModal({ currentMode, hasMission, hasCto, todoCount = 0, runningCount = 0, onConfirm, onClose }: AutopilotModalProps) {
   const { t } = useTranslation();
   const [selected, setSelected] = useState<AutopilotMode>(currentMode);
+  const dialogRef = useModalA11y<HTMLDivElement>(onClose);
 
   const fullDisabled = !hasMission || !hasCto;
   const changed = selected !== currentMode;
@@ -34,7 +36,9 @@ export function AutopilotModal({ currentMode, hasMission, hasCto, todoCount = 0,
       onClick={onClose}
     >
       <div
-        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[480px] overflow-hidden"
+        ref={dialogRef}
+        tabIndex={-1}
+        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[480px] overflow-hidden focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useModalA11y } from "../hooks/useModalA11y";
 
 interface InputDialogProps {
   title: string;
@@ -23,6 +24,7 @@ export function InputDialog({
   const { t } = useTranslation();
   const [value, setValue] = useState(defaultValue);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useModalA11y<HTMLDivElement>(onCancel);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -38,7 +40,9 @@ export function InputDialog({
       onClick={onCancel}
     >
       <div
-        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[420px] overflow-hidden"
+        ref={dialogRef}
+        tabIndex={-1}
+        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[420px] overflow-hidden focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-5 py-4">
