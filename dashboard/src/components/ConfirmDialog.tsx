@@ -1,5 +1,5 @@
-import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
+import { useModalA11y } from "../hooks/useModalA11y";
 
 interface ConfirmDialogProps {
   message: string;
@@ -9,14 +9,7 @@ interface ConfirmDialogProps {
 
 export function ConfirmDialog({ message, onConfirm, onCancel }: ConfirmDialogProps) {
   const { t } = useTranslation();
-
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", handleKey);
-    return () => document.removeEventListener("keydown", handleKey);
-  }, [onCancel]);
+  const dialogRef = useModalA11y<HTMLDivElement>(onCancel);
 
   return (
     <div
@@ -24,7 +17,9 @@ export function ConfirmDialog({ message, onConfirm, onCancel }: ConfirmDialogPro
       onClick={onCancel}
     >
       <div
-        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[380px] overflow-hidden"
+        ref={dialogRef}
+        tabIndex={-1}
+        className="bg-white dark:bg-[#25253d] rounded-xl shadow-lg w-[380px] overflow-hidden focus:outline-none"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-5 py-5">

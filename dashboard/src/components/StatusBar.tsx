@@ -148,7 +148,7 @@ export function StatusBar() {
     : "";
 
   return (
-    <div className="flex items-center gap-2.5 text-[10px] text-gray-400 dark:text-gray-500 font-mono">
+    <div className="flex w-max items-center gap-2.5 text-[10px] text-gray-400 dark:text-gray-500 font-mono">
       {/* Crewdeck agent stats — always shown when data exists */}
       {crew && (
         <>

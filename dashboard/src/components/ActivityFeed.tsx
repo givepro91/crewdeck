@@ -1,7 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { getProviderActivityDetails, useActivityStore } from "../stores/activityStore";
 import { REASON_LABEL_KEYS, providerEngineName } from "../lib/providerActivity";
+import type { ActivityLogEntry } from "../types";
 
 interface ActivityFeedProps {
   projectId: string;
@@ -131,6 +132,28 @@ export function ActivityFeed({ projectId }: ActivityFeedProps) {
     };
   }, [t, projectId]);
 
+  // 연속된 동일 이벤트(같은 type·메시지)를 한 줄로 접는다 — autopilot의 "정체" 류
+  // 하트비트 메시지가 5분마다 반복돼 실제 이벤트(실패·fix·건너뜀)를 밀어내는 도배를
+  // 막는다. provider 전환 행은 metadata가 제각각이라 병합에서 제외한다.
+  const groups = useMemo(() => {
+    const isTransition = (a: ActivityLogEntry) => {
+      const d = getProviderActivityDetails(a);
+      return d?.event === "provider:failover" || d?.event === "provider:redispatched";
+    };
+    const keyOf = (a: ActivityLogEntry) => `${a.type}::${humanizeMessage(a.message)}`;
+    const out: { head: ActivityLogEntry; count: number; oldest: string }[] = [];
+    for (const a of activities) {
+      const prev = out[out.length - 1];
+      if (prev && !isTransition(a) && !isTransition(prev.head) && keyOf(prev.head) === keyOf(a)) {
+        prev.count += 1;
+        prev.oldest = a.created_at; // 배열은 최신순 — 뒤로 갈수록 과거
+      } else {
+        out.push({ head: a, count: 1, oldest: a.created_at });
+      }
+    }
+    return out;
+  }, [activities]);
+
   if (loading) {
     return <p className="text-xs text-gray-400 italic">{t("loadingActivity")}</p>;
   }
@@ -145,7 +168,7 @@ export function ActivityFeed({ projectId }: ActivityFeedProps) {
 
   return (
     <div className="space-y-1.5 px-3 py-2">
-      {activities.map((a) => {
+      {groups.map(({ head: a, count, oldest }) => {
         const providerDetails = getProviderActivityDetails(a);
         const isProviderTransition =
           providerDetails?.event === "provider:failover" || providerDetails?.event === "provider:redispatched";
@@ -176,9 +199,17 @@ export function ActivityFeed({ projectId }: ActivityFeedProps) {
               )}
               <span className={`break-words ${a.type === "system:error" ? "text-red-600 dark:text-red-400" : "text-gray-700 dark:text-gray-300"}`}>
                 {humanizeMessage(a.message)}
+                {count > 1 && (
+                  <span
+                    className="ml-1.5 inline-flex items-center rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-500 align-middle tabular-nums dark:bg-gray-700 dark:text-gray-300"
+                    title={`${t("activityRepeatedTimes", { count: String(count) })} · ${formatTime(oldest)}–${formatTime(a.created_at)}`}
+                  >
+                    ×{count}
+                  </span>
+                )}
               </span>
             </div>
-            <span className="shrink-0 text-gray-300 dark:text-gray-600 tabular-nums">
+            <span className="shrink-0 text-gray-500 dark:text-gray-400 tabular-nums">
               {formatTime(a.created_at)}
             </span>
           </div>

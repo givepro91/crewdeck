@@ -425,6 +425,7 @@ const ko = {
   confirmKillAgent: "이 에이전트를 종료하시겠습니까?",
   confirm: "확인",
   recentActivity: "최근 활동",
+  activityRepeatedTimes: "{{count}}회 반복",
 
   // Error / status messages (inline)
   importedSuccess: "프로젝트를 가져왔습니다",

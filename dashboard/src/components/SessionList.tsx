@@ -224,7 +224,7 @@ export function SessionList({ projectId }: { projectId?: string }) {
 
       {/* Session Table */}
       {sessions.length === 0 ? (
-        <div className="py-8 text-center text-xs text-gray-400">
+        <div className="py-8 text-center text-xs text-gray-500 dark:text-gray-400">
           {filter === "active" ? t("sessionNoActive") : t("sessionNoResults")}
         </div>
       ) : (

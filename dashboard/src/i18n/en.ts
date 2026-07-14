@@ -425,6 +425,7 @@ const en = {
   confirmKillAgent: "End this agent's session?",
   confirm: "Confirm",
   recentActivity: "Recent Activity",
+  activityRepeatedTimes: "Repeated {{count}}×",
 
   // Error / status messages (inline)
   importedSuccess: "Project imported successfully",
