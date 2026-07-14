@@ -203,22 +203,18 @@ export function createOrchestrationRoutes(ctx: AppContext): Router {
     res.status(202).json({ status: "decomposing", goalId });
 
     // Background decompose
-    engine.decomposeGoal(goalId).then(() => {
+    engine.decomposeGoal(goalId).then(async () => {
       broadcast("project:updated", { projectId: goal.project_id });
 
-      // Auto-approve tasks if project is in autopilot mode
+      // Plan review gate if project is in autopilot mode (reviewer approves/
+      // rejects/escalates each task instead of a blanket auto-approve).
       const project = db.prepare("SELECT autopilot FROM projects WHERE id = ?").get(goal.project_id) as { autopilot: string } | undefined;
       if (project && (project.autopilot === "goal" || project.autopilot === "full")) {
-        const approved = db.prepare(
-          "UPDATE tasks SET status = 'todo' WHERE goal_id = ? AND status = 'pending_approval'"
-        ).run(goalId);
-        if (approved.changes > 0) {
-          broadcast("project:updated", { projectId: goal.project_id });
-
-          // Auto-start queue if not already running
-          if (ctx.scheduler && !ctx.scheduler.isRunning(goal.project_id)) {
-            ctx.scheduler.startQueue(goal.project_id);
-          }
+        await engine.applyPlanReviewGate(goalId, { autopilot: project.autopilot });
+        broadcast("project:updated", { projectId: goal.project_id });
+        // Auto-start queue so approved (→todo) tasks get consumed
+        if (ctx.scheduler && !ctx.scheduler.isRunning(goal.project_id)) {
+          ctx.scheduler.startQueue(goal.project_id);
         }
       }
 

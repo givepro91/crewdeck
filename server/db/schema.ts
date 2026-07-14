@@ -558,6 +558,17 @@ export function migrate(db: Database.Database): void {
     if (!taskColsLate.some((c) => c.name === name)) db.exec(sql);
   }
 
+  // Plan-review gate: 리뷰어 에이전트 자동 승인 + CEO 에스컬레이션
+  // requires_human_approval=1 이면 decompose 계획 리뷰가 사람 승인(pending_approval)으로 남긴다.
+  // approval_reason 은 리뷰어/decompose 가 판정한 에스컬레이션·반려 사유.
+  const taskPlanReviewColumns = [
+    ["requires_human_approval", "ALTER TABLE tasks ADD COLUMN requires_human_approval INTEGER NOT NULL DEFAULT 0"],
+    ["approval_reason", "ALTER TABLE tasks ADD COLUMN approval_reason TEXT"],
+  ];
+  for (const [name, sql] of taskPlanReviewColumns) {
+    if (!taskColsLate.some((c) => c.name === name)) db.exec(sql);
+  }
+
   // Goal-as-Unit: goals 테이블 컬럼 추가
   // 증분 마이그레이션 — 기존 goals는 DEFAULT 값으로 자동 적용 (legacy 호환)
   const goalColsLate = db.prepare("PRAGMA table_info(goals)").all() as { name: string }[];

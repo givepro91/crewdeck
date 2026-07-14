@@ -491,13 +491,13 @@ export function createProjectRoutes(ctx: AppContext): Router {
             log.info(`Rescue: spec generated for goal ${g.id}, triggering decompose`);
             broadcast("project:updated", { projectId });
             if (ctx.orchestrationEngine) {
-              ctx.orchestrationEngine.decomposeGoal(g.id).then(() => {
-                // Auto-approve tasks in goal/full autopilot mode
+              ctx.orchestrationEngine.decomposeGoal(g.id).then(async () => {
+                // Plan review gate in goal/full autopilot mode
                 const proj = db.prepare("SELECT autopilot FROM projects WHERE id = ?").get(projectId) as { autopilot: string } | undefined;
                 if (proj && (proj.autopilot === "goal" || proj.autopilot === "full")) {
-                  db.prepare("UPDATE tasks SET status = 'todo' WHERE goal_id = ? AND status = 'pending_approval'").run(g.id);
+                  await ctx.orchestrationEngine!.applyPlanReviewGate(g.id, { autopilot: proj.autopilot });
                   broadcast("project:updated", { projectId });
-                  log.info(`Rescue: auto-approved tasks for goal ${g.id}`);
+                  log.info(`Rescue: plan review gate applied for goal ${g.id}`);
                 }
               }).catch((err: any) => {
                 log.error(`Rescue decompose failed for goal ${g.id}`, err);
@@ -529,13 +529,13 @@ export function createProjectRoutes(ctx: AppContext): Router {
           return;
         }
         log.info(`Rescue: spec already exists for goal ${g.id}, triggering decompose directly`);
-        ctx.orchestrationEngine.decomposeGoal(g.id).then(() => {
-          // Auto-approve tasks in goal/full autopilot mode
+        ctx.orchestrationEngine.decomposeGoal(g.id).then(async () => {
+          // Plan review gate in goal/full autopilot mode
           const proj = db.prepare("SELECT autopilot FROM projects WHERE id = ?").get(projectId) as { autopilot: string } | undefined;
           if (proj && (proj.autopilot === "goal" || proj.autopilot === "full")) {
-            db.prepare("UPDATE tasks SET status = 'todo' WHERE goal_id = ? AND status = 'pending_approval'").run(g.id);
+            await ctx.orchestrationEngine!.applyPlanReviewGate(g.id, { autopilot: proj.autopilot });
             broadcast("project:updated", { projectId });
-            log.info(`Rescue: auto-approved tasks for goal ${g.id}`);
+            log.info(`Rescue: plan review gate applied for goal ${g.id}`);
           }
         }).catch((err: any) => {
           log.error(`Rescue decompose failed for goal ${g.id}`, err);
@@ -1182,11 +1182,9 @@ Rules:
           });
           await ctx.orchestrationEngine.decomposeGoal(goalId);
 
-          // 2b: Auto-approve tasks for this goal
-          const approved = db.prepare(
-            "UPDATE tasks SET status = 'todo' WHERE goal_id = ? AND status = 'pending_approval'"
-          ).run(goalId);
-          log.info(`Full autopilot: auto-approved ${approved.changes} tasks for goal ${i + 1}/${goalIds.length}`);
+          // 2b: Plan review gate for this goal (full autopilot)
+          await ctx.orchestrationEngine.applyPlanReviewGate(goalId, { autopilot: "full" });
+          log.info(`Full autopilot: plan review gate applied for goal ${i + 1}/${goalIds.length}`);
 
           // 2c: Start queue (if not running)
           if (ctx.scheduler && !ctx.scheduler.isRunning(projectId)) {

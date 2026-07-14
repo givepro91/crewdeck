@@ -47,6 +47,7 @@ export interface AppContext {
     decomposeGoal: (goalId: string) => Promise<{ taskCount: number; projectId: string }>;
     generateGoalsFromMission: (projectId: string) => Promise<{ goalIds: string[] }>;
     executeTask: (taskId: string, config?: any) => Promise<{ success: boolean; verdict: string }>;
+    applyPlanReviewGate: (goalId: string, config: { autopilot: string; taskIds?: string[] }) => Promise<void>;
   };
   generateGoalSpec?: (goalId: string) => Promise<any>;
   scheduler?: Scheduler;

@@ -133,6 +133,18 @@ function buildSessionSeparationFailure(
  * - soft-block: Continuing possible but runtime failure risk
  * - hard-block: Data loss/security/irreversible — STOP immediately
  */
+export type PlanReviewVerdict = "approve" | "reject" | "escalate";
+export interface PlanReview {
+  taskId: string;
+  verdict: PlanReviewVerdict;
+  reason: string;
+}
+export interface PlanReviewResult {
+  reviews: PlanReview[];
+  failed: boolean;
+  failureReason?: string;
+}
+
 export function createQualityGate(
   db: Database,
   sessionManager: SessionManager,
@@ -589,6 +601,159 @@ export function createQualityGate(
           name: evaluatorAgent.name,
           status: "idle",
         });
+      }
+    },
+
+    /**
+     * Plan review gate — a reviewer agent (separate from the decompose
+     * Generator/CTO) inspects freshly-decomposed pending_approval tasks and
+     * returns a verdict per task: approve (engineering-sound) / reject
+     * (defective) / escalate (CEO-level product decision → human).
+     * PURE: returns verdicts only; the caller (engine.applyPlanReviewGate)
+     * maps them to task status. Mirrors verify()'s Generator-Evaluator
+     * separation via a fresh per-goal sessionKey + forceNewSession + a
+     * non-CTO reviewer agent.
+     */
+    async reviewPlan(
+      goalId: string,
+      opts: { taskIds?: string[] } = {},
+    ): Promise<PlanReviewResult> {
+      const goal = db.prepare("SELECT * FROM goals WHERE id = ?").get(goalId) as any;
+      if (!goal) return { reviews: [], failed: false };
+      const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(goal.project_id) as any;
+      if (!project) return { reviews: [], failed: false };
+
+      // Load the plan tasks to review: pending_approval tasks of this goal,
+      // optionally narrowed to a specific set (e.g. just-created fix tasks).
+      const cols = `id, title, description, sort_order, depends_on, requires_human_approval, approval_reason`;
+      const taskRows = (opts.taskIds && opts.taskIds.length > 0
+        ? db.prepare(
+            `SELECT ${cols} FROM tasks WHERE goal_id = ? AND status = 'pending_approval'
+             AND id IN (${opts.taskIds.map(() => "?").join(",")}) ORDER BY sort_order ASC`,
+          ).all(goalId, ...opts.taskIds)
+        : db.prepare(
+            `SELECT ${cols} FROM tasks WHERE goal_id = ? AND status = 'pending_approval' ORDER BY sort_order ASC`,
+          ).all(goalId)) as Array<{
+            id: string; title: string; description: string; sort_order: number;
+            depends_on: string; requires_human_approval: number; approval_reason: string | null;
+          }>;
+
+      if (taskRows.length === 0) return { reviews: [], failed: false };
+
+      // Reviewer agent — must differ from the decompose Generator (the CTO).
+      // Prefer a dedicated reviewer; never the CTO; else a system evaluator.
+      let reviewerAgent = db.prepare(
+        "SELECT * FROM agents WHERE project_id = ? AND role = 'reviewer' LIMIT 1",
+      ).get(goal.project_id) as any;
+      if (!reviewerAgent) {
+        reviewerAgent = db.prepare(
+          "SELECT * FROM agents WHERE project_id = ? AND role != 'cto' LIMIT 1",
+        ).get(goal.project_id) as any;
+      }
+      if (!reviewerAgent) {
+        db.prepare(
+          "INSERT OR IGNORE INTO agents (project_id, name, role, system_prompt) VALUES (?, '[Crewdeck] Evaluator', 'reviewer', ?)",
+        ).run(goal.project_id, "You are a plan reviewer with an adversarial mindset. Approve sound engineering, reject defects, escalate product-level decisions.");
+        reviewerAgent = db.prepare(
+          "SELECT * FROM agents WHERE project_id = ? AND name = '[Crewdeck] Evaluator' LIMIT 1",
+        ).get(goal.project_id) as any;
+      }
+      if (!reviewerAgent) {
+        return { reviews: [], failed: true, failureReason: "no reviewer agent available" };
+      }
+
+      const workdir = project.workdir;
+      if (!workdir) return { reviews: [], failed: true, failureReason: "project has no workdir" };
+      const reviewKey = `planreview-${goalId}`;
+      const specContext = formatExecutionSpecContext(getTaskExecutionSpec(db, taskRows[0].id));
+      const taskList = taskRows.map((t) => {
+        let deps: unknown = [];
+        try { deps = JSON.parse(t.depends_on || "[]"); } catch { deps = []; }
+        return `- taskId: ${t.id}\n  title: ${t.title}\n  description: ${t.description}\n  depends_on: ${JSON.stringify(deps)}\n  draft_requires_human_approval: ${t.requires_human_approval ? "true" : "false"}${t.approval_reason ? `\n  draft_reason: ${t.approval_reason}` : ""}`;
+      }).join("\n");
+
+      const prompt = `# Plan Review
+
+You are reviewing an execution PLAN (a list of tasks) another agent produced for this goal. You did NOT write it. Judge each task and return a verdict.
+
+Goal:${goal.title ? ` **${goal.title}**` : ""}
+"${goal.description}"
+${specContext}
+Tasks to review:
+${taskList}
+
+For EACH task decide a verdict:
+- "approve": engineering-sound and safe to execute automatically (ordinary implementation, refactor, test, docs, config).
+- "reject": defective, mis-scoped, unsafe, or contradicts the goal/spec. Give a concrete reason.
+- "escalate": a CEO-level PRODUCT decision a human must sign off on — removing or disabling a user-facing feature/menu; irreversible data/schema deletion or migration; product-direction or UX decisions; external exposure, spend, or public API changes.
+
+Rules:
+- If a task's draft_requires_human_approval is true, default to "escalate" unless there is a concrete engineering reason it is actually routine.
+- Keep each reason under 30 words.
+- Include EVERY task's taskId exactly once.
+
+Respond in this EXACT JSON format:
+\`\`\`json
+{
+  "reviews": [
+    { "taskId": "<id>", "verdict": "approve" | "reject" | "escalate", "reason": "<short>" }
+  ]
+}
+\`\`\`
+`;
+
+      const parseReviews = (text: string): PlanReview[] | null => {
+        const block = extractJsonBlock(text);
+        if (!block) return null;
+        try {
+          const obj = JSON.parse(block);
+          if (!obj || !Array.isArray(obj.reviews)) return null;
+          const valid: PlanReview[] = [];
+          for (const r of obj.reviews) {
+            if (r && typeof r.taskId === "string"
+                && (r.verdict === "approve" || r.verdict === "reject" || r.verdict === "escalate")) {
+              valid.push({
+                taskId: r.taskId,
+                verdict: r.verdict,
+                reason: typeof r.reason === "string" ? r.reason.slice(0, 300) : "",
+              });
+            }
+          }
+          return valid;
+        } catch { return null; }
+      };
+
+      broadcast("agent:status", { id: reviewerAgent.id, name: reviewerAgent.name, status: "working" });
+      try {
+        const session = sessionManager.spawnAgent(
+          reviewerAgent.id, workdir, reviewKey, null, undefined,
+          { omitUnstructuredTaskOutput: true, forceNewSession: true },
+        );
+        const send = async (p: string): Promise<string> => {
+          const res = await session.send(p);
+          if (res.exitCode !== 0) {
+            throw new Error(`plan review session exited with code ${res.exitCode ?? "signal"}`);
+          }
+          return parseAgentOutput(res.stdout, res.provider, "verification").text;
+        };
+
+        let reviews = parseReviews(await send(prompt));
+        if (!reviews) {
+          log.info("Plan review parse failed, retrying with explicit JSON reminder...");
+          const retry = `이전 응답에서 JSON을 파싱하지 못했습니다. 반드시 \`\`\`json 블록으로만 응답하세요.\n\n${prompt}`;
+          reviews = parseReviews(await send(retry));
+        }
+        if (!reviews) {
+          return { reviews: [], failed: true, failureReason: "reviewer output could not be parsed as JSON" };
+        }
+        log.info(`Plan review complete for goal ${goalId}: ${reviews.length} verdict(s)`);
+        return { reviews, failed: false };
+      } catch (err) {
+        log.error("Plan review failed", err);
+        return { reviews: [], failed: true, failureReason: err instanceof Error ? err.message : String(err) };
+      } finally {
+        sessionManager.killSession(reviewKey);
+        broadcast("agent:status", { id: reviewerAgent.id, name: reviewerAgent.name, status: "idle" });
       }
     },
   };

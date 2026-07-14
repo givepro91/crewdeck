@@ -1837,10 +1837,12 @@ export function createScheduler(
           broadcast("project:updated", { projectId });
           await engine.decomposeGoal(goalId);
 
-          // Step 3: Auto-approve (only after successful decompose — never for pre-existing tasks)
+          // Step 3: Plan review gate — a reviewer agent approves/rejects/
+          // escalates each decomposed task (replaces the old blanket
+          // auto-approve). Escalated tasks stay pending_approval for the human.
           const project = db.prepare("SELECT autopilot FROM projects WHERE id = ?").get(projectId) as { autopilot: string } | undefined;
-          if (project && (project.autopilot === "goal" || project.autopilot === "full")) {
-            db.prepare("UPDATE tasks SET status = 'todo' WHERE goal_id = ? AND status = 'pending_approval'").run(goalId);
+          if (project) {
+            await engine.applyPlanReviewGate(goalId, { autopilot: project.autopilot });
           }
           broadcast("project:updated", { projectId });
         } else {
@@ -2696,15 +2698,24 @@ export function createScheduler(
       }
       log.info(`Starting queue for project ${projectId} (max concurrency: ${getProjectBaseConcurrency(projectId)})`);
 
-      // Auto-approve any stuck pending_approval tasks from previous runs
-      // (e.g., rescue decompose completed but server restarted before approval)
+      // Auto-approve genuinely-stuck LEGACY plan tasks from previous runs
+      // (e.g., rescue decompose completed but server restarted before approval).
+      // EXCLUDE escalated (requires_human_approval) tasks and verification/
+      // fix-derived pending_approval tasks — they must not bypass the human
+      // gate or the Quality Gate. Fresh decomposes are gated by the reviewer
+      // at decompose time, so this only revives pre-gate legacy tasks.
       const project = db.prepare("SELECT autopilot FROM projects WHERE id = ?").get(projectId) as { autopilot: string } | undefined;
       if (project && (project.autopilot === "goal" || project.autopilot === "full")) {
-        const approved = db.prepare(
-          "UPDATE tasks SET status = 'todo' WHERE project_id = ? AND status = 'pending_approval'"
-        ).run(projectId);
+        const approved = db.prepare(`
+          UPDATE tasks SET status = 'todo'
+          WHERE project_id = ? AND status = 'pending_approval'
+            AND requires_human_approval = 0
+            AND verification_id IS NULL
+            AND recovery_resume_phase IS NULL
+            AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.task_id = tasks.id)
+        `).run(projectId);
         if (approved.changes > 0) {
-          log.info(`startQueue: auto-approved ${approved.changes} stuck pending_approval task(s) for project ${projectId}`);
+          log.info(`startQueue: auto-approved ${approved.changes} stuck legacy pending_approval task(s) for project ${projectId}`);
           broadcast("project:updated", { projectId });
         }
       }

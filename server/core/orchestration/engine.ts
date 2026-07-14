@@ -104,6 +104,8 @@ interface TaskRow {
   target_files: string | null;  // JSON array of paths (P2: scope anchoring)
   stack_hint: string | null;    // Short stack constraint (P2: scope anchoring)
   depends_on: string | null;    // JSON array of task IDs (DAG dependency)
+  requires_human_approval: number;  // 1 = 사람(CEO) 승인 필요 — 제품 방향성/파괴적 변경
+  approval_reason: string | null;   // 에스컬레이션·반려 사유
   execution_run_id: string | null;
   execution_spec_version_id: string | null;
 }
@@ -2598,6 +2600,14 @@ Rules:
 - \`stack_hint\`: short framework constraint (e.g. "Next.js 16 App Router",
   "FastAPI router"). Empty string if none. Prevents wrong-stack impls.
 - \`type\`: one of "code" | "content" | "config" | "review". Default "code".
+- \`requires_human_approval\`: boolean. Set \`true\` ONLY when this task is a
+  CEO-level product decision a human must sign off on — NOT routine
+  engineering. Triggers: removing or disabling a user-facing feature/menu;
+  irreversible data/schema deletion or migration; product-direction or UX
+  decisions; external exposure, spend, or public API changes. Otherwise
+  \`false\` (the default for ordinary implementation, refactor, test tasks).
+- \`approval_reason\`: one short sentence explaining why, when
+  requires_human_approval is true; empty string "" otherwise.
 
 ## Fullstack contract rule (if goal touches backend API AND UI)
 The first task that touches the API MUST cite the exact response shape
@@ -2629,7 +2639,9 @@ Respond in this EXACT JSON format:
       "type": "code",
       "target_files": ["relative/path/to/file.ext"],
       "stack_hint": "Next.js 16 App Router",
-      "depends_on": []
+      "depends_on": [],
+      "requires_human_approval": false,
+      "approval_reason": ""
     }
   ],
   "handoff": {
@@ -2847,20 +2859,27 @@ Respond in this EXACT JSON format:
           const stackHint = typeof t.stack_hint === "string" ? t.stack_hint.slice(0, 200) : "";
           // task_type: 유효값이 아니면 기본값 'code' 사용
           const taskType = VALID_TASK_TYPES.has(t.type) ? t.type : "code";
+          // CEO 게이트 초안 플래그 — decompose LLM 판정(advisory). 리뷰어가 최종 확정한다.
+          const requiresHumanApproval = t.requires_human_approval === true ? 1 : 0;
+          const approvalReason = requiresHumanApproval && typeof t.approval_reason === "string"
+            ? t.approval_reason.slice(0, 300)
+            : null;
           // Sprint 5: tasks created from decomposition start as pending_approval
-          // so the user can review the plan before execution begins
+          // so the plan review gate (reviewer agent) can approve/reject/escalate
           const row = db.prepare(`
             INSERT INTO tasks (
               goal_id, project_id, title, description, assignee_id, status, priority,
               sort_order, target_files, stack_hint, task_type,
+              requires_human_approval, approval_reason,
               execution_run_id, execution_spec_version_id
             )
-            VALUES (?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'pending_approval', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
           `).get(
             goal.id, goal.project_id, title, description, agent?.id ?? null,
             priority, sortOrder,
             JSON.stringify(targetFiles), stackHint, taskType,
+            requiresHumanApproval, approvalReason,
             executionRun?.id ?? null,
             executionRun?.executionSpecVersionId ?? null,
           ) as { id: string } | undefined;
@@ -2971,6 +2990,99 @@ Respond in this EXACT JSON format:
         // (e.g. goal/project/agent not found).
         inflightDecompose.delete(goalId);
       }
+    },
+
+    /**
+     * Plan review gate — replaces the blanket "decompose → auto-approve all
+     * pending_approval → todo" logic that was duplicated across the scheduler
+     * and rescue paths. A reviewer agent (separate from the decompose CTO)
+     * judges each freshly-decomposed plan task and we map the verdict:
+     *   approve  → todo (auto-approved)
+     *   reject   → blocked (reason appended + activity)
+     *   escalate → stays pending_approval (human/CEO sign-off), flagged
+     * Verification/fix-derived pending_approval tasks are EXCLUDED via the
+     * discriminator — the Quality Gate is preserved, never auto-approved.
+     * Manual (off) autopilot keeps the human gate untouched. On reviewer
+     * failure everything stays pending_approval (safe state) + is surfaced.
+     */
+    async applyPlanReviewGate(
+      goalId: string,
+      config: { autopilot: string; taskIds?: string[] },
+    ): Promise<void> {
+      // Reviewer only runs under autopilot; manual mode keeps the human gate.
+      if (config.autopilot !== "goal" && config.autopilot !== "full") return;
+
+      const goalRow = db.prepare("SELECT project_id FROM goals WHERE id = ?").get(goalId) as
+        { project_id: string } | undefined;
+      if (!goalRow) return;
+
+      // Only PLAN tasks — exclude verification/fix-derived pending_approval,
+      // which are Quality-Gate/safety gates we must never auto-approve.
+      const discriminator = `verification_id IS NULL AND recovery_resume_phase IS NULL
+        AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.task_id = tasks.id)`;
+      const idFilter = config.taskIds && config.taskIds.length > 0
+        ? ` AND id IN (${config.taskIds.map(() => "?").join(",")})`
+        : "";
+      const planTasks = db.prepare(
+        `SELECT * FROM tasks WHERE goal_id = ? AND status = 'pending_approval' AND (${discriminator})${idFilter}`,
+      ).all(goalId, ...(config.taskIds ?? [])) as TaskRow[];
+      if (planTasks.length === 0) return;
+
+      // Review only the discriminator-passing tasks (keeps reviewer focused
+      // and consistent with what we will act on).
+      const planTaskIds = planTasks.map((t) => t.id);
+      let review;
+      try {
+        review = await qualityGate.reviewPlan(goalId, { taskIds: planTaskIds });
+      } catch (err) {
+        review = { reviews: [], failed: true, failureReason: err instanceof Error ? err.message : String(err) };
+      }
+
+      // Reviewer failure → safe state: leave everything pending_approval + surface once.
+      if (review.failed) {
+        db.prepare(
+          "INSERT INTO activities (project_id, type, message) VALUES (?, 'plan_review_failed', ?)",
+        ).run(goalRow.project_id, `계획 리뷰 실패 — 수동 승인 대기 유지: ${(review.failureReason ?? "unknown").slice(0, 140)}`);
+        broadcast("project:updated", { projectId: goalRow.project_id });
+        return;
+      }
+
+      const verdictByTask = new Map(review.reviews.map((r) => [r.taskId, r]));
+      let approved = 0, rejected = 0, escalated = 0;
+
+      for (const task of planTasks) {
+        // Missing from reviewer output → escalate (safe default).
+        const r = verdictByTask.get(task.id) ?? { verdict: "escalate" as const, reason: "reviewer omitted this task" };
+
+        if (r.verdict === "approve") {
+          transitionTask(db, broadcast, task, "todo");
+          approved++;
+        } else if (r.verdict === "reject") {
+          const newDesc = r.reason
+            ? `${task.description}\n\n--- Plan Review Rejected ---\n${r.reason}`
+            : task.description;
+          db.prepare("UPDATE tasks SET description = ? WHERE id = ?").run(newDesc, task.id);
+          transitionTask(db, broadcast, task, "blocked");
+          db.prepare(
+            "INSERT INTO activities (project_id, type, message) VALUES (?, 'plan_review_rejected', ?)",
+          ).run(goalRow.project_id, `계획 반려: ${task.title}${r.reason ? ` — ${r.reason}` : ""}`);
+          rejected++;
+        } else {
+          // escalate → stays pending_approval, flag for human (CEO gate).
+          db.prepare(
+            "UPDATE tasks SET requires_human_approval = 1, approval_reason = ?, updated_at = datetime('now') WHERE id = ?",
+          ).run(r.reason || null, task.id);
+          const flagged = db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id);
+          if (flagged) broadcast("task:updated", flagged);
+          db.prepare(
+            "INSERT INTO activities (project_id, type, message) VALUES (?, 'plan_review_escalated', ?)",
+          ).run(goalRow.project_id, `사람 승인 필요(제품 방향성): ${task.title}${r.reason ? ` — ${r.reason}` : ""}`);
+          escalated++;
+        }
+      }
+
+      log.info(`Plan review gate (goal ${goalId}): ${approved} approved, ${rejected} rejected, ${escalated} escalated`);
+      broadcast("project:updated", { projectId: goalRow.project_id });
     },
 
     /**
