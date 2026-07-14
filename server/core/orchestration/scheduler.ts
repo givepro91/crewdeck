@@ -1499,6 +1499,16 @@ export function createScheduler(
               SELECT COUNT(*) as remaining FROM tasks
               WHERE goal_id = ? AND id != ?
                 AND status != 'done'
+                -- reviewer gate 는 같은 '레벨'만 센다: subtask 는 실제 형제 subtask(같은
+                -- parent_task_id)만, root reviewer 는 root 태스크(parent 없음)만. goal-wide 로
+                -- 세면 reviewer subtask 가 자기 부모(하위 작업이 도는 동안 항상 in_progress)를
+                -- 미완료 형제로 오인해 부모↔subtask 순환 대기 deadlock 이 생긴다(2026-07-14 실측).
+                -- 부모는 자식보다 먼저 done 될 수 없으므로, root 레벨만 세도 subtask 완료를
+                -- transitively 포함해 root reviewer 동작은 등가다.
+                AND (
+                  (? IS NULL AND parent_task_id IS NULL)
+                  OR parent_task_id = ?
+                )
                 AND NOT (
                   status = 'blocked'
                   AND recovery_manual_action_required = 0
@@ -1506,7 +1516,7 @@ export function createScheduler(
                   AND reassign_count >= ?
                 )
                 AND assignee_id NOT IN (SELECT id FROM agents WHERE project_id = ? AND role IN ('qa-reviewer', 'reviewer', 'qa'))
-            `).get(task.goal_id, task.id, MAX_TASK_RETRIES, MAX_REASSIGNS, projectId) as { remaining: number };
+            `).get(task.goal_id, task.id, task.parent_task_id, task.parent_task_id, MAX_TASK_RETRIES, MAX_REASSIGNS, projectId) as { remaining: number };
 
             if (siblings.remaining > 0) {
               logDeferOnce(task.id, task.title, siblings.remaining);
