@@ -712,6 +712,7 @@ const ko = {
   contextTokens: "{{count}}K ctx",
   tasksCost: "{{count}} 태스크 · ${{cost}}",
   noCostData: "—",
+  costEstimatedNote: "≈ 는 일부 비용이 토큰 기반 추정치임을 뜻합니다(Codex는 CLI가 비용을 보고하지 않아 공개 단가로 역산).",
 
   // KeyboardShortcuts
   keyboardShortcuts: "키보드 단축키",

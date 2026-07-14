@@ -712,6 +712,7 @@ const en = {
   contextTokens: "{{count}}K ctx",
   tasksCost: "{{count}} tasks · ${{cost}}",
   noCostData: "—",
+  costEstimatedNote: "≈ means part of this cost is a token-based estimate (Codex CLI does not report cost, so it is derived from public rates).",
 
   // KeyboardShortcuts
   keyboardShortcuts: "Keyboard Shortcuts",

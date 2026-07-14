@@ -8,6 +8,7 @@
  * - type: "tool_use" / "tool_result" — tool calls
  */
 import { parseCodexJson } from "../codex-stream-parser.js";
+import { resolveCodexModel } from "./codex-pricing.js";
 import type { AgentHandoff, AgentHandoffStage } from "../../../../shared/types.js";
 import {
   validateAgentHandoff,
@@ -24,6 +25,11 @@ export interface UsageInfo {
   numTurns: number;
   tokenUsageReported: boolean;
   costUsdReported: boolean;
+  /**
+   * totalCostUsd가 CLI 실보고가 아니라 토큰×단가 역산 추정치일 때 true(Codex 전용).
+   * costUsdReported와 상호배타 — 추정치는 실측 비용과 구분해 UI에서 ≈로 표기한다.
+   */
+  costEstimated?: boolean;
 }
 
 export interface RateLimitInfo {
@@ -235,7 +241,10 @@ export function parseAgentOutput(
   provider: "claude" | "codex",
   expectedHandoffStage?: AgentHandoffStage,
 ): ParsedStreamOutput {
-  const parsed = provider === "codex" ? parseCodexJson(rawOutput) : parseStreamJson(rawOutput);
+  // Codex는 cost 미보고 → 파서가 토큰×단가로 역산할 수 있게 이 머신의 codex 기본 모델을 주입한다.
+  const parsed = provider === "codex"
+    ? parseCodexJson(rawOutput, { model: resolveCodexModel() })
+    : parseStreamJson(rawOutput);
   if (expectedHandoffStage) {
     const handoff = extractAgentHandoff(parsed.text, expectedHandoffStage);
     parsed.handoff = handoff.handoff;

@@ -1097,7 +1097,9 @@ Rules:
         a.name      AS agentName,
         a.role,
         COALESCE(SUM(s.token_usage), 0) AS totalTokens,
-        COALESCE(SUM(s.cost_usd), 0)    AS totalCost
+        COALESCE(SUM(s.cost_usd), 0)    AS totalCost,
+        -- CLI 실보고(claude)와 토큰 역산 추정치(codex)를 구분: 추정분 합계
+        COALESCE(SUM(CASE WHEN COALESCE(s.cost_usd_reported, 0) = 0 THEN s.cost_usd ELSE 0 END), 0) AS estimatedCost
       FROM agents a
       LEFT JOIN sessions s ON s.agent_id = a.id
       WHERE a.project_id = ?

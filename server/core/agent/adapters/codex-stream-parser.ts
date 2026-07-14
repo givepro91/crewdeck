@@ -11,8 +11,12 @@
  * claude 파서(stream-parser.ts)와 동일한 ParsedStreamOutput으로 정규화해 소비자가 provider를 몰라도 되게 한다.
  */
 import type { ParsedStreamOutput } from "./stream-parser.js";
+import { estimateCodexCostUsd } from "./codex-pricing.js";
 
-export function parseCodexJson(rawOutput: string): ParsedStreamOutput {
+export function parseCodexJson(
+  rawOutput: string,
+  opts?: { model?: string },
+): ParsedStreamOutput {
   const result: ParsedStreamOutput = {
     text: "",
     sessionId: null,
@@ -71,16 +75,24 @@ export function parseCodexJson(rawOutput: string): ParsedStreamOutput {
           && u.input_tokens >= 0
           && Number.isFinite(u.output_tokens)
           && u.output_tokens >= 0;
+        // Codex는 cost를 보고하지 않으므로 토큰 × 공개 단가로 역산한다(모델을 알 때만).
+        // costUsdReported는 계속 false — 이건 CLI 실보고가 아니라 추정치(costEstimated)다.
+        const estimate = estimateCodexCostUsd(opts?.model, {
+          inputTokens: u.input_tokens ?? 0,
+          outputTokens: u.output_tokens ?? 0,
+          cacheReadTokens: u.cached_input_tokens ?? 0,
+        });
         result.usage = {
           inputTokens: u.input_tokens ?? 0,
           outputTokens: u.output_tokens ?? 0,
           cacheReadTokens: u.cached_input_tokens ?? 0,
           cacheCreationTokens: 0,
-          totalCostUsd: 0, // Codex는 cost 미보고
+          totalCostUsd: estimate.costUsd,
           durationMs: 0,
           numTurns: 1,
           tokenUsageReported,
           costUsdReported: false,
+          costEstimated: estimate.priced,
         };
         break;
       }

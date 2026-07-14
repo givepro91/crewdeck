@@ -448,7 +448,7 @@ export function createQualityGate(
           `).run(
             usage.tokenUsageReported ? tokens : 0,
             usage.tokenUsageReported ? 1 : 0,
-            usage.costUsdReported ? usage.totalCostUsd : 0,
+            (usage.costUsdReported || usage.costEstimated) ? usage.totalCostUsd : 0,
             usage.costUsdReported ? 1 : 0,
             evaluatorSessionRowId,
           );

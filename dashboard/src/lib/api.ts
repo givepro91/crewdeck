@@ -342,7 +342,7 @@ export const api = {
       request<any>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
     delete: (id: string) => request<any>(`/projects/${id}`, { method: "DELETE" }),
     getCost: (id: string) =>
-      request<{ costs: Array<{ agentId: string; agentName: string; totalTokens: number; totalCost: number }> }>(
+      request<{ costs: Array<{ agentId: string; agentName: string; totalTokens: number; totalCost: number; estimatedCost: number }> }>(
         `/projects/${id}/cost`,
       ),
     listBranches: (id: string) =>

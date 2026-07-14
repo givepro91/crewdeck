@@ -1673,7 +1673,7 @@ ${formatHandoffOutputContract("implementation")}
           ).run(
             implParsed.usage.tokenUsageReported ? implTokens : 0,
             implParsed.usage.tokenUsageReported ? 1 : 0,
-            implParsed.usage.costUsdReported ? implParsed.usage.totalCostUsd : 0,
+            (implParsed.usage.costUsdReported || implParsed.usage.costEstimated) ? implParsed.usage.totalCostUsd : 0,
             implParsed.usage.costUsdReported ? 1 : 0,
             implementationSessionRowId,
           );
@@ -2033,7 +2033,7 @@ ${formatHandoffOutputContract("fix")}
                 `).run(
                   fixParsed.usage.tokenUsageReported ? fixTokens : 0,
                   fixParsed.usage.tokenUsageReported ? 1 : 0,
-                  fixParsed.usage.costUsdReported ? fixParsed.usage.totalCostUsd : 0,
+                  (fixParsed.usage.costUsdReported || fixParsed.usage.costEstimated) ? fixParsed.usage.totalCostUsd : 0,
                   fixParsed.usage.costUsdReported ? 1 : 0,
                   fixSessionRowId,
                 );

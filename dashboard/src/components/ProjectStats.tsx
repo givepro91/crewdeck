@@ -26,6 +26,8 @@ export function ProjectStats({ tasks, projectId }: ProjectStatsProps) {
   // baseCost: loaded from REST API (historical sessions)
   const [baseCostUsd, setBaseCostUsd] = useState(0);
   const [baseTokens, setBaseTokens] = useState(0);
+  // 이 프로젝트 누적 비용 중 토큰 역산 추정치(codex)의 합. >0이면 총액을 ≈로 표기한다.
+  const [baseEstimatedCost, setBaseEstimatedCost] = useState(0);
   // deltaCost: accumulated from live WebSocket usage events
   const [deltaCostUsd, setDeltaCostUsd] = useState(0);
   const [deltaTokens, setDeltaTokens] = useState(0);
@@ -41,6 +43,7 @@ export function ProjectStats({ tasks, projectId }: ProjectStatsProps) {
     setDeltaTokens(0);
     setBaseCostUsd(0);
     setBaseTokens(0);
+    setBaseEstimatedCost(0);
     setVerifStats(null);
     loadedProjectRef.current = projectId;
 
@@ -48,8 +51,10 @@ export function ProjectStats({ tasks, projectId }: ProjectStatsProps) {
       if (loadedProjectRef.current !== projectId) return;
       const totalCost = data.costs.reduce((sum, c) => sum + (c.totalCost ?? 0), 0);
       const totalTok = data.costs.reduce((sum, c) => sum + (c.totalTokens ?? 0), 0);
+      const estimated = data.costs.reduce((sum, c) => sum + (c.estimatedCost ?? 0), 0);
       setBaseCostUsd(totalCost);
       setBaseTokens(totalTok);
+      setBaseEstimatedCost(estimated);
     }).catch(() => {
       // Non-fatal — REST cost unavailable, delta from WS still works
     });
@@ -85,8 +90,12 @@ export function ProjectStats({ tasks, projectId }: ProjectStatsProps) {
   const inProgress = tasks.filter((t) => t.status === "in_progress").length;
   const verified = tasks.filter((t) => t.verification_id != null).length;
 
+  // 추정치가 섞였으면 ≈로 표기해 CLI 실보고 비용과 구분한다(Codex는 토큰 역산 추정).
+  const hasEstimatedCost = baseEstimatedCost > 0;
   const costLabel =
-    totalCostUsd > 0 ? `$${totalCostUsd.toFixed(4)}` : t("noCostData");
+    totalCostUsd > 0
+      ? `${hasEstimatedCost ? "≈" : ""}$${totalCostUsd.toFixed(4)}`
+      : t("noCostData");
   const tokenLabel =
     totalTokens > 0
       ? t("contextTokens", { count: (totalTokens / 1000).toFixed(1) })
@@ -171,7 +180,10 @@ export function ProjectStats({ tasks, projectId }: ProjectStatsProps) {
       </div>
       <div className="w-px h-8 bg-gray-200 dark:bg-gray-700" />
       <div className="text-center">
-        <span className="text-lg font-bold text-amber-600 dark:text-amber-400">{costLabel}</span>
+        <span
+          className="text-lg font-bold text-amber-600 dark:text-amber-400"
+          title={hasEstimatedCost ? t("costEstimatedNote") : undefined}
+        >{costLabel}</span>
         <p className="text-[11px] leading-none mt-0.5 text-gray-400 dark:text-gray-500">{t("totalCost")}</p>
       </div>
       <div className="w-px h-8 bg-gray-200 dark:bg-gray-700" />
