@@ -743,6 +743,7 @@ const en = {
   projectAgentsFound: "Project agents found",
   projectAgentsFoundDesc: "These files will be used automatically as agent prompts",
   missionBasedSuggest: "Mission-based suggestions",
+  aiSkippedProjectAgents: "Loaded this project's own role definitions as-is. AI design only runs when the project has no role definitions.",
   createFullTeam: "Create Full Team",
   selectAndCreate: "Create Selected",
   analyzingProject: "Analyzing project...",

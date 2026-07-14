@@ -143,7 +143,7 @@ export function AddAgentDialog({
       // Auto-select all by default
       const allKeys = new Set([
         ...scanned.map((a) => `scanned:${a.file}`),
-        ...suggested.map((a) => `suggested:${a.role}`),
+        ...suggested.map((_, i) => `suggested:${i}`),
       ]);
       setSelectedSmartAgents(allKeys);
     } finally {
@@ -181,8 +181,8 @@ export function AddAgentDialog({
           toCreate.push({ name: sa.agentName, role: inferRole(sa.agentName), fromProject: true });
         }
       }
-      for (const sg of suggestedAgents) {
-        const key = `suggested:${sg.role}`;
+      for (const [i, sg] of suggestedAgents.entries()) {
+        const key = `suggested:${i}`;
         if (all || selectedSmartAgents.has(key)) {
           toCreate.push({ name: sg.name, role: sg.role, fromProject: false, systemPrompt: sg.systemPrompt, model: sg.model });
         }
@@ -432,6 +432,9 @@ function SmartTeamPanel({
   onClose: () => void;
 }) {
   const hasAny = scannedAgents.length > 0 || suggestedAgents.length > 0;
+  // AI 모드로 요청했지만 프로젝트 자체 역할 정의(.claude/agents/)가 있어 AI 설계가 생략된 경우 —
+  // project-agents source가 곧 "AI 건너뜀" 신호다 (서버 agents.ts: hasProjectDefs 게이트)
+  const aiSkipped = suggestedAgents.some((s) => s.source === "project-agents");
 
   return (
     <>
@@ -510,17 +513,29 @@ function SmartTeamPanel({
                   <span className="text-xs font-semibold text-gray-700 dark:text-gray-300">
                     {t("missionBasedSuggest")}
                   </span>
-                  <button
-                    onClick={onRedesign}
-                    className="ml-auto text-[10px] px-1.5 py-0.5 rounded text-gray-400 dark:text-gray-500 hover:text-purple-500 hover:bg-purple-500/10 transition-colors"
-                    title={t("redesignTeamHint")}
-                  >
-                    ↻ {t("redesignTeam")}
-                  </button>
+                  {!aiSkipped && (
+                    <button
+                      onClick={onRedesign}
+                      className="ml-auto text-[10px] px-1.5 py-0.5 rounded text-gray-400 dark:text-gray-500 hover:text-purple-500 hover:bg-purple-500/10 transition-colors"
+                      title={t("redesignTeamHint")}
+                    >
+                      ↻ {t("redesignTeam")}
+                    </button>
+                  )}
                 </div>
+                {aiSkipped && (
+                  <div className="flex items-start gap-1.5 mb-2 text-[11px] text-amber-600 dark:text-amber-400/90 bg-amber-500/8 border border-amber-500/15 rounded-lg px-2.5 py-1.5">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 mt-0.5">
+                      <circle cx="12" cy="12" r="10" />
+                      <line x1="12" y1="8" x2="12" y2="12" />
+                      <line x1="12" y1="16" x2="12.01" y2="16" />
+                    </svg>
+                    <span>{t("aiSkippedProjectAgents")}</span>
+                  </div>
+                )}
                 <div className="space-y-1.5">
-                  {suggestedAgents.map((sg) => {
-                    const key = `suggested:${sg.role}`;
+                  {suggestedAgents.map((sg, i) => {
+                    const key = `suggested:${i}`;
                     return (
                       <label key={key} className="flex items-center gap-2.5 px-3 py-2 rounded-lg border border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/20 cursor-pointer hover:bg-gray-100/50 dark:hover:bg-gray-700/20 transition-colors">
                         <input

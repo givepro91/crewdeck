@@ -743,6 +743,7 @@ const ko = {
   projectAgentsFound: "프로젝트 에이전트 발견",
   projectAgentsFoundDesc: "이 파일들이 에이전트의 지시사항으로 자동 사용됩니다",
   missionBasedSuggest: "미션 기반 추천",
+  aiSkippedProjectAgents: "이 프로젝트에 정의된 역할을 그대로 불러왔어요. AI 자동 설계는 프로젝트에 역할 정의가 없을 때만 실행됩니다.",
   createFullTeam: "전체 팀 생성",
   selectAndCreate: "선택하여 생성",
   analyzingProject: "프로젝트 분석 중...",
