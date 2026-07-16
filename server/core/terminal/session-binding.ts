@@ -1,6 +1,7 @@
 import type { Database } from "better-sqlite3";
 import type { AgentProvider, TaskStatus, TerminalDecision, TerminalSession } from "../../../shared/types.js";
 import { updateTerminalBridgeTask } from "./bridge.js";
+import { redactTerminalText } from "./redaction.js";
 
 interface SessionRow {
   id: string;
@@ -221,14 +222,143 @@ export function claimNextTerminalTask(
   return claim();
 }
 
+export interface TerminalTaskStartResult {
+  task: Record<string, unknown>;
+  provider: AgentProvider;
+  launchKey: string;
+  launchState: "requested" | "continued";
+}
+
+function preferredProvider(
+  db: Database,
+  session: SessionRow,
+  inputProvider: AgentProvider | null | undefined,
+): AgentProvider {
+  const requested = inputProvider === undefined ? null : normalizeProvider(inputProvider);
+  if (requested) return requested;
+  if (session.provider) return session.provider;
+  if (session.agent_id) {
+    const agent = db.prepare("SELECT provider FROM agents WHERE id = ? AND project_id = ?")
+      .get(session.agent_id, session.project_id) as { provider: AgentProvider | null } | undefined;
+    if (agent?.provider) return agent.provider;
+  }
+  const project = db.prepare("SELECT default_provider FROM projects WHERE id = ?")
+    .get(session.project_id) as { default_provider: AgentProvider | null } | undefined;
+  return project?.default_provider ?? "claude";
+}
+
 /**
- * claim 직후 터미널의 에이전트 REPL에 주입하는 착수 지시 한 줄.
- * TERMINAL_AGENT_PROMPT 계약(crewdeck_get_context 우선)과 같은 언어(영어)로 작성한다.
+ * Claims/binds the next task and requests the provider command as one synchronous
+ * API operation. The persisted task+provider binding is the idempotency lease:
+ * repeating the same request returns `continued` without writing another CLI
+ * command. `requested` only proves that the PTY accepted the command, not that the
+ * provider became ready. A rejected write restores the task/session DB state.
  */
-export function composeTaskKickoffMessage(task: { id?: unknown; title?: unknown }): string {
-  const title = String(task.title ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-  const id = String(task.id ?? "").trim();
-  return `[Crewdeck] Task assigned to this terminal: "${title}" (task ${id}, already in_progress). Call crewdeck_get_context to confirm the binding, then start working on this task now.`;
+export function startNextTerminalTask(
+  db: Database,
+  terminalId: string,
+  // taskId를 주면 우선순위 큐 대신 그 태스크를 수임한다 (검증은 claimNextTerminalTask가 수행).
+  input: TerminalBindingInput,
+  launchProvider: (provider: AgentProvider, launchKey: string) => boolean,
+): TerminalTaskStartResult {
+  const prepare = db.transaction(() => {
+    const before = activeSessionRow(db, terminalId);
+    const taskSnapshots = db.prepare(`
+      SELECT id, status, assignee_id, started_at FROM tasks
+       WHERE project_id = ? AND goal_id = ?
+    `).all(before.project_id, input.goalId ?? before.goal_id) as Array<{
+      id: string;
+      status: TaskStatus;
+      assignee_id: string | null;
+      started_at: string | null;
+    }>;
+    const agentSnapshots = db.prepare(`
+      SELECT id, status, current_task_id FROM agents WHERE project_id = ?
+    `).all(before.project_id) as Array<{ id: string; status: string; current_task_id: string | null }>;
+    const leasedTaskBefore = taskSnapshots.find((item) => item.id === before.active_task_id);
+    if (leasedTaskBefore && ["in_progress", "in_review", "blocked"].includes(leasedTaskBefore.status)
+      && before.provider && input.provider && before.provider !== input.provider) {
+      throw new Error(`This task is already running with ${before.provider}`);
+    }
+
+    const task = claimNextTerminalTask(db, terminalId, input);
+    const bound = activeSessionRow(db, terminalId);
+    const provider = preferredProvider(db, bound, input.provider);
+    const taskId = String(task.id ?? "");
+    if (!taskId) throw new Error("Claimed task has no id");
+
+    const taskBefore = taskSnapshots.find((item) => item.id === taskId) ?? null;
+    const launchSuppressedByTaskState = taskBefore?.status === "in_review"
+      || taskBefore?.status === "blocked";
+    const launchRequired = !launchSuppressedByTaskState && (
+      taskBefore?.status === "todo"
+      || before.active_task_id !== taskId
+      || before.provider !== provider
+    );
+    const launchKey = `${terminalId}:${taskId}:${provider}`;
+    if (!launchSuppressedByTaskState) {
+      db.prepare("UPDATE terminal_sessions SET provider = ? WHERE id = ?").run(provider, terminalId);
+    }
+
+    return {
+      task,
+      provider,
+      launchKey,
+      launchState: launchRequired ? "requested" as const : "continued" as const,
+      before,
+      launchRequired,
+      taskBefore,
+      agentBefore: agentSnapshots.find((item) => item.id === bound.agent_id) ?? null,
+    };
+  });
+  const prepared = prepare();
+  if (prepared.launchRequired && !launchProvider(prepared.provider, prepared.launchKey)) {
+    db.transaction(() => {
+      const taskId = String(prepared.task.id);
+      if (prepared.taskBefore?.status === "todo") {
+        db.prepare(`
+          UPDATE tasks SET status = ?, assignee_id = ?, started_at = ?, updated_at = datetime('now')
+           WHERE id = ? AND status = 'in_progress'
+        `).run(
+          prepared.taskBefore.status,
+          prepared.taskBefore.assignee_id,
+          prepared.taskBefore.started_at,
+          taskId,
+        );
+        if (prepared.agentBefore) {
+          db.prepare("UPDATE agents SET status = ?, current_task_id = ? WHERE id = ? AND current_task_id = ?")
+            .run(
+              prepared.agentBefore.status,
+              prepared.agentBefore.current_task_id,
+              prepared.agentBefore.id,
+              taskId,
+            );
+        }
+      }
+      db.prepare(`
+        UPDATE terminal_sessions
+           SET goal_id = ?, agent_id = ?, active_task_id = ?, provider = ?
+         WHERE id = ? AND active_task_id = ? AND provider = ?
+      `).run(
+        prepared.before.goal_id,
+        prepared.before.agent_id,
+        prepared.before.active_task_id,
+        prepared.before.provider,
+        terminalId,
+        taskId,
+        prepared.provider,
+      );
+      db.prepare("UPDATE workspaces SET active_goal_id = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(prepared.before.goal_id, prepared.before.workspace_id);
+    })();
+    throw new Error("Terminal provider launch failed before the task could start");
+  }
+  return {
+    task: prepared.task,
+    provider: prepared.provider,
+    launchKey: prepared.launchKey,
+    launchState: prepared.launchState,
+  };
 }
 
 export function listTerminalDecisions(db: Database, workspaceId: string, goalId?: string): TerminalDecision[] {
@@ -259,7 +389,7 @@ export function recordTerminalDecision(
   messageInput: string,
 ): { decision: TerminalDecision; task: Record<string, unknown> | null } {
   const session = activeSessionRow(db, terminalId);
-  const message = messageInput.trim().slice(0, 4_000);
+  const message = redactTerminalText(messageInput.trim(), 4_000);
   if (!message) throw new Error("Decision message is required");
   const result = db.transaction(() => {
     const row = db.prepare(`

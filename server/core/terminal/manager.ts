@@ -8,6 +8,7 @@ import type { AgentProvider, TerminalSession, TerminalSessionStatus } from "../.
 import { TERMINAL_AGENT_PROMPT } from "../../../shared/terminal-agent.js";
 import { detectRunningAgent } from "./agent-detect.js";
 import { finishTerminalBridgeAgentRun } from "./bridge.js";
+import { recoverInterruptedTask } from "../recovery.js";
 import { TmuxBackend, type TmuxCommand } from "./tmux.js";
 
 const MAX_OUTPUT = 200 * 1024;
@@ -64,6 +65,9 @@ interface ActiveTerminal {
   runtimeId: string | null;
   stopStatus: "killed" | "interrupted" | null;
   flushTimer: ReturnType<typeof setTimeout> | null;
+  inputReady: boolean;
+  pendingInput: string;
+  inputReadyTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export interface TerminalCommand {
@@ -89,9 +93,23 @@ export type TerminalEvent =
     exitCode: number | null;
   } };
 
+const UTF8_LOCALE = "en_US.UTF-8";
+
 function clamp(value: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+/**
+ * PTY 환경에 UTF-8 로케일을 보장한다. launchd로 기동하면 LANG/LC_* 가 아예 없는데,
+ * tmux는 LC_ALL > LC_CTYPE > LANG 중 첫 값에 "UTF-8"이 없으면 non-UTF-8 클라이언트로
+ * 붙어(client_utf8=0) 멀티바이트 입력·출력을 '_'로 뭉갠다. 셸과 claude/codex CLI의
+ * 한글 출력도 같은 이유로 깨진다. 이미 UTF-8이면 사용자 설정을 그대로 둔다.
+ */
+function withUtf8Locale<T extends Record<string, string | undefined>>(env: T): T {
+  const configured = env.LC_ALL ?? env.LC_CTYPE ?? env.LANG;
+  if (configured && /utf-?8/i.test(configured)) return env;
+  return { ...env, LANG: env.LANG ?? UTF8_LOCALE, LC_CTYPE: UTF8_LOCALE };
 }
 
 function toModel(
@@ -132,11 +150,6 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-/** PTY 주입용 한 줄 정규화 — 제어문자가 섞이면 REPL 입력이 깨지거나 조기 제출된다. */
-function sanitizeAgentLine(value: string): string {
-  return value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 1_000);
-}
-
 export class TerminalManager {
   private readonly active = new Map<string, ActiveTerminal>();
   private readonly tmux: TmuxBackend | null;
@@ -161,7 +174,8 @@ export class TerminalManager {
       }
       this.db.prepare(`
         UPDATE terminal_sessions
-           SET status = 'interrupted', pid = NULL, ended_at = datetime('now')
+           SET status = 'interrupted', pid = NULL, bridge_token_hash = NULL,
+               ended_at = datetime('now')
          WHERE id = ? AND status = 'active'
       `).run(terminal.id);
       this.reconcileInterruptedTerminal(terminal.id, terminal.workspace_id);
@@ -181,7 +195,7 @@ export class TerminalManager {
         cwd: row.cwd,
         cols: row.cols,
         rows: row.rows,
-        env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" },
+        env: withUtf8Locale({ ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" }),
       });
       const pid = this.tmux.panePid(row.runtime_id) ?? row.pid;
       this.db.prepare(`
@@ -232,6 +246,8 @@ export class TerminalManager {
     backend: "pty" | "tmux";
     runtimeId: string | null;
     output: string;
+    deferInputUntilData?: boolean;
+    inputReadyFile?: string | null;
   }): void {
     const active: ActiveTerminal = {
       pty: input.pty,
@@ -240,10 +256,40 @@ export class TerminalManager {
       runtimeId: input.runtimeId,
       stopStatus: null,
       flushTimer: null,
+      inputReady: input.deferInputUntilData !== true,
+      pendingInput: "",
+      inputReadyTimer: null,
     };
     this.active.set(input.id, active);
 
+    const markInputReady = () => {
+      if (active.inputReady) return;
+      active.inputReady = true;
+      if (active.inputReadyTimer) clearTimeout(active.inputReadyTimer);
+      active.inputReadyTimer = null;
+      const pending = active.pendingInput;
+      active.pendingInput = "";
+      if (!pending) return;
+      if (active.backend === "tmux" && active.runtimeId && this.tmux) {
+        this.tmux.write(active.runtimeId, pending);
+      } else {
+        active.pty.write(pending);
+      }
+    };
+    const pollInputReady = () => {
+      if (active.inputReady) return;
+      if (!input.inputReadyFile || existsSync(input.inputReadyFile)) {
+        markInputReady();
+        return;
+      }
+      active.inputReadyTimer = setTimeout(pollInputReady, 20);
+    };
+    if (!active.inputReady) {
+      active.inputReadyTimer = setTimeout(pollInputReady, 20);
+    }
+
     input.pty.onData((data) => {
+      if (!input.inputReadyFile || existsSync(input.inputReadyFile)) markInputReady();
       active.output = `${active.output}${data}`.slice(-MAX_OUTPUT);
       if (!active.flushTimer) {
         active.flushTimer = setTimeout(() => {
@@ -256,6 +302,7 @@ export class TerminalManager {
     });
     input.pty.onExit(({ exitCode }) => {
       if (active.flushTimer) clearTimeout(active.flushTimer);
+      if (active.inputReadyTimer) clearTimeout(active.inputReadyTimer);
       if (this.shuttingDown) {
         this.active.delete(input.id);
         return;
@@ -276,7 +323,8 @@ export class TerminalManager {
         : active.stopStatus ?? "exited";
       this.db.prepare(`
         UPDATE terminal_sessions
-           SET status = ?, exit_code = ?, pid = NULL, last_output = ?, ended_at = datetime('now')
+           SET status = ?, exit_code = ?, pid = NULL, bridge_token_hash = NULL,
+               last_output = ?, ended_at = datetime('now')
          WHERE id = ?
       `).run(status, exitCode, active.output, input.id);
       if (status === "interrupted") {
@@ -310,7 +358,7 @@ export class TerminalManager {
 
   private reconcileInterruptedTerminal(terminalId: string, workspaceId: string): void {
     try {
-      finishTerminalBridgeAgentRun(this.db, {
+      const result = finishTerminalBridgeAgentRun(this.db, {
         workspaceId,
         terminalSessionId: terminalId,
         clientRequestId: `terminal-interrupted-${terminalId}`,
@@ -318,8 +366,20 @@ export class TerminalManager {
         exitCode: -1,
         interrupted: true,
       });
+      if (result.task) return;
     } catch {
       // Terminal history remains authoritative even when no bridge task exists.
+    }
+    const binding = this.db.prepare(`
+      SELECT active_task_id, agent_id FROM terminal_sessions WHERE id = ?
+    `).get(terminalId) as { active_task_id: string | null; agent_id: string | null } | undefined;
+    if (!binding?.active_task_id) return;
+    recoverInterruptedTask(this.db, binding.active_task_id, "startup");
+    if (binding.agent_id) {
+      this.db.prepare(`
+        UPDATE agents SET status = 'idle', current_task_id = NULL, current_activity = NULL
+         WHERE id = ? AND current_task_id = ? AND status != 'terminated'
+      `).run(binding.agent_id, binding.active_task_id);
     }
   }
 
@@ -350,14 +410,15 @@ export class TerminalManager {
     const bridgeToken = this.runtime ? randomBytes(32).toString("hex") : null;
     const bridgeTokenHash = bridgeToken ? createHash("sha256").update(bridgeToken).digest("hex") : null;
     const runtimeDir = this.runtime ? resolve(this.runtime.dataDir, "terminal-runtime") : null;
-    const terminalEnv: Record<string, string | undefined> = {
+    const inputReadyFile = runtimeDir ? resolve(runtimeDir, "ready", id) : null;
+    const terminalEnv: Record<string, string | undefined> = withUtf8Locale({
       ...process.env,
       TERM: "xterm-256color",
       COLORTERM: "truecolor",
       CREWDECK_WORKSPACE_ID: workspace.id,
       CREWDECK_PROJECT_ID: workspace.project_id,
       CREWDECK_TERMINAL_ID: id,
-    };
+    });
     if (this.runtime && runtimeDir) {
       terminalEnv.CREWDECK_API_URL = this.runtime.apiBaseUrl;
       terminalEnv.CREWDECK_API_KEY = bridgeToken!;
@@ -366,6 +427,7 @@ export class TerminalManager {
       terminalEnv.CREWDECK_MCP_CONFIG = resolve(runtimeDir, "claude-mcp.json");
       terminalEnv.CREWDECK_MCP_COMMAND = this.runtime.mcpCommand.command;
       terminalEnv.CREWDECK_MCP_ARGS_TOML = JSON.stringify(this.runtime.mcpCommand.args);
+      terminalEnv.CREWDECK_TERMINAL_READY_FILE = inputReadyFile!;
       terminalEnv.CREWDECK_ORIGINAL_ZDOTDIR = process.env.ZDOTDIR ?? process.env.HOME ?? "";
       terminalEnv.PATH = `${resolve(runtimeDir, "bin")}:${process.env.PATH ?? ""}`;
       const codexHome = resolve(runtimeDir, "codex-home", id);
@@ -479,6 +541,8 @@ export class TerminalManager {
       backend,
       runtimeId,
       output: "",
+      deferInputUntilData: backend === "tmux" && (shell.endsWith("/zsh") || shell.endsWith("/bash")),
+      inputReadyFile,
     });
 
     return this.get(id)!;
@@ -489,6 +553,7 @@ export class TerminalManager {
     const runtimeDir = resolve(this.runtime.dataDir, "terminal-runtime");
     const binDir = resolve(runtimeDir, "bin");
     mkdirSync(binDir, { recursive: true, mode: 0o700 });
+    mkdirSync(resolve(runtimeDir, "ready"), { recursive: true, mode: 0o700 });
     const syncWrapper = resolve(binDir, "crewdeck-sync");
     writeFileSync(
       syncWrapper,
@@ -539,6 +604,7 @@ if [[ -n "$CREWDECK_CODEX_BIN" ]]; then
     return "$_crewdeck_exit"
   }
 fi
+: > "$CREWDECK_TERMINAL_READY_FILE"
 `, { mode: 0o600 });
     writeFileSync(resolve(runtimeDir, "bashrc"), `
 [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
@@ -557,6 +623,7 @@ codex() {
   crewdeck-sync agent-exit --provider codex --exit-code "$_crewdeck_exit" >/dev/null 2>&1 || true
   return "$_crewdeck_exit"
 }
+: > "$CREWDECK_TERMINAL_READY_FILE"
 `, { mode: 0o600 });
   }
 
@@ -621,6 +688,14 @@ codex() {
   write(id: string, data: string): boolean {
     const terminal = this.active.get(id);
     if (!terminal || typeof data !== "string" || data.length > 64 * 1024) return false;
+    if (!terminal.inputReady) {
+      if (terminal.pendingInput.length + data.length > 64 * 1024) return false;
+      terminal.pendingInput += data;
+      return true;
+    }
+    if (terminal.backend === "tmux" && terminal.runtimeId && this.tmux) {
+      return this.tmux.write(terminal.runtimeId, data);
+    }
     terminal.pty.write(data);
     return true;
   }
@@ -638,24 +713,6 @@ codex() {
       ? this.tmux?.panePid(row.runtime_id) ?? null
       : this.active.get(id)?.pty.pid ?? row.pid;
     return detectRunningAgent(rootPid);
-  }
-
-  /**
-   * 실행 중인 에이전트 REPL에 한 줄 메시지를 주입한다.
-   * 텍스트와 Enter를 나눠 보낸다 — 일부 REPL은 같은 청크의 CR을 붙여넣기 개행으로 취급한다.
-   */
-  async sendAgentMessage(id: string, message: string): Promise<boolean> {
-    const text = sanitizeAgentLine(message);
-    if (!text || !this.write(id, text)) return false;
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    return this.write(id, "\r");
-  }
-
-  /** 셸 프롬프트 상태의 터미널에서 에이전트 CLI를 실행한다. 초기 프롬프트는 인자로 전달. */
-  launchAgentCommand(id: string, provider: AgentProvider, initialPrompt?: string): boolean {
-    const prompt = initialPrompt ? sanitizeAgentLine(initialPrompt) : "";
-    const command = prompt ? `${provider} ${shellQuote(prompt)}` : provider;
-    return this.write(id, `${command}\r`);
   }
 
   resize(id: string, colsInput: number, rowsInput: number): boolean {
@@ -693,30 +750,49 @@ codex() {
     return this.get(id);
   }
 
-  killAll(): void {
+  killAll(options: { preservePersistent?: boolean } = {}): void {
     this.shuttingDown = true;
     for (const [id, terminal] of this.active) {
       terminal.stopStatus = "interrupted";
       if (terminal.flushTimer) clearTimeout(terminal.flushTimer);
+      if (terminal.inputReadyTimer) clearTimeout(terminal.inputReadyTimer);
       if (terminal.backend === "tmux" && terminal.runtimeId && this.tmux?.hasSession(terminal.runtimeId)) {
-        const output = this.tmux.capture(terminal.runtimeId) || terminal.output;
-        const pid = this.tmux.panePid(terminal.runtimeId);
-        this.db.prepare(`
-          UPDATE terminal_sessions
-             SET pid = COALESCE(?, pid), last_output = ?
-           WHERE id = ? AND status = 'active'
-        `).run(pid, output, id);
-        try { terminal.pty.kill(); } catch { /* best effort during shutdown */ }
-        continue;
+        if (options.preservePersistent === false) {
+          this.tmux.killSession(terminal.runtimeId);
+        } else {
+          const output = this.tmux.capture(terminal.runtimeId) || terminal.output;
+          const pid = this.tmux.panePid(terminal.runtimeId);
+          this.db.prepare(`
+            UPDATE terminal_sessions
+               SET pid = COALESCE(?, pid), last_output = ?
+             WHERE id = ? AND status = 'active'
+          `).run(pid, output, id);
+          try { terminal.pty.kill(); } catch { /* best effort during shutdown */ }
+          continue;
+        }
       }
       try { terminal.pty.kill(); } catch { /* best effort during shutdown */ }
       this.db.prepare(`
         UPDATE terminal_sessions
-           SET status = 'interrupted', pid = NULL, last_output = ?, ended_at = datetime('now')
+           SET status = 'interrupted', pid = NULL, bridge_token_hash = NULL,
+               last_output = ?, ended_at = datetime('now')
          WHERE id = ? AND status = 'active'
       `).run(terminal.output, id);
       const session = this.get(id);
       if (session) this.reconcileInterruptedTerminal(id, session.workspaceId);
+    }
+    if (options.preservePersistent === false && this.tmux) {
+      const persistent = this.db.prepare(`
+        SELECT runtime_id FROM terminal_sessions
+         WHERE backend = 'tmux' AND status = 'active' AND runtime_id IS NOT NULL
+      `).all() as Array<{ runtime_id: string }>;
+      for (const terminal of persistent) this.tmux.killSession(terminal.runtime_id);
+      this.db.prepare(`
+        UPDATE terminal_sessions
+           SET status = 'interrupted', pid = NULL, bridge_token_hash = NULL,
+               ended_at = datetime('now')
+         WHERE backend = 'tmux' AND status = 'active'
+      `).run();
     }
   }
 }

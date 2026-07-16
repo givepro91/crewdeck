@@ -9,13 +9,13 @@ import { createDatabase, migrate } from "../db/schema.js";
 import { createTerminalRoutes } from "../api/routes/terminals.js";
 
 const servers: Server[] = [];
-const cleanup: Array<() => void> = [];
+const databases: ReturnType<typeof createDatabase>[] = [];
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   })));
-  cleanup.splice(0).reverse().forEach((run) => run());
+  databases.splice(0).forEach((db) => db.close());
 });
 
 async function startApi(dismiss: (id: string) => unknown) {
@@ -24,6 +24,21 @@ async function startApi(dismiss: (id: string) => unknown) {
   app.use(express.json());
   app.use("/api/terminals", createTerminalRoutes({
     terminalManager: { dismiss },
+    broadcast,
+  } as never));
+  const server = createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  servers.push(server);
+  return { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, broadcast };
+}
+
+async function startTaskApi(terminalManager: Record<string, unknown>, db: unknown = {}) {
+  const broadcast = vi.fn();
+  const app = express();
+  app.use(express.json());
+  app.use("/api/terminals", createTerminalRoutes({
+    db,
+    terminalManager,
     broadcast,
   } as never));
   const server = createServer(app);
@@ -59,172 +74,97 @@ describe("terminal tab routes", () => {
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ error: "Active terminal must be stopped before dismissal" });
   });
-});
 
-function bindingFixture() {
-  const dir = mkdtempSync(join(tmpdir(), "crewdeck-terminal-routes-"));
-  const db = createDatabase(join(dir, "crewdeck.db"));
-  migrate(db);
-  cleanup.push(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
-  db.prepare("INSERT INTO projects (id, name, source, workdir) VALUES ('p1', 'Project', 'local_import', ?)").run(dir);
-  db.prepare("INSERT INTO goals (id, project_id, title, description, sort_order) VALUES ('g1', 'p1', 'Goal', 'Ship it', 0)").run();
-  db.prepare(`
-    INSERT INTO workspaces (id, project_id, goal_id, active_goal_id, name, kind, state, worktree_path, worktree_branch)
-    VALUES ('w1', 'p1', 'g1', 'g1', 'Workspace', 'goal', 'ready', ?, 'workspace/g1')
-  `).run(dir);
-  db.prepare("INSERT INTO tasks (id, goal_id, project_id, title, status, sort_order, depends_on) VALUES ('t1', 'g1', 'p1', 'Implement feature', 'todo', 0, '[]')").run();
-  db.prepare("INSERT INTO terminal_sessions (id, workspace_id, project_id, shell, cwd, status, goal_id) VALUES ('term1', 'w1', 'p1', '/bin/zsh', ?, 'active', 'g1')").run(dir);
-  return db;
-}
+  it("rejects task start before claiming when terminal context is mismatched", async () => {
+    const write = vi.fn();
+    const { baseUrl } = await startTaskApi({
+      get: vi.fn().mockReturnValue({ id: "term-1", status: "active", contextState: "mismatch" }),
+      write,
+    });
 
-function fakeManager(db: ReturnType<typeof bindingFixture>) {
-  return {
-    get: vi.fn((id: string) => {
-      const row = db.prepare(`
-        SELECT ts.*, t.title AS active_task_title FROM terminal_sessions ts
-        LEFT JOIN tasks t ON t.id = ts.active_task_id WHERE ts.id = ?
-      `).get(id) as Record<string, unknown> | undefined;
-      if (!row) return null;
-      return {
-        id: row.id,
-        status: row.status,
-        workspaceId: row.workspace_id,
-        projectId: row.project_id,
-        activeTaskId: row.active_task_id,
-        activeTaskTitle: row.active_task_title ?? null,
-        provider: row.provider,
-      };
-    }),
-    runningAgent: vi.fn<(id: string) => "claude" | "codex" | null>(() => null),
-    sendAgentMessage: vi.fn(async () => true),
-    launchAgentCommand: vi.fn(() => true),
-    dismiss: vi.fn(),
-  };
-}
-
-async function startBindingApi(db: ReturnType<typeof bindingFixture>, manager: ReturnType<typeof fakeManager>) {
-  const broadcast = vi.fn();
-  const app = express();
-  app.use(express.json());
-  app.use("/api/terminals", createTerminalRoutes({ db, terminalManager: manager, broadcast } as never));
-  const server = createServer(app);
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  servers.push(server);
-  return { baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, broadcast };
-}
-
-describe("claim-next kickoff", () => {
-  it("injects the kickoff into a running agent session", async () => {
-    const db = bindingFixture();
-    const manager = fakeManager(db);
-    manager.runningAgent.mockReturnValue("claude");
-    const { baseUrl } = await startBindingApi(db, manager);
-
-    const response = await fetch(`${baseUrl}/api/terminals/term1/claim-next`, {
+    const response = await fetch(`${baseUrl}/api/terminals/term-1/start-next`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ goalId: "g1" }),
     });
 
-    expect(response.status).toBe(200);
-    const body = await response.json() as { kickoff: { status: string; provider: string } };
-    expect(body.kickoff).toEqual({ status: "sent", provider: "claude" });
-    expect(manager.sendAgentMessage).toHaveBeenCalledWith("term1", expect.stringContaining('"Implement feature"'));
-    expect(manager.sendAgentMessage).toHaveBeenCalledWith("term1", expect.stringContaining("task t1"));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "Terminal context is not connected" });
+    expect(write).not.toHaveBeenCalled();
   });
 
-  it("never types into a bare shell — reports agent_not_running instead", async () => {
-    const db = bindingFixture();
-    const manager = fakeManager(db);
-    const { baseUrl } = await startBindingApi(db, manager);
+  it("records the claimed task and honest provider launch request", async () => {
+    const db = createDatabase(":memory:");
+    databases.push(db);
+    migrate(db);
+    db.exec(`
+      INSERT INTO projects (id, name, source, default_provider) VALUES ('p1', 'Project', 'new', 'codex');
+      INSERT INTO agents (id, project_id, name, role, provider) VALUES ('a1', 'p1', 'Coder', 'coder', 'codex');
+      INSERT INTO goals (id, project_id, title, description) VALUES ('g1', 'p1', 'Goal', 'Ship');
+      INSERT INTO workspaces (id, project_id, goal_id, active_goal_id, name, state)
+        VALUES ('w1', 'p1', 'g1', 'g1', 'Workspace', 'ready');
+      INSERT INTO tasks (id, goal_id, project_id, title, assignee_id, status)
+        VALUES ('t1', 'g1', 'p1', 'Implement', 'a1', 'todo');
+      INSERT INTO terminal_sessions (id, workspace_id, project_id, shell, cwd, goal_id, agent_id, status)
+        VALUES ('term1', 'w1', 'p1', '/bin/zsh', '/tmp', 'g1', 'a1', 'active');
+    `);
+    const write = vi.fn().mockReturnValue(true);
+    const { baseUrl, broadcast } = await startTaskApi({
+      get: vi.fn().mockReturnValue({
+        id: "term1", workspaceId: "w1", projectId: "p1", status: "active", contextState: "connected",
+      }),
+      write,
+    }, db);
 
-    const response = await fetch(`${baseUrl}/api/terminals/term1/claim-next`, {
+    const response = await fetch(`${baseUrl}/api/terminals/term1/start-next`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ goalId: "g1" }),
+      body: JSON.stringify({ goalId: "g1", agentId: "a1", provider: "codex" }),
     });
 
     expect(response.status).toBe(200);
-    const body = await response.json() as { kickoff: { status: string } };
-    expect(body.kickoff).toEqual({ status: "agent_not_running", provider: null });
-    expect(manager.sendAgentMessage).not.toHaveBeenCalled();
-    expect(manager.launchAgentCommand).not.toHaveBeenCalled();
+    expect(write).toHaveBeenCalledWith("term1", "codex\r");
+    expect(db.prepare("SELECT kind FROM terminal_activities ORDER BY rowid").all())
+      .toEqual([{ kind: "task_claimed" }, { kind: "provider_launch_requested" }]);
+    expect(broadcast).toHaveBeenCalledWith("terminal:activity", expect.objectContaining({ kind: "task_claimed" }));
   });
-});
 
-describe("terminal launch", () => {
-  it("launches the agent CLI with the kickoff as its initial prompt", async () => {
-    const db = bindingFixture();
-    const manager = fakeManager(db);
-    db.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = 't1'").run();
-    db.prepare("UPDATE terminal_sessions SET active_task_id = 't1' WHERE id = 'term1'").run();
-    const { baseUrl } = await startBindingApi(db, manager);
+  it("starts the exact task requested from the list instead of the priority queue", async () => {
+    const db = createDatabase(":memory:");
+    databases.push(db);
+    migrate(db);
+    db.exec(`
+      INSERT INTO projects (id, name, source, default_provider) VALUES ('p1', 'Project', 'new', 'codex');
+      INSERT INTO agents (id, project_id, name, role, provider) VALUES ('a1', 'p1', 'Coder', 'coder', 'codex');
+      INSERT INTO goals (id, project_id, title, description) VALUES ('g1', 'p1', 'Goal', 'Ship');
+      INSERT INTO workspaces (id, project_id, goal_id, active_goal_id, name, state)
+        VALUES ('w1', 'p1', 'g1', 'g1', 'Workspace', 'ready');
+      INSERT INTO tasks (id, goal_id, project_id, title, status, priority, sort_order)
+        VALUES ('t1', 'g1', 'p1', 'Urgent first', 'todo', 'critical', 0);
+      INSERT INTO tasks (id, goal_id, project_id, title, status, priority, sort_order)
+        VALUES ('t2', 'g1', 'p1', 'Picked from the list', 'todo', 'medium', 1);
+      INSERT INTO terminal_sessions (id, workspace_id, project_id, shell, cwd, goal_id, agent_id, status)
+        VALUES ('term1', 'w1', 'p1', '/bin/zsh', '/tmp', 'g1', 'a1', 'active');
+    `);
+    const write = vi.fn().mockReturnValue(true);
+    const { baseUrl } = await startTaskApi({
+      get: vi.fn().mockReturnValue({
+        id: "term1", workspaceId: "w1", projectId: "p1", status: "active", contextState: "connected",
+      }),
+      write,
+    }, db);
 
-    const response = await fetch(`${baseUrl}/api/terminals/term1/launch`, {
+    const response = await fetch(`${baseUrl}/api/terminals/term1/start-next`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ provider: "claude", goalId: "g1", kickoff: true }),
+      body: JSON.stringify({ goalId: "g1", taskId: "t2", provider: "codex" }),
     });
 
     expect(response.status).toBe(200);
-    const body = await response.json() as { status: string; kickoffSent: boolean };
-    expect(body.status).toBe("launched");
-    expect(body.kickoffSent).toBe(true);
-    expect(manager.launchAgentCommand).toHaveBeenCalledWith("term1", "claude", expect.stringContaining('"Implement feature"'));
-    expect(manager.sendAgentMessage).not.toHaveBeenCalled();
-  });
-
-  it("does not retype the launch command into an already running session", async () => {
-    const db = bindingFixture();
-    const manager = fakeManager(db);
-    manager.runningAgent.mockReturnValue("claude");
-    const { baseUrl } = await startBindingApi(db, manager);
-
-    const response = await fetch(`${baseUrl}/api/terminals/term1/launch`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ provider: "claude", goalId: "g1" }),
-    });
-
-    expect(response.status).toBe(200);
-    const body = await response.json() as { status: string; kickoffSent: boolean };
-    expect(body.status).toBe("already_running");
-    expect(body.kickoffSent).toBe(false);
-    expect(manager.launchAgentCommand).not.toHaveBeenCalled();
-    expect(manager.sendAgentMessage).not.toHaveBeenCalled();
-  });
-
-  it("blocks launching while a different agent is running", async () => {
-    const db = bindingFixture();
-    const manager = fakeManager(db);
-    manager.runningAgent.mockReturnValue("codex");
-    const { baseUrl } = await startBindingApi(db, manager);
-
-    const response = await fetch(`${baseUrl}/api/terminals/term1/launch`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ provider: "claude", goalId: "g1" }),
-    });
-
-    expect(response.status).toBe(200);
-    const body = await response.json() as { status: string; runningProvider: string };
-    expect(body.status).toBe("conflict");
-    expect(body.runningProvider).toBe("codex");
-    expect(manager.launchAgentCommand).not.toHaveBeenCalled();
-    expect(manager.sendAgentMessage).not.toHaveBeenCalled();
-  });
-
-  it("rejects an unknown provider", async () => {
-    const db = bindingFixture();
-    const manager = fakeManager(db);
-    const { baseUrl } = await startBindingApi(db, manager);
-
-    const response = await fetch(`${baseUrl}/api/terminals/term1/launch`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ provider: "gemini" }),
-    });
-
-    expect(response.status).toBe(400);
+    const payload = await response.json() as { task: Record<string, unknown> };
+    expect(payload.task).toMatchObject({ id: "t2", status: "in_progress" });
+    expect(db.prepare("SELECT status FROM tasks WHERE id = 't1'").get()).toEqual({ status: "todo" });
+    expect(db.prepare("SELECT active_task_id FROM terminal_sessions WHERE id = 'term1'").get())
+      .toEqual({ active_task_id: "t2" });
   });
 });

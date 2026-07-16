@@ -18,7 +18,6 @@ const mocks = vi.hoisted(() => {
     kill: vi.fn(),
     dismiss: vi.fn(),
     bind: vi.fn(),
-    launch: vi.fn(),
     selectGoal: vi.fn(),
     wsSend: vi.fn(),
     writes: [] as string[],
@@ -34,7 +33,6 @@ vi.mock("../lib/api", () => ({
       kill: mocks.kill,
       dismiss: mocks.dismiss,
       bind: mocks.bind,
-      launch: mocks.launch,
     },
     workspaces: { selectGoal: mocks.selectGoal },
   },
@@ -45,7 +43,7 @@ vi.mock("@xterm/xterm", () => ({
     cols = 120;
     rows = 32;
     loadAddon() {}
-    open() {}
+    open(host: HTMLElement) { host.appendChild(document.createElement("textarea")); }
     focus() {}
     write(value: string) { mocks.writes.push(value); }
     writeln(value: string) { mocks.writes.push(value); }
@@ -115,18 +113,6 @@ beforeEach(() => {
     endedAt: null,
     ...data,
   }));
-  mocks.launch.mockImplementation(async (_id: string, data: { provider: "claude" | "codex" }) => ({
-    status: "launched",
-    runningProvider: null,
-    kickoffSent: false,
-    terminal: terminal({
-      id: "terminal-connected",
-      status: "active",
-      contextState: "connected",
-      endedAt: null,
-      provider: data.provider,
-    }),
-  }));
   mocks.selectGoal.mockResolvedValue({});
 });
 
@@ -137,13 +123,31 @@ afterEach(() => {
 });
 
 describe("WorkspaceTerminal restart recovery", () => {
+  it("exposes terminal tabs, controls, input, and status with stable accessible names", async () => {
+    mocks.list.mockResolvedValue([terminal({
+      id: "terminal-active",
+      status: "active",
+      contextState: "connected",
+      pid: 1234,
+      output: "",
+      endedAt: null,
+    })]);
+    render(<WorkspaceTerminal workspaceId="w1" activeGoalId="g1" />);
+
+    expect((await screen.findByRole("tab", { name: "Terminal 1 · active" })).getAttribute("aria-selected")).toBe("true");
+    expect((await screen.findByRole("textbox", { name: "Local terminal" })).getAttribute("aria-multiline")).toBe("true");
+    expect(screen.getByRole("button", { name: "New terminal" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop terminal" })).toBeTruthy();
+    expect(screen.getAllByRole("status").length).toBeGreaterThan(0);
+  });
+
   it("preserves an interrupted session and waits for explicit continuation", async () => {
     mocks.list.mockResolvedValue([terminal()]);
     render(<WorkspaceTerminal workspaceId="w1" />);
 
     expect(await screen.findByText("The terminal was interrupted by a server restart")).toBeTruthy();
     expect(mocks.create).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", {
+    expect(screen.getByRole("tab", {
       name: "Terminal 1 · interrupted by server restart",
     })).toBeTruthy();
     await waitFor(() => expect(mocks.writes).toContain("preserved output\r\n"));
@@ -157,7 +161,7 @@ describe("WorkspaceTerminal restart recovery", () => {
     }));
     await waitFor(() => expect(screen.queryByText("The terminal was interrupted by a server restart")).toBeNull());
 
-    fireEvent.click(screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("tab", {
       name: "Terminal 1 · interrupted by server restart",
     }));
     expect(await screen.findByText("This is preserved output from an interrupted terminal. It is read-only.")).toBeTruthy();
@@ -166,8 +170,8 @@ describe("WorkspaceTerminal restart recovery", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Close Terminal 1 tab" }));
     await waitFor(() => expect(mocks.dismiss).toHaveBeenCalledWith("terminal-old"));
-    expect(screen.queryByRole("button", { name: "Terminal 1 · interrupted by server restart" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Terminal 2 · active" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Terminal 1 · interrupted by server restart" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Terminal 2 · active" })).toBeTruthy();
   });
 
   it("reattaches to an existing active terminal without opening another one", async () => {
@@ -180,7 +184,7 @@ describe("WorkspaceTerminal restart recovery", () => {
     })]);
     render(<WorkspaceTerminal workspaceId="w1" />);
 
-    expect(await screen.findByRole("button", { name: "Terminal 1 · active" })).toBeTruthy();
+    expect(await screen.findByRole("tab", { name: "Terminal 1 · active" })).toBeTruthy();
     expect(screen.queryByText("The terminal was interrupted by a server restart")).toBeNull();
     expect(mocks.create).not.toHaveBeenCalled();
   });
@@ -199,7 +203,7 @@ describe("WorkspaceTerminal restart recovery", () => {
     expect(await screen.findByText("PTY · tmux · xterm-256color")).toBeTruthy();
   });
 
-  it("connects the selected goal and launches Claude through the guarded endpoint", async () => {
+  it("connects the selected goal before launching Claude", async () => {
     mocks.list.mockResolvedValue([terminal({
       id: "terminal-connected",
       status: "active",
@@ -212,12 +216,14 @@ describe("WorkspaceTerminal restart recovery", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Claude" }));
     await waitFor(() => expect(mocks.selectGoal).toHaveBeenCalledWith("w1", "g1"));
-    await waitFor(() => expect(mocks.launch).toHaveBeenCalledWith("terminal-connected", { provider: "claude", goalId: "g1" }));
-    // 서버 판정 없이 클라이언트가 PTY에 `claude`를 직접 타이핑하지 않는다.
-    expect(mocks.wsSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: "terminal:input", data: "claude\r" }));
+    expect(mocks.wsSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: "terminal:input",
+      terminalId: "terminal-connected",
+      data: "claude\r",
+    }));
   });
 
-  it("reuses an already running Claude session instead of retyping the command", async () => {
+  it("keeps direct provider launch as an explicit retry fallback", async () => {
     mocks.list.mockResolvedValue([terminal({
       id: "terminal-connected",
       status: "active",
@@ -225,41 +231,19 @@ describe("WorkspaceTerminal restart recovery", () => {
       pid: 1234,
       output: "",
       endedAt: null,
+      provider: "claude",
     })]);
-    mocks.launch.mockResolvedValue({
-      status: "already_running",
-      runningProvider: "claude",
-      kickoffSent: false,
-      terminal: terminal({ id: "terminal-connected", status: "active", contextState: "connected", endedAt: null, provider: "claude" }),
-    });
     render(<WorkspaceTerminal workspaceId="w1" activeGoalId="g1" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Claude" }));
-    expect((await screen.findByRole("status")).textContent).toContain("already running");
-    expect(mocks.wsSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: "terminal:input", data: "claude\r" }));
-  });
+    const claude = await screen.findByRole("button", { name: "Claude" });
+    fireEvent.click(claude);
+    await waitFor(() => expect(mocks.wsSend).toHaveBeenCalledWith(expect.objectContaining({ data: "claude\r" })));
+    mocks.wsSend.mockClear();
 
-  it("blocks launching Claude while a Codex session is running", async () => {
-    mocks.list.mockResolvedValue([terminal({
-      id: "terminal-connected",
-      status: "active",
-      contextState: "connected",
-      pid: 1234,
-      output: "",
-      endedAt: null,
-    })]);
-    mocks.launch.mockResolvedValue({
-      status: "conflict",
-      runningProvider: "codex",
-      kickoffSent: false,
-      terminal: terminal({ id: "terminal-connected", status: "active", contextState: "connected", endedAt: null }),
-    });
-    render(<WorkspaceTerminal workspaceId="w1" activeGoalId="g1" />);
-
-    fireEvent.click(await screen.findByRole("button", { name: "Claude" }));
-    const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("Codex");
-    expect(mocks.wsSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: "terminal:input", data: "claude\r" }));
+    // The primary start action is idempotent. This advanced button intentionally
+    // remains available after the provider exits back to the shell.
+    fireEvent.click(claude);
+    await waitFor(() => expect(mocks.wsSend).toHaveBeenCalledWith(expect.objectContaining({ data: "claude\r" })));
   });
 
   it("blocks AI launch when terminal context does not match", async () => {

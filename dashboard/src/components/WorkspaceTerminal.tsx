@@ -31,8 +31,6 @@ export function WorkspaceTerminal({
   const [status, setStatus] = useState<TerminalSession["status"] | "connecting">("connecting");
   const [error, setError] = useState<string | null>(null);
   const [bridgeNotice, setBridgeNotice] = useState<string | null>(null);
-  const [launchNotice, setLaunchNotice] = useState<string | null>(null);
-  const launchTimerRef = useRef<number | null>(null);
   const selectedSession = sessions.find((session) => session.id === terminalId) ?? null;
   const contextState = selectedSession?.contextState ?? "unknown";
 
@@ -95,7 +93,9 @@ export function WorkspaceTerminal({
         cursorBlink: true,
         cursorStyle: "block",
         convertEol: false,
-        fontFamily: "'SFMono-Regular', Menlo, Monaco, Consolas, monospace",
+        // CJK monospace가 맨 앞이어야 한글 advance가 라틴의 정확히 2배(xterm의 wide char 셀 폭)가 된다.
+        // 라틴만 다른 폰트가 잡으면 em 비율이 어긋나 한글 자간이 벌어진다.
+        fontFamily: "'D2Coding', 'SFMono-Regular', Menlo, Monaco, Consolas, monospace",
         fontSize: 13,
         lineHeight: 1.25,
         scrollback: 10_000,
@@ -117,6 +117,9 @@ export function WorkspaceTerminal({
       const fit = new fitModule.FitAddon();
       terminal.loadAddon(fit);
       terminal.open(host);
+      const terminalInput = host.querySelector("textarea");
+      terminalInput?.setAttribute("aria-label", t("workspaceTerminalTitle"));
+      terminalInput?.setAttribute("aria-multiline", "true");
       xtermRef.current = terminal;
       fitRef.current = fit;
       setReadyTerminalId(terminalId);
@@ -145,7 +148,7 @@ export function WorkspaceTerminal({
       disposed = true;
       disposeTerminal();
     };
-  }, [terminalId]);
+  }, [t, terminalId]);
 
   useEffect(() => {
     if (!terminalId || readyTerminalId !== terminalId) return;
@@ -291,19 +294,6 @@ export function WorkspaceTerminal({
   const terminalBackend = selectedSession?.backend ?? "pty";
   const providerLabel = (provider: "claude" | "codex") => provider === "claude" ? "Claude" : "Codex";
 
-  const showLaunchNotice = (message: string) => {
-    setLaunchNotice(message);
-    if (launchTimerRef.current) window.clearTimeout(launchTimerRef.current);
-    launchTimerRef.current = window.setTimeout(() => {
-      launchTimerRef.current = null;
-      setLaunchNotice(null);
-    }, 4_000);
-  };
-
-  useEffect(() => () => {
-    if (launchTimerRef.current) window.clearTimeout(launchTimerRef.current);
-  }, []);
-
   const stopTerminal = async () => {
     if (!terminalId || status !== "active") return;
     await api.terminals.kill(terminalId);
@@ -318,16 +308,9 @@ export function WorkspaceTerminal({
     setError(null);
     try {
       await api.workspaces.selectGoal(workspaceId, activeGoalId);
-      // 서버가 foreground 에이전트를 감지해 실행/재사용/충돌을 판정한다 —
-      // 실행 중인 REPL에 `claude` 텍스트가 메시지로 들어가는 오실행을 막는다.
-      const result = await api.terminals.launch(terminalId, { provider, goalId: activeGoalId });
-      setSessions((current) => current.map((session) => session.id === result.terminal.id ? result.terminal : session));
-      if (result.status === "already_running") {
-        showLaunchNotice(t("terminalAgentAlreadyRunning", { provider: providerLabel(provider) }));
-      } else if (result.status === "conflict") {
-        setError(t("terminalOtherAgentRunning", { provider: providerLabel(result.runningProvider ?? "claude") }));
-        return;
-      }
+      const bound = await api.terminals.bind(terminalId, { goalId: activeGoalId, provider });
+      setSessions((current) => current.map((session) => session.id === bound.id ? bound : session));
+      wsSend({ type: "terminal:input", terminalId, data: `${provider}\r` });
       xtermRef.current?.focus();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("terminalContextSelectFailed"));
@@ -336,8 +319,8 @@ export function WorkspaceTerminal({
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[#17191d]">
-      <div className="flex h-9 shrink-0 items-center border-b border-white/10 bg-[#202329] px-2">
-        <div className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto">
+      <div className="flex h-9 min-w-0 shrink-0 items-center border-b border-white/10 bg-[#202329] px-1 sm:px-2">
+        <div role="tablist" aria-label={t("workspaceTerminalTitle")} className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto">
           {sessions.map((session) => (
             <div
               key={session.id}
@@ -347,6 +330,8 @@ export function WorkspaceTerminal({
             >
               <button
                 type="button"
+                role="tab"
+                aria-selected={terminalId === session.id}
                 onClick={() => selectSession(session)}
                 aria-label={t("terminalTabStatus", {
                   tab: t("terminalTab", { count: session.tabNumber }),
@@ -381,14 +366,13 @@ export function WorkspaceTerminal({
             </div>
           ))}
         </div>
-        <button type="button" onClick={() => void openTerminal(true)} className="px-2 text-lg text-[#8c929d] hover:text-white" title={t("terminalNew")}>+</button>
-        <button type="button" onClick={() => void launchAgent("claude")} disabled={status !== "active" || contextState !== "connected"} className="rounded px-2 py-1 text-[10px] text-[#c7a8ff] hover:bg-white/5 disabled:opacity-30" title={t("terminalLaunchClaude")}>Claude</button>
-        <button type="button" onClick={() => void launchAgent("codex")} disabled={status !== "active" || contextState !== "connected"} className="rounded px-2 py-1 text-[10px] text-[#7cc4ff] hover:bg-white/5 disabled:opacity-30" title={t("terminalLaunchCodex")}>Codex</button>
-        <button type="button" onClick={() => void stopTerminal()} disabled={status !== "active"} className="px-2 text-xs text-[#8c929d] hover:text-danger disabled:opacity-30" title={t("terminalStop")}>■</button>
+        <button type="button" onClick={() => void openTerminal(true)} aria-label={t("terminalNew")} className="shrink-0 px-2 text-lg text-[#8c929d] hover:text-white" title={t("terminalNew")}>+</button>
+        <button type="button" onClick={() => void launchAgent("claude")} disabled={status !== "active" || contextState !== "connected"} className="shrink-0 rounded px-1.5 py-1 text-[10px] text-[#c7a8ff] hover:bg-white/5 disabled:opacity-30 sm:px-2" title={t("terminalLaunchClaude")}>Claude</button>
+        <button type="button" onClick={() => void launchAgent("codex")} disabled={status !== "active" || contextState !== "connected"} className="shrink-0 rounded px-1.5 py-1 text-[10px] text-[#7cc4ff] hover:bg-white/5 disabled:opacity-30 sm:px-2" title={t("terminalLaunchCodex")}>Codex</button>
+        <button type="button" onClick={() => void stopTerminal()} disabled={status !== "active"} aria-label={t("terminalStop")} className="shrink-0 px-2 text-xs text-[#8c929d] hover:text-danger disabled:opacity-30" title={t("terminalStop")}>■</button>
       </div>
-      {error && <div role="alert" className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>}
-      {bridgeNotice && <div className="shrink-0 border-b border-success/30 bg-success/10 px-3 py-2 text-xs text-success">✓ {bridgeNotice}</div>}
-      {launchNotice && <div role="status" className="shrink-0 border-b border-accent/30 bg-accent/10 px-3 py-2 text-xs text-accent">{launchNotice}</div>}
+      {error && <div role="alert" aria-live="assertive" className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>}
+      {bridgeNotice && <div role="status" aria-live="polite" className="shrink-0 border-b border-success/30 bg-success/10 px-3 py-2 text-xs text-success">✓ {bridgeNotice}</div>}
       {status === "active" && contextState === "mismatch" && (
         <div className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger" role="alert">
           {t("terminalContextMismatch")}
@@ -413,8 +397,8 @@ export function WorkspaceTerminal({
           </button>
         </div>
       )}
-      <div ref={hostRef} className="min-h-0 flex-1 px-2 py-1" aria-label={t("workspaceTerminalTitle")} />
-      <div className="flex h-6 shrink-0 items-center border-t border-white/10 bg-[#202329] px-3 font-mono text-[10px] text-[#8c929d]">
+      <div ref={hostRef} role="region" className="min-h-0 min-w-0 flex-1 overflow-hidden px-2 py-1" aria-label={t("workspaceTerminalTitle")} />
+      <div role="status" aria-live="polite" className="flex h-6 shrink-0 items-center border-t border-white/10 bg-[#202329] px-3 font-mono text-[10px] text-[#8c929d]">
         <span>{statusLabel(status)} · {t(`terminalContext_${contextState}`)}</span>
         <span className="ml-auto">PTY{terminalBackend === "tmux" ? " · tmux" : ""} · xterm-256color</span>
       </div>
