@@ -6,6 +6,7 @@ import { NewProjectDialog } from "./NewProjectDialog";
 import { InputDialog } from "./InputDialog";
 import { DirectoryPicker } from "./DirectoryPicker";
 import { Toast } from "./Toast";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 export function Sidebar() {
   const { t } = useTranslation();
@@ -21,6 +22,7 @@ export function Sidebar() {
 
   const [showDialog, setShowDialog] = useState<"newProject" | "import" | "github" | null>(null);
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false);
+  const [archiveWorkspaceId, setArchiveWorkspaceId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
   // 프로젝트별 실시간 작업 상태 — 어떤 프로젝트가 지금 일하는지 사이드바에서 한눈에.
@@ -119,6 +121,24 @@ export function Sidebar() {
       }
     } catch (error) {
       showToast(error instanceof Error ? error.message : t("workspaceCreateFailed"));
+    }
+  };
+
+  const handleArchiveWorkspace = async () => {
+    const workspace = workspaces.find((item) => item.id === archiveWorkspaceId);
+    setArchiveWorkspaceId(null);
+    if (!workspace) return;
+    try {
+      await api.workspaces.archive(workspace.id, {
+        confirmDirty: workspace.pathExists === true && workspace.dirty !== false,
+      });
+      setWorkspaces(workspaces.filter((item) => item.id !== workspace.id));
+      showToast(t("workspaceArchived"));
+      window.dispatchEvent(new CustomEvent("crewdeck:workspace-archived", {
+        detail: { workspaceId: workspace.id },
+      }));
+    } catch {
+      showToast(t("workspaceArchiveFailed"));
     }
   };
 
@@ -299,6 +319,21 @@ export function Sidebar() {
           onCancel={() => setShowWorkspaceDialog(false)}
         />
       )}
+      {archiveWorkspaceId && (() => {
+        const workspace = workspaces.find((item) => item.id === archiveWorkspaceId);
+        const message = workspace?.dirty === true
+          ? t("workspaceArchiveDirtyConfirm")
+          : workspace?.pathExists === true && workspace.dirty === null
+            ? t("workspaceArchiveUnknownConfirm")
+            : t("workspaceArchiveConfirm");
+        return (
+          <ConfirmDialog
+            message={message}
+            onConfirm={() => { void handleArchiveWorkspace(); }}
+            onCancel={() => setArchiveWorkspaceId(null)}
+          />
+        );
+      })()}
       {toast && <Toast message={toast} onDismiss={() => setToast(null)} />}
 
       <aside className="hidden h-screen w-[260px] shrink-0 flex-col border-r border-line bg-sidebar sm:flex">
@@ -359,42 +394,59 @@ export function Sidebar() {
                       {t("workspaceEmptyAction")}
                     </button>
                   )}
-                  {workspaces.map((workspace) => (
-                    <button
-                      type="button"
-                      key={workspace.id}
-                      onClick={() => openWorkspace(workspace)}
-                      disabled={workspace.state !== "ready" || workspace.pathExists === false}
-                      className="flex w-full min-w-0 items-center gap-2 rounded px-2 py-1 pl-6 text-left text-[11px] text-muted hover:bg-fg/5 hover:text-fg disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-muted"
-                      title={workspace.worktreePath ?? t("workspacePending")}
-                    >
-                      <span
-                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                          workspace.state === "ready" && workspace.pathExists !== false
-                            ? "bg-success"
-                            : workspace.state === "error" || workspace.pathExists === false
-                              ? "bg-danger"
-                              : workspace.state === "pending"
-                                ? "bg-warning"
-                                : "bg-faint"
-                        }`}
-                      />
-                      <span className="min-w-0 flex-1 truncate">{workspace.name}</span>
-                      {workspace.dirty && (
-                        <span className="shrink-0 rounded bg-warning-subtle px-1 text-[9px] text-warning">
-                          {t("workspaceDirty")}
-                        </span>
-                      )}
-                      {workspace.activeTerminalSessionCount > 0 && (
-                        <span className="shrink-0 rounded bg-accent/10 px-1 font-mono text-[9px] text-accent">
-                          ⌘{workspace.activeTerminalSessionCount}
-                        </span>
-                      )}
-                      <span className="max-w-[72px] shrink-0 truncate font-mono text-[9px] text-faint">
-                        {workspace.worktreeBranch ?? t("workspacePending")}
-                      </span>
-                    </button>
-                  ))}
+                  {workspaces.map((workspace) => {
+                    const hasActiveSessions = workspace.activeSessionCount > 0
+                      || workspace.activeTerminalSessionCount > 0;
+                    return (
+                      <div key={workspace.id} className="group flex min-w-0 items-center gap-0.5">
+                        <button
+                          type="button"
+                          onClick={() => openWorkspace(workspace)}
+                          disabled={workspace.state !== "ready" || workspace.pathExists === false}
+                          className="flex min-w-0 flex-1 items-center gap-2 rounded px-2 py-1 pl-6 text-left text-[11px] text-muted hover:bg-fg/5 hover:text-fg disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-muted"
+                          title={workspace.worktreePath ?? t("workspacePending")}
+                        >
+                          <span
+                            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                              workspace.state === "ready" && workspace.pathExists !== false
+                                ? "bg-success"
+                                : workspace.state === "error" || workspace.pathExists === false
+                                  ? "bg-danger"
+                                  : workspace.state === "pending"
+                                    ? "bg-warning"
+                                    : "bg-faint"
+                            }`}
+                          />
+                          <span className="min-w-0 flex-1 truncate">{workspace.name}</span>
+                          {workspace.dirty && (
+                            <span className="shrink-0 rounded bg-warning-subtle px-1 text-[9px] text-warning">
+                              {t("workspaceDirty")}
+                            </span>
+                          )}
+                          {workspace.activeTerminalSessionCount > 0 && (
+                            <span className="shrink-0 rounded bg-accent/10 px-1 font-mono text-[9px] text-accent">
+                              ⌘{workspace.activeTerminalSessionCount}
+                            </span>
+                          )}
+                          <span className="max-w-[72px] shrink-0 truncate font-mono text-[9px] text-faint">
+                            {workspace.worktreeBranch ?? t("workspacePending")}
+                          </span>
+                        </button>
+                        {workspace.kind === "manual" && (
+                          <button
+                            type="button"
+                            onClick={() => setArchiveWorkspaceId(workspace.id)}
+                            disabled={hasActiveSessions}
+                            className="shrink-0 rounded px-1 py-0.5 text-[10px] text-faint hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-faint"
+                            title={hasActiveSessions ? t("workspaceArchiveBlocked") : t("workspaceArchive")}
+                            aria-label={`${t("workspaceArchive")}: ${workspace.name}`}
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

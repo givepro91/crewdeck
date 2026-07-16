@@ -7,7 +7,17 @@ import { api } from "../lib/api";
 import { wsSend } from "../hooks/useWebSocket";
 import { useTranslation } from "react-i18next";
 
-export function WorkspaceTerminal({ workspaceId }: { workspaceId: string }) {
+export function WorkspaceTerminal({
+  workspaceId,
+  activeGoalId = null,
+  onContextStateChange,
+  onSessionChange,
+}: {
+  workspaceId: string;
+  activeGoalId?: string | null;
+  onContextStateChange?: (state: TerminalSession["contextState"]) => void;
+  onSessionChange?: (session: TerminalSession | null) => void;
+}) {
   const { t } = useTranslation();
   const hostRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
@@ -19,6 +29,16 @@ export function WorkspaceTerminal({ workspaceId }: { workspaceId: string }) {
   const [status, setStatus] = useState<TerminalSession["status"] | "connecting">("connecting");
   const [error, setError] = useState<string | null>(null);
   const [bridgeNotice, setBridgeNotice] = useState<string | null>(null);
+  const selectedSession = sessions.find((session) => session.id === terminalId) ?? null;
+  const contextState = selectedSession?.contextState ?? "unknown";
+
+  useEffect(() => {
+    onContextStateChange?.(contextState);
+  }, [contextState, onContextStateChange]);
+
+  useEffect(() => {
+    onSessionChange?.(selectedSession);
+  }, [onSessionChange, selectedSession]);
 
   const openTerminal = useCallback(async (forceNew = false) => {
     setError(null);
@@ -44,6 +64,9 @@ export function WorkspaceTerminal({ workspaceId }: { workspaceId: string }) {
         if (active) {
           setTerminalId(active.id);
           setStatus(active.status);
+        } else if (items[0]?.status === "interrupted") {
+          setTerminalId(items[0].id);
+          setStatus(items[0].status);
         } else {
           void openTerminal();
         }
@@ -149,6 +172,7 @@ export function WorkspaceTerminal({ workspaceId }: { workspaceId: string }) {
       api.terminals.get(terminalId).then((item) => {
         if (!received && item.output) terminal?.write(item.output);
         setStatus(item.status);
+        setSessions((current) => current.map((session) => session.id === item.id ? item : session));
       }).catch(() => undefined);
     }, 250);
     return () => {
@@ -185,46 +209,166 @@ export function WorkspaceTerminal({ workspaceId }: { workspaceId: string }) {
     setError(null);
   };
 
+  const applyDismissedTerminal = useCallback((dismissedTerminalId: string) => {
+    const remaining = sessions.filter((session) => session.id !== dismissedTerminalId);
+    if (remaining.length === sessions.length) return;
+    setSessions(remaining);
+    if (terminalId === dismissedTerminalId) {
+      const next = remaining.find((session) => session.status === "active") ?? remaining[0] ?? null;
+      setTerminalId(next?.id ?? null);
+      setStatus(next?.status ?? "exited");
+      setError(null);
+    }
+  }, [sessions, terminalId]);
+
+  useEffect(() => {
+    const onDismissed = (event: Event) => {
+      const detail = (event as CustomEvent<{ terminalId: string; workspaceId: string }>).detail;
+      if (detail.workspaceId === workspaceId) applyDismissedTerminal(detail.terminalId);
+    };
+    window.addEventListener("crewdeck:terminal-dismissed", onDismissed);
+    return () => window.removeEventListener("crewdeck:terminal-dismissed", onDismissed);
+  }, [applyDismissedTerminal, workspaceId]);
+
+  useEffect(() => {
+    const onBinding = (event: Event) => {
+      const terminal = (event as CustomEvent<TerminalSession>).detail;
+      if (terminal.workspaceId !== workspaceId) return;
+      setSessions((current) => current.map((session) => session.id === terminal.id ? terminal : session));
+      if (terminal.id === terminalId) setStatus(terminal.status);
+    };
+    const onFocus = (event: Event) => {
+      const detail = (event as CustomEvent<{ terminalId?: string }>).detail;
+      const next = detail.terminalId ? sessions.find((session) => session.id === detail.terminalId) : selectedSession;
+      if (next) selectSession(next);
+      window.setTimeout(() => xtermRef.current?.focus(), 0);
+    };
+    window.addEventListener("crewdeck:terminal-binding", onBinding);
+    window.addEventListener("crewdeck:terminal-focus", onFocus);
+    return () => {
+      window.removeEventListener("crewdeck:terminal-binding", onBinding);
+      window.removeEventListener("crewdeck:terminal-focus", onFocus);
+    };
+  }, [selectedSession, sessions, terminalId, workspaceId]);
+
+  const dismissTerminal = async (session: TerminalSession) => {
+    if (session.status === "active") return;
+    setError(null);
+    try {
+      await api.terminals.dismiss(session.id);
+      applyDismissedTerminal(session.id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("terminalDismissFailed"));
+    }
+  };
+
+  const resumeInterrupted = () => {
+    const active = sessions.find((session) => session.status === "active");
+    if (active) selectSession(active);
+    else void openTerminal(true);
+  };
+
+  const statusLabel = (terminalStatus: TerminalSession["status"] | "connecting") => terminalStatus === "connecting"
+    ? t("terminalConnecting")
+    : t(`terminalStatus_${terminalStatus}`);
+  const terminalBackend = selectedSession?.backend ?? "pty";
+
   const stopTerminal = async () => {
     if (!terminalId || status !== "active") return;
     await api.terminals.kill(terminalId);
   };
 
-  const launchAgent = (provider: "claude" | "codex") => {
+  const launchAgent = async (provider: "claude" | "codex") => {
     if (!terminalId || status !== "active") return;
-    wsSend({ type: "terminal:input", terminalId, data: `${provider}\r` });
-    xtermRef.current?.focus();
+    if (contextState !== "connected") {
+      setError(t("terminalContextMismatch"));
+      return;
+    }
+    setError(null);
+    try {
+      await api.workspaces.selectGoal(workspaceId, activeGoalId);
+      const bound = await api.terminals.bind(terminalId, { goalId: activeGoalId, provider });
+      setSessions((current) => current.map((session) => session.id === bound.id ? bound : session));
+      wsSend({ type: "terminal:input", terminalId, data: `${provider}\r` });
+      xtermRef.current?.focus();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("terminalContextSelectFailed"));
+    }
   };
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[#17191d]">
       <div className="flex h-9 shrink-0 items-center border-b border-white/10 bg-[#202329] px-2">
         <div className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto">
-          {sessions.map((session, index) => (
-            <button
+          {sessions.map((session) => (
+            <div
               key={session.id}
-              type="button"
-              onClick={() => selectSession(session)}
-              className={`flex h-8 shrink-0 items-center gap-2 rounded-t px-3 font-mono text-[11px] ${
+              className={`flex h-8 shrink-0 items-center rounded-t font-mono text-[11px] ${
                 terminalId === session.id ? "bg-[#17191d] text-white" : "text-[#8c929d] hover:text-white"
               }`}
             >
-              <span className={`h-1.5 w-1.5 rounded-full ${session.status === "active" ? "bg-success" : "bg-faint"}`} />
-              {t("terminalTab", { count: sessions.length - index })}
-            </button>
+              <button
+                type="button"
+                onClick={() => selectSession(session)}
+                aria-label={t("terminalTabStatus", {
+                  tab: t("terminalTab", { count: session.tabNumber }),
+                  status: statusLabel(session.status),
+                })}
+                title={statusLabel(session.status)}
+                className="flex h-full items-center gap-2 px-3"
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${session.status === "active" ? "bg-success" : "bg-faint"}`} />
+                <span>{session.provider ? session.provider === "claude" ? "Claude" : "Codex" : t("terminalTab", { count: session.tabNumber })}</span>
+                {session.agentName && <span className="max-w-24 truncate text-[9px] text-faint">· {session.agentName}</span>}
+              </button>
+              {session.status !== "active" && (
+                <button
+                  type="button"
+                  onClick={() => void dismissTerminal(session)}
+                  aria-label={t("terminalCloseTab", { tab: t("terminalTab", { count: session.tabNumber }) })}
+                  className="mr-1 flex h-5 w-5 items-center justify-center rounded text-sm text-[#707681] hover:bg-white/10 hover:text-white"
+                >
+                  ×
+                </button>
+              )}
+            </div>
           ))}
         </div>
         <button type="button" onClick={() => void openTerminal(true)} className="px-2 text-lg text-[#8c929d] hover:text-white" title={t("terminalNew")}>+</button>
-        <button type="button" onClick={() => launchAgent("claude")} disabled={status !== "active"} className="rounded px-2 py-1 text-[10px] text-[#c7a8ff] hover:bg-white/5 disabled:opacity-30" title={t("terminalLaunchClaude")}>Claude</button>
-        <button type="button" onClick={() => launchAgent("codex")} disabled={status !== "active"} className="rounded px-2 py-1 text-[10px] text-[#7cc4ff] hover:bg-white/5 disabled:opacity-30" title={t("terminalLaunchCodex")}>Codex</button>
+        <button type="button" onClick={() => void launchAgent("claude")} disabled={status !== "active" || contextState !== "connected"} className="rounded px-2 py-1 text-[10px] text-[#c7a8ff] hover:bg-white/5 disabled:opacity-30" title={t("terminalLaunchClaude")}>Claude</button>
+        <button type="button" onClick={() => void launchAgent("codex")} disabled={status !== "active" || contextState !== "connected"} className="rounded px-2 py-1 text-[10px] text-[#7cc4ff] hover:bg-white/5 disabled:opacity-30" title={t("terminalLaunchCodex")}>Codex</button>
         <button type="button" onClick={() => void stopTerminal()} disabled={status !== "active"} className="px-2 text-xs text-[#8c929d] hover:text-danger disabled:opacity-30" title={t("terminalStop")}>■</button>
       </div>
       {error && <div className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">{error}</div>}
       {bridgeNotice && <div className="shrink-0 border-b border-success/30 bg-success/10 px-3 py-2 text-xs text-success">✓ {bridgeNotice}</div>}
+      {status === "active" && contextState === "mismatch" && (
+        <div className="shrink-0 border-b border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger" role="alert">
+          {t("terminalContextMismatch")}
+        </div>
+      )}
+      {status === "interrupted" && (
+        <div className="flex shrink-0 items-center gap-3 border-b border-warning/30 bg-warning-subtle px-3 py-2" role="status">
+          <div className="min-w-0 flex-1">
+            <div className="text-xs font-medium text-warning">{t("terminalInterruptedTitle")}</div>
+            <div className="mt-0.5 text-[10px] text-muted">
+              {sessions.some((session) => session.status === "active")
+                ? t("terminalInterruptedHistory")
+                : t("terminalInterruptedMessage")}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={resumeInterrupted}
+            className="shrink-0 rounded border border-warning/30 bg-surface px-2.5 py-1 text-[10px] font-medium text-warning hover:bg-warning/10"
+          >
+            {sessions.some((session) => session.status === "active") ? t("terminalGoActive") : t("terminalResume")}
+          </button>
+        </div>
+      )}
       <div ref={hostRef} className="min-h-0 flex-1 px-2 py-1" aria-label={t("workspaceTerminalTitle")} />
       <div className="flex h-6 shrink-0 items-center border-t border-white/10 bg-[#202329] px-3 font-mono text-[10px] text-[#8c929d]">
-        <span>{status === "connecting" ? t("terminalConnecting") : status}</span>
-        <span className="ml-auto">PTY · xterm-256color</span>
+        <span>{statusLabel(status)} · {t(`terminalContext_${contextState}`)}</span>
+        <span className="ml-auto">PTY{terminalBackend === "tmux" ? " · tmux" : ""} · xterm-256color</span>
       </div>
     </div>
   );

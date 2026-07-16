@@ -56,6 +56,7 @@ export interface Workspace {
   id: string;
   projectId: string;
   goalId: string | null;
+  activeGoalId: string | null;
   name: string;
   kind: WorkspaceKind;
   state: WorkspaceState;
@@ -80,6 +81,7 @@ export type TerminalSessionStatus = "active" | "exited" | "killed" | "interrupte
 
 export interface TerminalSession {
   id: string;
+  tabNumber: number;
   workspaceId: string;
   projectId: string;
   shell: string;
@@ -92,6 +94,28 @@ export interface TerminalSession {
   output: string;
   startedAt: string;
   endedAt: string | null;
+  backend: "pty" | "tmux";
+  contextState: "connected" | "mismatch" | "unknown";
+  goalId: string | null;
+  goalTitle: string | null;
+  agentId: string | null;
+  agentName: string | null;
+  agentRole: string | null;
+  activeTaskId: string | null;
+  activeTaskTitle: string | null;
+  activeTaskStatus: TaskStatus | null;
+  provider: AgentProvider | null;
+}
+
+export interface TerminalDecision {
+  id: string;
+  workspaceId: string;
+  terminalSessionId: string;
+  goalId: string | null;
+  taskId: string | null;
+  agentId: string | null;
+  message: string;
+  createdAt: string;
 }
 
 export interface TerminalBridgeTaskInput {

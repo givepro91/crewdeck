@@ -281,8 +281,19 @@ export function useWebSocket() {
             case "terminal:exit":
               window.dispatchEvent(new CustomEvent("crewdeck:terminal-exit", { detail: msg.payload }));
               break;
+            case "terminal:dismissed":
+              window.dispatchEvent(new CustomEvent("crewdeck:terminal-dismissed", { detail: msg.payload }));
+              break;
             case "terminal:bridge":
               window.dispatchEvent(new CustomEvent("crewdeck:terminal-bridge", { detail: msg.payload }));
+              window.dispatchEvent(new CustomEvent("crewdeck:refresh", { detail: msg }));
+              break;
+            case "terminal:binding":
+              window.dispatchEvent(new CustomEvent("crewdeck:terminal-binding", { detail: msg.payload }));
+              window.dispatchEvent(new CustomEvent("crewdeck:refresh", { detail: msg }));
+              break;
+            case "terminal:decision":
+              window.dispatchEvent(new CustomEvent("crewdeck:terminal-decision", { detail: msg.payload }));
               window.dispatchEvent(new CustomEvent("crewdeck:refresh", { detail: msg }));
               break;
             case "session:stream":

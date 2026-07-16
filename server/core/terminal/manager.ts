@@ -7,6 +7,7 @@ import { spawn, type IPty } from "node-pty";
 import type { TerminalSession, TerminalSessionStatus } from "../../../shared/types.js";
 import { TERMINAL_AGENT_PROMPT } from "../../../shared/terminal-agent.js";
 import { finishTerminalBridgeAgentRun } from "./bridge.js";
+import { TmuxBackend, type TmuxCommand } from "./tmux.js";
 
 const MAX_OUTPUT = 200 * 1024;
 
@@ -28,6 +29,7 @@ function ensureSpawnHelperExecutable(): void {
 
 interface TerminalRow {
   id: string;
+  tab_number: number;
   workspace_id: string;
   project_id: string;
   shell: string;
@@ -40,11 +42,25 @@ interface TerminalRow {
   last_output: string;
   started_at: string;
   ended_at: string | null;
+  backend: "pty" | "tmux";
+  runtime_id: string | null;
+  bridge_token_hash: string | null;
+  goal_id: string | null;
+  goal_title: string | null;
+  agent_id: string | null;
+  agent_name: string | null;
+  agent_role: string | null;
+  active_task_id: string | null;
+  active_task_title: string | null;
+  active_task_status: TerminalSession["activeTaskStatus"];
+  provider: TerminalSession["provider"];
 }
 
 interface ActiveTerminal {
   pty: IPty;
   output: string;
+  backend: "pty" | "tmux";
+  runtimeId: string | null;
   stopStatus: "killed" | "interrupted" | null;
   flushTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -59,6 +75,7 @@ export interface TerminalRuntimeOptions {
   apiBaseUrl: string;
   syncCommand: TerminalCommand;
   mcpCommand: TerminalCommand;
+  tmuxCommand?: TmuxCommand | null;
 }
 
 export type TerminalEvent =
@@ -76,9 +93,14 @@ function clamp(value: number, min: number, max: number, fallback: number): numbe
   return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
-function toModel(row: TerminalRow, output?: string): TerminalSession {
+function toModel(
+  row: TerminalRow,
+  output?: string,
+  contextState: TerminalSession["contextState"] = "unknown",
+): TerminalSession {
   return {
     id: row.id,
+    tabNumber: row.tab_number,
     workspaceId: row.workspace_id,
     projectId: row.project_id,
     shell: row.shell,
@@ -91,6 +113,17 @@ function toModel(row: TerminalRow, output?: string): TerminalSession {
     output: output ?? row.last_output ?? "",
     startedAt: row.started_at,
     endedAt: row.ended_at,
+    backend: row.backend,
+    contextState,
+    goalId: row.goal_id,
+    goalTitle: row.goal_title,
+    agentId: row.agent_id,
+    agentName: row.agent_name,
+    agentRole: row.agent_role,
+    activeTaskId: row.active_task_id,
+    activeTaskTitle: row.active_task_title,
+    activeTaskStatus: row.active_task_status,
+    provider: row.provider,
   };
 }
 
@@ -100,6 +133,7 @@ function shellQuote(value: string): string {
 
 export class TerminalManager {
   private readonly active = new Map<string, ActiveTerminal>();
+  private readonly tmux: TmuxBackend | null;
   private shuttingDown = false;
 
   constructor(
@@ -109,18 +143,183 @@ export class TerminalManager {
   ) {
     ensureSpawnHelperExecutable();
     this.ensureShellIntegration();
-    // A PTY cannot survive the server process. Preserve the history while making
-    // the stale status explicit instead of pretending the old PID is attached.
-    this.db.prepare(`
-      UPDATE terminal_sessions
-         SET status = 'interrupted', pid = NULL, ended_at = datetime('now')
-       WHERE status = 'active'
-    `).run();
+    this.tmux = this.runtime
+      ? TmuxBackend.detect(this.runtime.dataDir, this.runtime.tmuxCommand)
+      : null;
+    const staleTerminals = this.db.prepare(`
+      SELECT * FROM terminal_sessions WHERE status = 'active'
+    `).all() as TerminalRow[];
+    for (const terminal of staleTerminals) {
+      if (terminal.backend === "tmux" && terminal.runtime_id && this.recoverPersistentTerminal(terminal)) {
+        continue;
+      }
+      this.db.prepare(`
+        UPDATE terminal_sessions
+           SET status = 'interrupted', pid = NULL, ended_at = datetime('now')
+         WHERE id = ? AND status = 'active'
+      `).run(terminal.id);
+      this.reconcileInterruptedTerminal(terminal.id, terminal.workspace_id);
+    }
+  }
+
+  private recoverPersistentTerminal(row: TerminalRow): boolean {
+    if (!this.tmux || !row.runtime_id || !this.tmux.hasSession(row.runtime_id)) return false;
+    if (this.persistentContextState(row) !== "connected") {
+      this.tmux.killSession(row.runtime_id);
+      return false;
+    }
+    try {
+      const output = this.tmux.capture(row.runtime_id) || row.last_output;
+      const terminal = this.tmux.attach({
+        runtimeId: row.runtime_id,
+        cwd: row.cwd,
+        cols: row.cols,
+        rows: row.rows,
+        env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" },
+      });
+      const pid = this.tmux.panePid(row.runtime_id) ?? row.pid;
+      this.db.prepare(`
+        UPDATE terminal_sessions
+           SET pid = ?, last_output = ?, ended_at = NULL
+         WHERE id = ? AND status = 'active'
+      `).run(pid, output, row.id);
+      this.registerTerminal({
+        id: row.id,
+        workspaceId: row.workspace_id,
+        projectId: row.project_id,
+        pty: terminal,
+        backend: "tmux",
+        runtimeId: row.runtime_id,
+        output,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private persistentContextState(row: TerminalRow): TerminalSession["contextState"] {
+    if (!this.tmux || !row.runtime_id || !this.tmux.hasSession(row.runtime_id)) return "unknown";
+    const environment = this.tmux.environment(row.runtime_id, [
+      "CREWDECK_WORKSPACE_ID",
+      "CREWDECK_PROJECT_ID",
+      "CREWDECK_TERMINAL_ID",
+      "CREWDECK_API_KEY",
+    ]);
+    const tokenHash = environment.CREWDECK_API_KEY
+      ? createHash("sha256").update(environment.CREWDECK_API_KEY).digest("hex")
+      : null;
+    return environment.CREWDECK_WORKSPACE_ID === row.workspace_id
+      && environment.CREWDECK_PROJECT_ID === row.project_id
+      && environment.CREWDECK_TERMINAL_ID === row.id
+      && tokenHash !== null
+      && tokenHash === row.bridge_token_hash
+      ? "connected"
+      : "mismatch";
+  }
+
+  private registerTerminal(input: {
+    id: string;
+    workspaceId: string;
+    projectId: string;
+    pty: IPty;
+    backend: "pty" | "tmux";
+    runtimeId: string | null;
+    output: string;
+  }): void {
+    const active: ActiveTerminal = {
+      pty: input.pty,
+      output: input.output,
+      backend: input.backend,
+      runtimeId: input.runtimeId,
+      stopStatus: null,
+      flushTimer: null,
+    };
+    this.active.set(input.id, active);
+
+    input.pty.onData((data) => {
+      active.output = `${active.output}${data}`.slice(-MAX_OUTPUT);
+      if (!active.flushTimer) {
+        active.flushTimer = setTimeout(() => {
+          active.flushTimer = null;
+          this.db.prepare("UPDATE terminal_sessions SET last_output = ? WHERE id = ? AND status = 'active'")
+            .run(active.output, input.id);
+        }, 250);
+      }
+      this.emit({ type: "terminal:data", payload: { terminalId: input.id, data } });
+    });
+    input.pty.onExit(({ exitCode }) => {
+      if (active.flushTimer) clearTimeout(active.flushTimer);
+      if (this.shuttingDown) {
+        this.active.delete(input.id);
+        return;
+      }
+      const persistentSessionSurvives = active.backend === "tmux"
+        && active.runtimeId !== null
+        && active.stopStatus === null
+        && this.tmux?.hasSession(active.runtimeId) === true;
+      if (persistentSessionSurvives) {
+        this.active.delete(input.id);
+        const row = this.db.prepare("SELECT * FROM terminal_sessions WHERE id = ? AND status = 'active'")
+          .get(input.id) as TerminalRow | undefined;
+        if (row && this.recoverPersistentTerminal(row)) return;
+      }
+
+      const status: TerminalSessionStatus = persistentSessionSurvives
+        ? "interrupted"
+        : active.stopStatus ?? "exited";
+      this.db.prepare(`
+        UPDATE terminal_sessions
+           SET status = ?, exit_code = ?, pid = NULL, last_output = ?, ended_at = datetime('now')
+         WHERE id = ?
+      `).run(status, exitCode, active.output, input.id);
+      if (status === "interrupted") {
+        this.reconcileInterruptedTerminal(input.id, input.workspaceId);
+      } else {
+        try {
+          finishTerminalBridgeAgentRun(this.db, {
+            workspaceId: input.workspaceId,
+            terminalSessionId: input.id,
+            clientRequestId: "terminal-exit-" + input.id + "-" + randomUUID(),
+            provider: status === "killed" ? "terminal session" : "shell",
+            exitCode: exitCode ?? -1,
+          });
+        } catch {
+          // Terminal status is authoritative even when there is no bridge task to reconcile.
+        }
+      }
+      this.active.delete(input.id);
+      this.emit({
+        type: "terminal:exit",
+        payload: {
+          terminalId: input.id,
+          workspaceId: input.workspaceId,
+          projectId: input.projectId,
+          status,
+          exitCode,
+        },
+      });
+    });
+  }
+
+  private reconcileInterruptedTerminal(terminalId: string, workspaceId: string): void {
+    try {
+      finishTerminalBridgeAgentRun(this.db, {
+        workspaceId,
+        terminalSessionId: terminalId,
+        clientRequestId: `terminal-interrupted-${terminalId}`,
+        provider: "terminal session",
+        exitCode: -1,
+        interrupted: true,
+      });
+    } catch {
+      // Terminal history remains authoritative even when no bridge task exists.
+    }
   }
 
   create(workspaceId: string, size: { cols?: number; rows?: number } = {}): TerminalSession {
     const workspace = this.db.prepare(`
-      SELECT id, project_id, worktree_path, state
+      SELECT id, project_id, worktree_path, state, COALESCE(active_goal_id, goal_id) AS active_goal_id
         FROM workspaces
        WHERE id = ?
     `).get(workspaceId) as {
@@ -128,6 +327,7 @@ export class TerminalManager {
       project_id: string;
       worktree_path: string | null;
       state: string;
+      active_goal_id: string | null;
     } | undefined;
 
     if (!workspace) throw new Error("Workspace not found");
@@ -193,62 +393,86 @@ export class TerminalManager {
     const shellArgs = shell.endsWith("/bash") && runtimeDir
       ? ["--rcfile", resolve(runtimeDir, "bashrc"), "-i"]
       : ["-l"];
-    const terminal = spawn(shell, shellArgs, {
-      name: "xterm-256color",
-      cols,
-      rows,
-      cwd: workspace.worktree_path,
-      env: terminalEnv,
-    });
+    let backend: "pty" | "tmux" = "pty";
+    let runtimeId: string | null = null;
+    let terminal: IPty;
+    if (this.tmux) {
+      runtimeId = `crewdeck-${id}`;
+      try {
+        this.tmux.createSession({
+          runtimeId,
+          shell,
+          shellArgs,
+          cwd: workspace.worktree_path,
+          cols,
+          rows,
+          env: terminalEnv,
+        });
+        const sessionEnvironment = this.tmux.environment(runtimeId, [
+          "CREWDECK_WORKSPACE_ID",
+          "CREWDECK_PROJECT_ID",
+          "CREWDECK_TERMINAL_ID",
+          "CREWDECK_API_KEY",
+        ]);
+        const sessionTokenHash = sessionEnvironment.CREWDECK_API_KEY
+          ? createHash("sha256").update(sessionEnvironment.CREWDECK_API_KEY).digest("hex")
+          : null;
+        if (sessionEnvironment.CREWDECK_WORKSPACE_ID !== workspace.id
+          || sessionEnvironment.CREWDECK_PROJECT_ID !== workspace.project_id
+          || sessionEnvironment.CREWDECK_TERMINAL_ID !== id
+          || sessionTokenHash !== bridgeTokenHash) {
+          this.tmux.killSession(runtimeId);
+          throw new Error("Persistent terminal context mismatch");
+        }
+        terminal = this.tmux.attach({
+          runtimeId,
+          cwd: workspace.worktree_path,
+          cols,
+          rows,
+          env: terminalEnv,
+        });
+        backend = "tmux";
+      } catch {
+        runtimeId = null;
+        terminal = spawn(shell, shellArgs, {
+          name: "xterm-256color",
+          cols,
+          rows,
+          cwd: workspace.worktree_path,
+          env: terminalEnv,
+        });
+      }
+    } else {
+      terminal = spawn(shell, shellArgs, {
+        name: "xterm-256color",
+        cols,
+        rows,
+        cwd: workspace.worktree_path,
+        env: terminalEnv,
+      });
+    }
+    const pid = backend === "tmux" && runtimeId
+      ? this.tmux?.panePid(runtimeId) ?? terminal.pid
+      : terminal.pid;
 
     this.db.prepare(`
       INSERT INTO terminal_sessions (
-        id, workspace_id, project_id, shell, cwd, pid, bridge_token_hash, cols, rows, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-    `).run(id, workspace.id, workspace.project_id, shell, workspace.worktree_path, terminal.pid, bridgeTokenHash, cols, rows);
+        id, workspace_id, project_id, shell, cwd, pid, bridge_token_hash,
+        goal_id, backend, runtime_id, cols, rows, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+    `).run(
+      id, workspace.id, workspace.project_id, shell, workspace.worktree_path, pid, bridgeTokenHash,
+      workspace.active_goal_id, backend, runtimeId, cols, rows,
+    );
 
-    const active: ActiveTerminal = { pty: terminal, output: "", stopStatus: null, flushTimer: null };
-    this.active.set(id, active);
-
-    terminal.onData((data) => {
-      active.output = `${active.output}${data}`.slice(-MAX_OUTPUT);
-      if (!active.flushTimer) {
-        active.flushTimer = setTimeout(() => {
-          active.flushTimer = null;
-          this.db.prepare("UPDATE terminal_sessions SET last_output = ? WHERE id = ? AND status = 'active'")
-            .run(active.output, id);
-        }, 250);
-      }
-      this.emit({ type: "terminal:data", payload: { terminalId: id, data } });
-    });
-    terminal.onExit(({ exitCode }) => {
-      if (active.flushTimer) clearTimeout(active.flushTimer);
-      if (this.shuttingDown) {
-        this.active.delete(id);
-        return;
-      }
-      const status: TerminalSessionStatus = active.stopStatus ?? "exited";
-      this.db.prepare(`
-        UPDATE terminal_sessions
-           SET status = ?, exit_code = ?, pid = NULL, last_output = ?, ended_at = datetime('now')
-         WHERE id = ?
-      `).run(status, exitCode, active.output, id);
-      try {
-        finishTerminalBridgeAgentRun(this.db, {
-          workspaceId: workspace.id,
-          terminalSessionId: id,
-          clientRequestId: "terminal-exit-" + id + "-" + randomUUID(),
-          provider: status === "killed" ? "terminal session" : "shell",
-          exitCode: exitCode ?? -1,
-        });
-      } catch {
-        // Terminal status is authoritative even when there is no bridge task to reconcile.
-      }
-      this.active.delete(id);
-      this.emit({
-        type: "terminal:exit",
-        payload: { terminalId: id, workspaceId: workspace.id, projectId: workspace.project_id, status, exitCode },
-      });
+    this.registerTerminal({
+      id,
+      workspaceId: workspace.id,
+      projectId: workspace.project_id,
+      pty: terminal,
+      backend,
+      runtimeId,
+      output: "",
     });
 
     return this.get(id)!;
@@ -332,14 +556,60 @@ codex() {
 
   list(workspaceId: string): TerminalSession[] {
     const rows = this.db.prepare(`
-      SELECT * FROM terminal_sessions WHERE workspace_id = ? ORDER BY started_at DESC
+      SELECT ts.*,
+             g.title AS goal_title,
+             a.name AS agent_name,
+             a.role AS agent_role,
+             t.title AS active_task_title,
+             t.status AS active_task_status,
+             (SELECT COUNT(*)
+                FROM terminal_sessions previous
+               WHERE previous.workspace_id = ts.workspace_id
+                 AND previous.rowid <= ts.rowid) AS tab_number
+        FROM terminal_sessions ts
+        LEFT JOIN goals g ON g.id = ts.goal_id
+        LEFT JOIN agents a ON a.id = ts.agent_id
+        LEFT JOIN tasks t ON t.id = ts.active_task_id
+       WHERE ts.workspace_id = ? AND ts.dismissed_at IS NULL
+       ORDER BY ts.started_at DESC, ts.rowid DESC
     `).all(workspaceId) as TerminalRow[];
-    return rows.map((row) => toModel(row, this.active.get(row.id)?.output));
+    return rows.map((row) => toModel(row, this.currentOutput(row), this.contextState(row)));
   }
 
   get(id: string): TerminalSession | null {
-    const row = this.db.prepare("SELECT * FROM terminal_sessions WHERE id = ?").get(id) as TerminalRow | undefined;
-    return row ? toModel(row, this.active.get(id)?.output) : null;
+    const row = this.db.prepare(`
+      SELECT ts.*,
+             g.title AS goal_title,
+             a.name AS agent_name,
+             a.role AS agent_role,
+             t.title AS active_task_title,
+             t.status AS active_task_status,
+             (SELECT COUNT(*)
+                FROM terminal_sessions previous
+               WHERE previous.workspace_id = ts.workspace_id
+                 AND previous.rowid <= ts.rowid) AS tab_number
+        FROM terminal_sessions ts
+        LEFT JOIN goals g ON g.id = ts.goal_id
+        LEFT JOIN agents a ON a.id = ts.agent_id
+        LEFT JOIN tasks t ON t.id = ts.active_task_id
+       WHERE ts.id = ?
+    `).get(id) as TerminalRow | undefined;
+    return row ? toModel(row, this.currentOutput(row), this.contextState(row)) : null;
+  }
+
+  private contextState(row: TerminalRow): TerminalSession["contextState"] {
+    if (row.status !== "active") return "unknown";
+    if (row.backend === "tmux") return this.persistentContextState(row);
+    return this.active.has(row.id) ? "connected" : "unknown";
+  }
+
+  private currentOutput(row: TerminalRow): string | undefined {
+    const terminal = this.active.get(row.id);
+    if (!terminal) return undefined;
+    if (terminal.backend === "tmux" && terminal.runtimeId && this.tmux?.hasSession(terminal.runtimeId)) {
+      return this.tmux.capture(terminal.runtimeId) || row.last_output;
+    }
+    return terminal.output;
   }
 
   write(id: string, data: string): boolean {
@@ -363,7 +633,24 @@ codex() {
     const terminal = this.active.get(id);
     if (!terminal) return this.get(id);
     terminal.stopStatus = "killed";
-    terminal.pty.kill();
+    if (terminal.backend === "tmux" && terminal.runtimeId) {
+      this.tmux?.killSession(terminal.runtimeId);
+    }
+    try { terminal.pty.kill(); } catch { /* process already exited */ }
+    return this.get(id);
+  }
+
+  dismiss(id: string): TerminalSession | null {
+    const terminal = this.get(id);
+    if (!terminal) return null;
+    if (terminal.status === "active") {
+      throw new Error("Active terminal must be stopped before dismissal");
+    }
+    this.db.prepare(`
+      UPDATE terminal_sessions
+         SET dismissed_at = COALESCE(dismissed_at, datetime('now'))
+       WHERE id = ?
+    `).run(id);
     return this.get(id);
   }
 
@@ -372,12 +659,25 @@ codex() {
     for (const [id, terminal] of this.active) {
       terminal.stopStatus = "interrupted";
       if (terminal.flushTimer) clearTimeout(terminal.flushTimer);
+      if (terminal.backend === "tmux" && terminal.runtimeId && this.tmux?.hasSession(terminal.runtimeId)) {
+        const output = this.tmux.capture(terminal.runtimeId) || terminal.output;
+        const pid = this.tmux.panePid(terminal.runtimeId);
+        this.db.prepare(`
+          UPDATE terminal_sessions
+             SET pid = COALESCE(?, pid), last_output = ?
+           WHERE id = ? AND status = 'active'
+        `).run(pid, output, id);
+        try { terminal.pty.kill(); } catch { /* best effort during shutdown */ }
+        continue;
+      }
       try { terminal.pty.kill(); } catch { /* best effort during shutdown */ }
       this.db.prepare(`
         UPDATE terminal_sessions
            SET status = 'interrupted', pid = NULL, last_output = ?, ended_at = datetime('now')
          WHERE id = ? AND status = 'active'
       `).run(terminal.output, id);
+      const session = this.get(id);
+      if (session) this.reconcileInterruptedTerminal(id, session.workspaceId);
     }
   }
 }

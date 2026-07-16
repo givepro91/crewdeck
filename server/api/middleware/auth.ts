@@ -11,14 +11,18 @@ export function createScopedTerminalTokenValidator(db: Database): (token: string
   return (token, req) => {
     const hash = createHash("sha256").update(token).digest("hex");
     const terminal = db.prepare(`
-      SELECT workspace_id FROM terminal_sessions
+      SELECT id, workspace_id FROM terminal_sessions
        WHERE bridge_token_hash = ? AND status = 'active'
-    `).get(hash) as { workspace_id: string } | undefined;
+    `).get(hash) as { id: string; workspace_id: string } | undefined;
     if (!terminal) return false;
     const workspaceId = typeof req.query.workspaceId === "string"
       ? req.query.workspaceId
       : typeof req.body?.workspaceId === "string" ? req.body.workspaceId : "";
-    return workspaceId === terminal.workspace_id;
+    const terminalSessionId = typeof req.query.terminalSessionId === "string"
+      ? req.query.terminalSessionId
+      : typeof req.body?.terminalSessionId === "string" ? req.body.terminalSessionId : "";
+    return workspaceId === terminal.workspace_id
+      && (!terminalSessionId || terminalSessionId === terminal.id);
   };
 }
 

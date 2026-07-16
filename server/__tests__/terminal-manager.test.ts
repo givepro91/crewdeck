@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { createDatabase, migrate } from "../db/schema.js";
 import { TerminalManager, type TerminalEvent } from "../core/terminal/manager.js";
 import {
@@ -12,13 +13,21 @@ import {
 
 const tempDirs: string[] = [];
 const managers: TerminalManager[] = [];
+const tmuxAvailable = (() => {
+  try {
+    execFileSync("tmux", ["-V"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 afterEach(() => {
   for (const manager of managers.splice(0)) manager.killAll();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function setup(withRuntime = false) {
+function setup(withRuntime = false, persistent = false) {
   const cwd = mkdtempSync(join(tmpdir(), "crewdeck-pty-"));
   tempDirs.push(cwd);
   const db = createDatabase(":memory:");
@@ -30,14 +39,16 @@ function setup(withRuntime = false) {
     ) VALUES ('w1', 'p1', 'Workspace', 'manual', 'ready', ?, 'workspace/test', 100)
   `).run(cwd);
   const events: TerminalEvent[] = [];
-  const manager = new TerminalManager(db, (event) => events.push(event), withRuntime ? {
+  const runtime = withRuntime ? {
     dataDir: cwd,
     apiBaseUrl: "http://127.0.0.1:7200/api",
     syncCommand: { command: "/bin/echo", args: ["sync"] },
     mcpCommand: { command: "/bin/echo", args: ["mcp"] },
-  } : undefined);
+    tmuxCommand: persistent ? undefined : null,
+  } : undefined;
+  const manager = new TerminalManager(db, (event) => events.push(event), runtime);
   managers.push(manager);
-  return { cwd, db, events, manager };
+  return { cwd, db, events, manager, runtime };
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
@@ -78,6 +89,20 @@ describe("local terminal manager", () => {
     expect(manager.get(second.id)?.status).toBe("active");
   });
 
+  it("dismisses a completed tab without deleting its terminal evidence", async () => {
+    const { manager } = setup();
+    const completed = manager.create("w1");
+    const active = manager.create("w1");
+
+    expect(() => manager.dismiss(active.id)).toThrow("Active terminal must be stopped before dismissal");
+    manager.kill(completed.id);
+    await waitUntil(() => manager.get(completed.id)?.status === "killed");
+
+    expect(manager.dismiss(completed.id)).toMatchObject({ id: completed.id, status: "killed" });
+    expect(manager.list("w1").map((terminal) => terminal.id)).toEqual([active.id]);
+    expect(manager.get(completed.id)).toMatchObject({ id: completed.id, status: "killed" });
+  });
+
   it("blocks the terminal-owned active task when the user stops its PTY", async () => {
     const { db, manager } = setup();
     const terminal = manager.create("w1");
@@ -101,21 +126,135 @@ describe("local terminal manager", () => {
       .toMatchObject({ status: "blocked", result_summary: expect.stringContaining("terminal session exited") });
   });
 
-  it("marks stale active PTYs interrupted on server restart", () => {
+  it("marks stale active PTYs interrupted and blocks their active bridge task on server restart", () => {
     const { db } = setup();
     db.prepare(`
       INSERT INTO terminal_sessions (
         id, workspace_id, project_id, shell, cwd, pid, status
       ) VALUES ('stale', 'w1', 'p1', '/bin/zsh', '/tmp', 99999, 'active')
     `).run();
+    const goal = createTerminalBridgeGoal(db, {
+      workspaceId: "w1", terminalSessionId: "stale", clientRequestId: "restart-goal", title: "Restart recovery",
+    });
+    const task = createTerminalBridgeTask(db, {
+      workspaceId: "w1", terminalSessionId: "stale", clientRequestId: "restart-task",
+      goalId: String(goal.goal.id), task: { title: "Interrupted work" },
+    });
+    const taskId = String((task.task as Record<string, unknown>).id);
+    updateTerminalBridgeTask(db, {
+      workspaceId: "w1", terminalSessionId: "stale", clientRequestId: "restart-start",
+      taskId, status: "in_progress",
+    });
     const manager = new TerminalManager(db, () => {});
     managers.push(manager);
     expect(manager.get("stale")).toMatchObject({ status: "interrupted", pid: null });
+    expect(db.prepare("SELECT status, result_summary FROM tasks WHERE id = ?").get(taskId)).toMatchObject({
+      status: "blocked",
+      result_summary: expect.stringContaining("was interrupted"),
+    });
+  });
+
+  it("preserves output and reconciles the active bridge task during graceful shutdown", async () => {
+    const { db, manager } = setup();
+    const terminal = manager.create("w1");
+    manager.write(terminal.id, "printf 'OUTPUT_BEFORE_RESTART\\n'\n");
+    await waitUntil(() => manager.get(terminal.id)?.output.includes("OUTPUT_BEFORE_RESTART") === true);
+    const goal = createTerminalBridgeGoal(db, {
+      workspaceId: "w1", terminalSessionId: terminal.id, clientRequestId: "shutdown-goal", title: "Shutdown recovery",
+    });
+    const task = createTerminalBridgeTask(db, {
+      workspaceId: "w1", terminalSessionId: terminal.id, clientRequestId: "shutdown-task",
+      goalId: String(goal.goal.id), task: { title: "Gracefully interrupted work" },
+    });
+    const taskId = String((task.task as Record<string, unknown>).id);
+    updateTerminalBridgeTask(db, {
+      workspaceId: "w1", terminalSessionId: terminal.id, clientRequestId: "shutdown-start",
+      taskId, status: "in_progress",
+    });
+
+    manager.killAll();
+
+    expect(manager.get(terminal.id)).toMatchObject({
+      status: "interrupted",
+      pid: null,
+      output: expect.stringContaining("OUTPUT_BEFORE_RESTART"),
+    });
+    expect(db.prepare("SELECT status, result_summary FROM tasks WHERE id = ?").get(taskId)).toMatchObject({
+      status: "blocked",
+      result_summary: expect.stringContaining("was interrupted"),
+    });
+  });
+
+  it.skipIf(!tmuxAvailable)("reattaches to the same persistent shell without blocking its active task", async () => {
+    const { db, manager, runtime } = setup(true, true);
+    const terminal = manager.create("w1");
+    expect(terminal).toMatchObject({ status: "active", backend: "tmux" });
+    expect(manager.write(
+      terminal.id,
+      "printf 'INITIAL=%s:%s\\n' \"$CREWDECK_WORKSPACE_ID\" \"$CREWDECK_TERMINAL_ID\"; export CREWDECK_PERSIST_PROBE=same-shell\n",
+    )).toBe(true);
+    await waitUntil(() => manager.get(terminal.id)?.output.includes(`INITIAL=w1:${terminal.id}`) === true);
+
+    const goal = createTerminalBridgeGoal(db, {
+      workspaceId: "w1", terminalSessionId: terminal.id, clientRequestId: "persist-goal", title: "Persistent work",
+    });
+    const task = createTerminalBridgeTask(db, {
+      workspaceId: "w1", terminalSessionId: terminal.id, clientRequestId: "persist-task",
+      goalId: String(goal.goal.id), task: { title: "Keep running" },
+    });
+    const taskId = String((task.task as Record<string, unknown>).id);
+    updateTerminalBridgeTask(db, {
+      workspaceId: "w1", terminalSessionId: terminal.id, clientRequestId: "persist-start",
+      taskId, status: "in_progress",
+    });
+
+    manager.killAll();
+    const recoveredManager = new TerminalManager(db, () => {}, runtime);
+    managers.push(recoveredManager);
+
+    expect(recoveredManager.get(terminal.id)).toMatchObject({
+      status: "active",
+      backend: "tmux",
+      pid: terminal.pid,
+    });
+    expect(db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId)).toEqual({ status: "in_progress" });
+    expect(recoveredManager.write(terminal.id, "printf 'PERSIST=%s\\n' \"$CREWDECK_PERSIST_PROBE\"\n")).toBe(true);
+    await waitUntil(() => recoveredManager.get(terminal.id)?.output.includes("PERSIST=same-shell") === true);
+    expect(recoveredManager.get(terminal.id)?.output).not.toContain("\u001b");
+
+    recoveredManager.kill(terminal.id);
+    await waitUntil(() => recoveredManager.get(terminal.id)?.status === "killed");
+  });
+
+  it.skipIf(!tmuxAvailable)("isolates Crewdeck context across persistent Workspace terminals", async () => {
+    const { cwd, db, manager } = setup(true, true);
+    const otherCwd = mkdtempSync(join(tmpdir(), "crewdeck-pty-other-"));
+    tempDirs.push(otherCwd);
+    db.exec(`
+      INSERT INTO projects (id, name, source, workdir)
+      VALUES ('p2', 'Other Project', 'new', '${otherCwd.replaceAll("'", "''")}');
+    `);
+    db.prepare(`
+      INSERT INTO workspaces (
+        id, project_id, name, kind, state, worktree_path, worktree_branch, setup_progress
+      ) VALUES ('w2', 'p2', 'Other Workspace', 'manual', 'ready', ?, 'workspace/other', 100)
+    `).run(otherCwd);
+
+    const first = manager.create("w1");
+    const second = manager.create("w2");
+    expect(first).toMatchObject({ contextState: "connected", projectId: "p1", workspaceId: "w1" });
+    expect(second).toMatchObject({ contextState: "connected", projectId: "p2", workspaceId: "w2" });
+
+    manager.write(first.id, "printf 'FIRST=%s:%s:%s\\n' \"$CREWDECK_PROJECT_ID\" \"$CREWDECK_WORKSPACE_ID\" \"$CREWDECK_TERMINAL_ID\"\n");
+    manager.write(second.id, "printf 'SECOND=%s:%s:%s\\n' \"$CREWDECK_PROJECT_ID\" \"$CREWDECK_WORKSPACE_ID\" \"$CREWDECK_TERMINAL_ID\"\n");
+    await waitUntil(() => manager.get(first.id)?.output.includes(`FIRST=p1:w1:${first.id}`) === true);
+    await waitUntil(() => manager.get(second.id)?.output.includes(`SECOND=p2:w2:${second.id}`) === true);
   });
 
   it("injects the Crewdeck bridge and AI wrappers into the local shell", async () => {
     const { cwd, events, manager } = setup(true);
     const terminal = manager.create("w1");
+    expect(terminal.backend).toBe("pty");
     manager.write(terminal.id, "command -v crewdeck-sync; whence -w claude; whence -w codex; printf 'BRIDGE_ENV=%s:%s\\n' \"$CREWDECK_WORKSPACE_ID\" \"$CREWDECK_TERMINAL_ID\"; printf 'LIFECYCLE=%s\\n' \"$CREWDECK_AGENT_PROMPT\"\n");
     await waitUntil(() => manager.get(terminal.id)?.output.includes("BRIDGE_ENV=w1:") === true);
     const output = manager.get(terminal.id)?.output ?? "";

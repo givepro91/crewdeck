@@ -36,7 +36,16 @@ async function main(): Promise<void> {
   const [command = "help", ...args] = process.argv.slice(2);
   const clientRequestId = value(args, "--request-id") ?? randomUUID();
   if (command === "context") {
-    console.log(JSON.stringify(await request(`/terminal-bridge/context?workspaceId=${encodeURIComponent(workspaceId!)}`), null, 2));
+    const terminalQuery = terminalSessionId ? `&terminalSessionId=${encodeURIComponent(terminalSessionId)}` : "";
+    console.log(JSON.stringify(await request(`/terminal-bridge/context?workspaceId=${encodeURIComponent(workspaceId!)}${terminalQuery}`), null, 2));
+    return;
+  }
+  if (command === "decision") {
+    if (!terminalSessionId) throw new Error("This terminal session is missing its Crewdeck id");
+    console.log(JSON.stringify(await request("/terminal-bridge/decisions", {
+      method: "POST",
+      body: JSON.stringify({ workspaceId, terminalSessionId, message: required(value(args, "--message") ?? args.join(" "), "--message") }),
+    }), null, 2));
     return;
   }
   if (command === "goal") {
@@ -126,6 +135,7 @@ async function main(): Promise<void> {
 
 Commands:
   crewdeck-sync context
+  crewdeck-sync decision --message <user-resolution>
   crewdeck-sync goal --title <title> [--description <text>] [--priority medium] [--tasks-json '[{"title":"...","assignee":"backend"}]']
   crewdeck-sync task --goal-id <id> --title <title> [--description <text>] [--assignee <name-or-role>]
   crewdeck-sync task-status --task-id <id> --status <todo|in_progress|in_review|done|blocked> [--summary <text>]

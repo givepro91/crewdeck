@@ -29,6 +29,7 @@ interface BridgeWorkspace {
   name: string;
   state: string;
   worktree_path: string | null;
+  active_goal_id: string | null;
 }
 
 export interface TerminalBridgeContext {
@@ -37,11 +38,16 @@ export interface TerminalBridgeContext {
   agents: Array<Record<string, unknown>>;
   goals: Array<Record<string, unknown>>;
   tasks: Array<Record<string, unknown>>;
+  activeGoal: Record<string, unknown> | null;
+  activeTasks: Array<Record<string, unknown>>;
+  sessionBinding: Record<string, unknown> | null;
 }
 
 function workspaceForBridge(db: Database, workspaceId: string): BridgeWorkspace {
   const workspace = db.prepare(`
-    SELECT id, project_id, name, state, worktree_path FROM workspaces WHERE id = ?
+    SELECT id, project_id, name, state, worktree_path,
+           COALESCE(active_goal_id, goal_id) AS active_goal_id
+      FROM workspaces WHERE id = ?
   `).get(workspaceId) as BridgeWorkspace | undefined;
   if (!workspace) throw new Error("Workspace not found");
   if (workspace.state !== "ready") throw new Error("Workspace is not ready");
@@ -159,7 +165,11 @@ function updateGoalProgress(db: Database, goalId: string): void {
   `).run(goalId, goalId);
 }
 
-export function getTerminalBridgeContext(db: Database, workspaceId: string): TerminalBridgeContext {
+export function getTerminalBridgeContext(
+  db: Database,
+  workspaceId: string,
+  terminalSessionId?: string,
+): TerminalBridgeContext {
   const workspace = workspaceForBridge(db, workspaceId);
   const project = db.prepare(`
     SELECT id, name, mission, workdir, autopilot, default_provider, base_branch
@@ -179,7 +189,28 @@ export function getTerminalBridgeContext(db: Database, workspaceId: string): Ter
      ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'in_review' THEN 1 WHEN 'todo' THEN 2 ELSE 3 END,
               updated_at DESC LIMIT 200
   `).all(workspace.project_id) as Array<Record<string, unknown>>;
-  return { workspace: { ...workspace }, project, agents, goals, tasks };
+  const activeGoal = workspace.active_goal_id
+    ? goals.find((goal) => goal.id === workspace.active_goal_id) ?? null
+    : null;
+  const activeTasks = activeGoal
+    ? tasks.filter((task) => task.goal_id === activeGoal.id)
+    : [];
+  let sessionBinding: Record<string, unknown> | null = null;
+  if (terminalSessionId) {
+    const terminal = db.prepare(`
+      SELECT ts.id, ts.workspace_id, ts.goal_id, ts.agent_id, ts.active_task_id, ts.provider,
+             g.title AS goal_title, a.name AS agent_name, a.role AS agent_role,
+             t.title AS task_title, t.status AS task_status
+        FROM terminal_sessions ts
+        LEFT JOIN goals g ON g.id = ts.goal_id
+        LEFT JOIN agents a ON a.id = ts.agent_id
+        LEFT JOIN tasks t ON t.id = ts.active_task_id
+       WHERE ts.id = ? AND ts.workspace_id = ?
+    `).get(terminalSessionId, workspaceId) as Record<string, unknown> | undefined;
+    if (!terminal) throw new Error("Terminal does not belong to this workspace");
+    sessionBinding = terminal;
+  }
+  return { workspace: { ...workspace }, project, agents, goals, tasks, activeGoal, activeTasks, sessionBinding };
 }
 
 export function createTerminalBridgeGoal(db: Database, input: TerminalBridgeGoalInput): TerminalBridgeGoalResult {
@@ -213,6 +244,8 @@ export function createTerminalBridgeGoal(db: Database, input: TerminalBridgeGoal
       RETURNING *
     `).get(workspace.project_id, title, description, priority, sortOrder, workspace.id) as Record<string, unknown>;
     const goalId = String(insertedGoal.id);
+    db.prepare("UPDATE workspaces SET active_goal_id = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(goalId, workspace.id);
     const createdTasks: Array<Record<string, unknown>> = [];
     taskInputs.forEach((task, index) => {
       const assigneeId = resolveAssignee(db, workspace.project_id, task);
@@ -344,6 +377,7 @@ export function finishTerminalBridgeAgentRun(
     clientRequestId: string;
     provider: string;
     exitCode: number;
+    interrupted?: boolean;
   },
 ): (Record<string, unknown> & { replayed: boolean }) | { task: null; replayed: false } {
   const workspace = workspaceForBridge(db, input.workspaceId);
@@ -367,7 +401,9 @@ export function finishTerminalBridgeAgentRun(
       .get(String(eventTask.id), workspace.project_id) as { id: string; status: TaskStatus } | undefined;
     if (!task || (task.status !== "in_progress" && task.status !== "in_review")) continue;
     const provider = input.provider?.trim().slice(0, 40) || "AI agent";
-    const summary = input.exitCode === 0
+    const summary = input.interrupted
+      ? provider + " was interrupted before completing the required Crewdeck lifecycle"
+      : input.exitCode === 0
       ? provider + " exited before completing the required Crewdeck lifecycle"
       : provider + " exited with code " + input.exitCode + " before completing the required Crewdeck lifecycle";
     return updateTerminalBridgeTask(db, {

@@ -1,7 +1,7 @@
 import type { Database } from "better-sqlite3";
 import { existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { createManualWorkspaceWorktree, removeWorktree } from "./worktree.js";
 
 export type WorkspaceKind = "goal" | "manual";
@@ -11,6 +11,7 @@ interface WorkspaceRow {
   id: string;
   project_id: string;
   goal_id: string | null;
+  active_goal_id: string | null;
   name: string;
   kind: WorkspaceKind;
   state: WorkspaceState;
@@ -34,6 +35,7 @@ export interface WorkspaceReadModel {
   id: string;
   projectId: string;
   goalId: string | null;
+  activeGoalId: string | null;
   name: string;
   kind: WorkspaceKind;
   state: WorkspaceState;
@@ -62,6 +64,17 @@ export interface WorkspaceDiff {
 export interface WorkspaceFiles {
   files: string[];
   truncated: boolean;
+}
+
+export class WorkspaceArchiveError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "WorkspaceArchiveError";
+  }
 }
 
 const WORKSPACE_SELECT = `
@@ -97,6 +110,7 @@ function toReadModel(row: WorkspaceRow): WorkspaceReadModel {
     id: row.id,
     projectId: row.project_id,
     goalId: row.goal_id,
+    activeGoalId: row.active_goal_id ?? row.goal_id,
     name: row.name,
     kind: row.kind,
     state: row.state,
@@ -122,14 +136,35 @@ function toReadModel(row: WorkspaceRow): WorkspaceReadModel {
 
 export function listWorkspaces(db: Database, projectId?: string): WorkspaceReadModel[] {
   const rows = projectId
-    ? db.prepare(`${WORKSPACE_SELECT} WHERE w.project_id = ? GROUP BY w.id ORDER BY w.created_at DESC`).all(projectId)
-    : db.prepare(`${WORKSPACE_SELECT} GROUP BY w.id ORDER BY w.created_at DESC`).all();
+    ? db.prepare(`${WORKSPACE_SELECT} WHERE w.project_id = ? AND w.state != 'archived' GROUP BY w.id ORDER BY w.created_at DESC`).all(projectId)
+    : db.prepare(`${WORKSPACE_SELECT} WHERE w.state != 'archived' GROUP BY w.id ORDER BY w.created_at DESC`).all();
   return (rows as WorkspaceRow[]).map(toReadModel);
 }
 
 export function getWorkspace(db: Database, workspaceId: string): WorkspaceReadModel | null {
   const row = db.prepare(`${WORKSPACE_SELECT} WHERE w.id = ? GROUP BY w.id`).get(workspaceId) as WorkspaceRow | undefined;
   return row ? toReadModel(row) : null;
+}
+
+export function selectWorkspaceGoal(
+  db: Database,
+  workspaceId: string,
+  goalId: string | null,
+): WorkspaceReadModel {
+  const workspace = db.prepare("SELECT id, project_id FROM workspaces WHERE id = ?")
+    .get(workspaceId) as { id: string; project_id: string } | undefined;
+  if (!workspace) throw new Error("Workspace not found");
+  if (goalId) {
+    const goal = db.prepare("SELECT id FROM goals WHERE id = ? AND project_id = ?")
+      .get(goalId, workspace.project_id);
+    if (!goal) throw new Error("Goal not found in this project");
+  }
+  db.prepare(`
+    UPDATE workspaces
+       SET active_goal_id = ?, updated_at = datetime('now')
+     WHERE id = ?
+  `).run(goalId, workspaceId);
+  return getWorkspace(db, workspaceId)!;
 }
 
 export function createManualWorkspace(
@@ -180,6 +215,78 @@ export function createManualWorkspace(
     removeWorktree(project.workdir, created.path, created.branch);
     throw error;
   }
+  return getWorkspace(db, workspaceId)!;
+}
+
+export function archiveManualWorkspace(
+  db: Database,
+  workspaceId: string,
+  options: { confirmDirty?: boolean } = {},
+): WorkspaceReadModel {
+  const workspace = getWorkspace(db, workspaceId);
+  if (!workspace) {
+    throw new WorkspaceArchiveError("workspace_not_found", "Workspace not found", 404);
+  }
+  if (workspace.kind !== "manual") {
+    throw new WorkspaceArchiveError(
+      "workspace_goal_owned",
+      "Goal-owned Workspaces are managed by the goal lifecycle",
+      409,
+    );
+  }
+  if (workspace.state === "archived") return workspace;
+  if (workspace.activeSessionCount > 0 || workspace.activeTerminalSessionCount > 0) {
+    throw new WorkspaceArchiveError(
+      "workspace_active_sessions",
+      "End active sessions before archiving this Workspace",
+      409,
+    );
+  }
+  if (workspace.pathExists === true && workspace.dirty !== false && options.confirmDirty !== true) {
+    throw new WorkspaceArchiveError(
+      "workspace_dirty_confirmation_required",
+      "Workspace changes must be confirmed before archiving",
+      409,
+    );
+  }
+
+  if (workspace.worktreePath && workspace.worktreeBranch) {
+    const project = db.prepare("SELECT workdir FROM projects WHERE id = ?").get(workspace.projectId) as {
+      workdir: string;
+    } | undefined;
+    if (!project?.workdir.trim()) {
+      throw new WorkspaceArchiveError(
+        "workspace_project_folder_unavailable",
+        "Project folder is unavailable",
+        500,
+      );
+    }
+    const workspaceRoot = resolve(project.workdir, ".crewdeck-worktrees");
+    const worktreePath = resolve(workspace.worktreePath);
+    if (!worktreePath.startsWith(`${workspaceRoot}${sep}`) || !workspace.worktreeBranch.startsWith("workspace/")) {
+      throw new WorkspaceArchiveError(
+        "workspace_cleanup_refused",
+        "Workspace cleanup ownership could not be verified",
+        409,
+      );
+    }
+    if (!removeWorktree(project.workdir, worktreePath, workspace.worktreeBranch)) {
+      throw new WorkspaceArchiveError(
+        "workspace_cleanup_failed",
+        "Workspace files could not be removed",
+        500,
+      );
+    }
+  }
+
+  db.prepare(`
+    UPDATE workspaces
+       SET state = 'archived', worktree_path = NULL, worktree_branch = NULL,
+           setup_step = 'archived', setup_progress = 100,
+           error_code = NULL, error_message = NULL,
+           archived_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?
+  `).run(workspaceId);
   return getWorkspace(db, workspaceId)!;
 }
 

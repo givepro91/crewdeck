@@ -28,7 +28,7 @@ async function api(path: string, init: RequestInit = {}): Promise<unknown> {
 const tools = [
   {
     name: "crewdeck_get_context",
-    description: "MANDATORY first step before file changes or verification: read the current Crewdeck Workspace, project, agent organization, goals, and tasks so work is attached to the correct non-duplicate goal.",
+    description: "MANDATORY first step before file changes or verification: read the current Crewdeck Workspace, selected activeGoal/activeTasks, agent organization, and remaining project goals so work is attached to the user's visible non-duplicate goal.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -85,12 +85,23 @@ const tools = [
       additionalProperties: false,
     },
   },
+  {
+    name: "crewdeck_record_decision",
+    description: "Record the user's resolution in the bound terminal session. If the active task was blocked, this resumes it as in_progress so the same agent conversation can continue.",
+    inputSchema: {
+      type: "object",
+      properties: { message: { type: "string" } },
+      required: ["message"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, any>): Promise<unknown> {
   const clientRequestId = randomUUID();
   if (name === "crewdeck_get_context") {
-    return api(`/terminal-bridge/context?workspaceId=${encodeURIComponent(workspaceId!)}`);
+    const terminalQuery = terminalSessionId ? `&terminalSessionId=${encodeURIComponent(terminalSessionId)}` : "";
+    return api(`/terminal-bridge/context?workspaceId=${encodeURIComponent(workspaceId!)}${terminalQuery}`);
   }
   if (name === "crewdeck_create_goal") {
     return api("/terminal-bridge/goals", {
@@ -111,6 +122,13 @@ async function callTool(name: string, args: Record<string, any>): Promise<unknow
     return api(`/terminal-bridge/tasks/${encodeURIComponent(args.taskId)}`, {
       method: "PATCH",
       body: JSON.stringify({ workspaceId, terminalSessionId, clientRequestId, status: args.status, summary: args.summary }),
+    });
+  }
+  if (name === "crewdeck_record_decision") {
+    if (!terminalSessionId) throw new Error("Crewdeck terminal session is missing");
+    return api("/terminal-bridge/decisions", {
+      method: "POST",
+      body: JSON.stringify({ workspaceId, terminalSessionId, message: args.message }),
     });
   }
   throw new Error(`Unknown tool: ${name}`);

@@ -1,4 +1,5 @@
 import type {
+  AgentProvider,
   GoalSpecLegacyContent,
   GoalSpecVersionSnapshot,
   ProjectGoalReportsResponse,
@@ -6,6 +7,7 @@ import type {
   SpecFields,
   SteeringNote,
   TerminalBridgeActivity,
+  TerminalDecision,
   TerminalSession,
   Workspace,
 } from "../../../shared/types";
@@ -381,6 +383,16 @@ export const api = {
     get: (id: string) => request<Workspace>(`/workspaces/${id}`),
     create: (data: { projectId: string; name: string; baseRef?: string }) =>
       request<Workspace>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
+    selectGoal: (id: string, goalId: string | null) =>
+      request<Workspace>(`/workspaces/${id}/context`, {
+        method: "PATCH",
+        body: JSON.stringify({ goalId }),
+      }),
+    archive: (id: string, options: { confirmDirty?: boolean } = {}) =>
+      request<Workspace>(`/workspaces/${id}`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirmDirty: options.confirmDirty === true }),
+      }),
     getDiff: (id: string) => request<{ diff: string; truncated: boolean }>(`/workspaces/${id}/diff`),
     getFiles: (id: string) => request<{ files: string[]; truncated: boolean }>(`/workspaces/${id}/files`),
   },
@@ -397,6 +409,18 @@ export const api = {
       request<TerminalSession>("/terminals", { method: "POST", body: JSON.stringify(data) }),
     kill: (id: string) =>
       request<{ status: string; terminalId: string }>(`/terminals/${id}`, { method: "DELETE" }),
+    dismiss: (id: string) =>
+      request<{ status: string; terminalId: string }>(`/terminals/${id}/dismiss`, { method: "POST" }),
+    bind: (id: string, data: { goalId?: string | null; agentId?: string | null; taskId?: string | null; provider?: AgentProvider | null }) =>
+      request<TerminalSession>(`/terminals/${id}/binding`, { method: "PATCH", body: JSON.stringify(data) }),
+    claimNext: (id: string, data: { goalId?: string | null; agentId?: string | null; provider?: AgentProvider | null }) =>
+      request<{ task: Record<string, unknown>; terminal: TerminalSession | null }>(`/terminals/${id}/claim-next`, { method: "POST", body: JSON.stringify(data) }),
+    decisions: (id: string, goalId?: string | null) =>
+      request<TerminalDecision[]>(`/terminals/${id}/decisions${goalId ? `?goalId=${encodeURIComponent(goalId)}` : ""}`),
+    recordDecision: (id: string, message: string) =>
+      request<{ decision: TerminalDecision; task: Record<string, unknown> | null; terminal: TerminalSession | null }>(`/terminals/${id}/decisions`, { method: "POST", body: JSON.stringify({ message }) }),
+    requestCompletion: (id: string, summary: string) =>
+      request<{ task: Record<string, unknown>; terminal: TerminalSession | null }>(`/terminals/${id}/completion`, { method: "POST", body: JSON.stringify({ summary }) }),
   },
   agents: {
     list: (projectId: string) => request<any[]>(`/agents?projectId=${projectId}`),

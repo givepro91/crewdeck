@@ -159,6 +159,7 @@ describe("Workspace API", () => {
       id: "w1",
       projectId: "p 1",
       goalId: "g1",
+      activeGoalId: "g1",
       name: "Goal workspace",
       kind: "goal",
       state: "ready",
@@ -189,6 +190,22 @@ describe("Workspace API", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("/workspaces?projectId=p%201"),
       expect.any(Object),
+    );
+  });
+
+  it("selects the active Workspace goal", async () => {
+    const fetchMock = vi.fn();
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ id: "w1", activeGoalId: "g1" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { api } = await import("./api");
+
+    await expect(api.workspaces.selectGoal("w1", "g1")).resolves.toMatchObject({ activeGoalId: "g1" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/workspaces/w1/context"),
+      expect.objectContaining({ method: "PATCH", body: JSON.stringify({ goalId: "g1" }) }),
     );
   });
 
@@ -224,6 +241,25 @@ describe("Workspace API", () => {
     await expect(api.workspaces.getFiles("w-manual")).resolves.toEqual({ files: ["README.md"], truncated: false });
   });
 
+  it("archives a manual Workspace with an explicit dirty confirmation", async () => {
+    const workspace = { id: "w-manual", state: "archived" };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(workspace), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { api } = await import("./api");
+
+    await expect(api.workspaces.archive("w manual", { confirmDirty: true })).resolves.toEqual(workspace);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/workspaces/w manual"),
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ confirmDirty: true }),
+      }),
+    );
+  });
+
   it("loads goal-scoped terminal phase evidence", async () => {
     const response = [{
       id: "event-1",
@@ -250,6 +286,22 @@ describe("Workspace API", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("/terminal-bridge/events?workspaceId=w%201&goalId=g%2F1"),
       expect.any(Object),
+    );
+  });
+
+  it("dismisses a completed terminal tab", async () => {
+    const response = { status: "dismissed", terminalId: "term-1" };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(response), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { api } = await import("./api");
+
+    await expect(api.terminals.dismiss("term-1")).resolves.toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/terminals/term-1/dismiss"),
+      expect.objectContaining({ method: "POST" }),
     );
   });
 });

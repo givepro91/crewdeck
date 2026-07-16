@@ -1,5 +1,12 @@
 import { Router } from "express";
 import type { AppContext } from "../../index.js";
+import {
+  bindTerminalSession,
+  claimNextTerminalTask,
+  listTerminalDecisions,
+  recordTerminalDecision,
+  requestTerminalTaskCompletion,
+} from "../../core/terminal/session-binding.js";
 
 export function createTerminalRoutes(ctx: AppContext): Router {
   const router = Router();
@@ -37,6 +44,100 @@ export function createTerminalRoutes(ctx: AppContext): Router {
     const terminal = manager.get(req.params.id);
     if (!terminal) return res.status(404).json({ error: "Terminal not found" });
     res.json(terminal);
+  });
+
+  router.patch("/:id/binding", (req, res) => {
+    try {
+      bindTerminalSession(ctx.db, req.params.id, {
+        goalId: req.body?.goalId,
+        agentId: req.body?.agentId,
+        taskId: req.body?.taskId,
+        provider: req.body?.provider,
+      });
+      const terminal = manager.get(req.params.id);
+      if (!terminal) return res.status(404).json({ error: "Terminal not found" });
+      ctx.broadcast("terminal:binding", terminal);
+      ctx.broadcast("workspace:updated", { workspaceId: terminal.workspaceId, projectId: terminal.projectId });
+      res.json(terminal);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Terminal binding failed";
+      res.status(message === "Terminal not found" ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post("/:id/claim-next", (req, res) => {
+    try {
+      const task = claimNextTerminalTask(ctx.db, req.params.id, {
+        goalId: req.body?.goalId,
+        agentId: req.body?.agentId,
+        provider: req.body?.provider,
+      });
+      const terminal = manager.get(req.params.id);
+      ctx.broadcast("task:updated", task);
+      if (terminal) ctx.broadcast("terminal:binding", terminal);
+      ctx.broadcast("project:updated", { projectId: task.project_id });
+      res.json({ task, terminal });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not claim the next task";
+      res.status(message === "Terminal not found" ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.get("/:id/decisions", (req, res) => {
+    const terminal = manager.get(req.params.id);
+    if (!terminal) return res.status(404).json({ error: "Terminal not found" });
+    const goalId = typeof req.query.goalId === "string" ? req.query.goalId : undefined;
+    res.json(listTerminalDecisions(ctx.db, terminal.workspaceId, goalId));
+  });
+
+  router.post("/:id/decisions", (req, res) => {
+    try {
+      const result = recordTerminalDecision(ctx.db, req.params.id, String(req.body?.message ?? ""));
+      const terminal = manager.get(req.params.id);
+      ctx.broadcast("terminal:decision", result.decision);
+      if (result.task) ctx.broadcast("task:updated", result.task);
+      if (terminal) ctx.broadcast("terminal:binding", terminal);
+      res.status(201).json({ ...result, terminal });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not record the decision";
+      res.status(message === "Terminal not found" ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post("/:id/completion", (req, res) => {
+    try {
+      const result = requestTerminalTaskCompletion(ctx.db, req.params.id, String(req.body?.summary ?? ""));
+      const terminal = manager.get(req.params.id);
+      ctx.broadcast("task:updated", result.task);
+      ctx.broadcast("terminal:bridge", {
+        kind: "task_updated",
+        workspaceId: terminal?.workspaceId,
+        task: result.task,
+        evidence: "evidence" in result ? result.evidence : null,
+      });
+      if (terminal) ctx.broadcast("terminal:binding", terminal);
+      ctx.broadcast("project:updated", { projectId: String((result.task as Record<string, unknown>).project_id ?? "") });
+      res.json({ ...result, terminal });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not request task completion";
+      res.status(message === "Terminal not found" ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post("/:id/dismiss", (req, res) => {
+    try {
+      const terminal = manager.dismiss(req.params.id);
+      if (!terminal) return res.status(404).json({ error: "Terminal not found" });
+      ctx.broadcast("terminal:dismissed", {
+        terminalId: terminal.id,
+        workspaceId: terminal.workspaceId,
+        projectId: terminal.projectId,
+      });
+      res.json({ status: "dismissed", terminalId: terminal.id });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Terminal dismissal failed";
+      res.status(message === "Active terminal must be stopped before dismissal" ? 409 : 500).json({ error: message });
+    }
   });
 
   router.delete("/:id", (req, res) => {

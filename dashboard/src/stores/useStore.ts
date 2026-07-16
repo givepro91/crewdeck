@@ -21,6 +21,7 @@ interface Project {
   github?: GitHubConfig;
   dev_port?: number;
   base_branch?: string;
+  autopilot?: "off" | "goal" | "full";
   /** Execution engine(s) this project's agents resolve to (Claude/Codex). */
   providers?: ("claude" | "codex")[];
 }
@@ -33,6 +34,15 @@ interface Agent {
   status: string;
   current_task_id: string | null;
   current_activity: string | null;
+  parent_id?: string | null;
+  system_prompt?: string;
+  session_id?: string;
+  prompt_source?: string;
+  resolved_prompt_source?: string;
+  resolved_prompt_file?: string;
+  needs_worktree?: number;
+  model?: string | null;
+  provider?: string | null;
 }
 
 interface Task {
@@ -44,6 +54,9 @@ interface Task {
   assignee_id: string | null;
   status: string;
   verification_id: string | null;
+  result_summary?: string | null;
+  depends_on?: string | null;
+  priority?: string;
 }
 
 type Goal = GoalListItem;

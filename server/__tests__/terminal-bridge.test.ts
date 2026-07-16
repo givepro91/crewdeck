@@ -108,7 +108,10 @@ describe("terminal bridge contract", () => {
     expect(review.evidence).toMatchObject({ dirty: true, changedFiles: ["proof.md"] });
     expect(db.prepare("SELECT progress FROM goals WHERE id = ?").get(goal.goal.id)).toEqual({ progress: 100 });
     expect(getTerminalBridgeContext(db, "w1")).toMatchObject({
-      project: { id: "p1" }, agents: [{ id: "a1" }, { id: "a2" }],
+      project: { id: "p1" },
+      agents: [{ id: "a1" }, { id: "a2" }],
+      activeGoal: { id: goal.goal.id },
+      activeTasks: [{ id: taskId }],
     });
     expect(listTerminalBridgeActivity(db, "w1", String(goal.goal.id)).map((event) => event.status))
       .toEqual(["done", "in_review", "in_progress", "todo", null]);

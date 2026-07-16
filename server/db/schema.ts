@@ -1009,6 +1009,7 @@ export function migrate(db: Database.Database): void {
       id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
       project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
       goal_id TEXT REFERENCES goals(id) ON DELETE CASCADE,
+      active_goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
       name TEXT NOT NULL,
       kind TEXT NOT NULL DEFAULT 'goal' CHECK (kind IN ('goal', 'manual')),
       state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'ready', 'error', 'archived')),
@@ -1042,6 +1043,12 @@ export function migrate(db: Database.Database): void {
       cwd TEXT NOT NULL,
       pid INTEGER,
       bridge_token_hash TEXT,
+      goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+      agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+      active_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      provider TEXT CHECK (provider IN ('claude', 'codex')),
+      backend TEXT NOT NULL DEFAULT 'pty' CHECK (backend IN ('pty', 'tmux')),
+      runtime_id TEXT,
       cols INTEGER NOT NULL DEFAULT 120 CHECK (cols BETWEEN 20 AND 400),
       rows INTEGER NOT NULL DEFAULT 32 CHECK (rows BETWEEN 5 AND 200),
       status TEXT NOT NULL DEFAULT 'active'
@@ -1049,12 +1056,26 @@ export function migrate(db: Database.Database): void {
       exit_code INTEGER,
       last_output TEXT NOT NULL DEFAULT '',
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
-      ended_at TEXT
+      ended_at TEXT,
+      dismissed_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_terminal_sessions_workspace
       ON terminal_sessions(workspace_id, started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_terminal_sessions_status
       ON terminal_sessions(status, started_at DESC);
+
+    CREATE TABLE IF NOT EXISTS terminal_decisions (
+      id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      terminal_session_id TEXT NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
+      goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+      message TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_terminal_decisions_workspace
+      ON terminal_decisions(workspace_id, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS terminal_bridge_events (
       id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
@@ -1075,10 +1096,50 @@ export function migrate(db: Database.Database): void {
   if (!terminalGoalColumns.some((c) => c.name === "origin_workspace_id")) {
     db.exec("ALTER TABLE goals ADD COLUMN origin_workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL");
   }
+  const workspaceColumns = db.prepare("PRAGMA table_info(workspaces)").all() as { name: string }[];
+  if (!workspaceColumns.some((c) => c.name === "active_goal_id")) {
+    db.exec("ALTER TABLE workspaces ADD COLUMN active_goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL");
+  }
+  db.exec("UPDATE workspaces SET active_goal_id = goal_id WHERE active_goal_id IS NULL AND goal_id IS NOT NULL");
   const terminalSessionColumns = db.prepare("PRAGMA table_info(terminal_sessions)").all() as { name: string }[];
   if (!terminalSessionColumns.some((c) => c.name === "bridge_token_hash")) {
     db.exec("ALTER TABLE terminal_sessions ADD COLUMN bridge_token_hash TEXT");
   }
+  if (!terminalSessionColumns.some((c) => c.name === "backend")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN backend TEXT NOT NULL DEFAULT 'pty'");
+  }
+  if (!terminalSessionColumns.some((c) => c.name === "runtime_id")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN runtime_id TEXT");
+  }
+  if (!terminalSessionColumns.some((c) => c.name === "dismissed_at")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN dismissed_at TEXT");
+  }
+  if (!terminalSessionColumns.some((c) => c.name === "goal_id")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL");
+  }
+  if (!terminalSessionColumns.some((c) => c.name === "agent_id")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL");
+  }
+  if (!terminalSessionColumns.some((c) => c.name === "active_task_id")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN active_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL");
+  }
+  if (!terminalSessionColumns.some((c) => c.name === "provider")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN provider TEXT");
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS terminal_decisions (
+      id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+      workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      terminal_session_id TEXT NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
+      goal_id TEXT REFERENCES goals(id) ON DELETE SET NULL,
+      task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+      agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+      message TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_terminal_decisions_workspace
+      ON terminal_decisions(workspace_id, created_at DESC);
+  `);
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_terminal_sessions_bridge_token
       ON terminal_sessions(bridge_token_hash) WHERE bridge_token_hash IS NOT NULL;

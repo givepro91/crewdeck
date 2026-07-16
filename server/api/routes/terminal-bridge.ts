@@ -9,15 +9,17 @@ import {
   listTerminalBridgeActivity,
   updateTerminalBridgeTask,
 } from "../../core/terminal/bridge.js";
+import { recordTerminalDecision } from "../../core/terminal/session-binding.js";
 
 export function createTerminalBridgeRoutes(ctx: AppContext): Router {
   const router = Router();
 
   router.get("/context", (req, res) => {
     const workspaceId = typeof req.query.workspaceId === "string" ? req.query.workspaceId : "";
+    const terminalSessionId = typeof req.query.terminalSessionId === "string" ? req.query.terminalSessionId : undefined;
     if (!workspaceId) return res.status(400).json({ error: "workspaceId is required" });
     try {
-      res.json(getTerminalBridgeContext(ctx.db, workspaceId));
+      res.json(getTerminalBridgeContext(ctx.db, workspaceId, terminalSessionId));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not read terminal context";
       res.status(message === "Workspace not found" ? 404 : 409).json({ error: message });
@@ -135,6 +137,22 @@ export function createTerminalBridgeRoutes(ctx: AppContext): Router {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not reconcile agent exit";
       res.status(message === "Workspace not found" ? 404 : 400).json({ error: message });
+    }
+  });
+
+  router.post("/decisions", (req, res) => {
+    try {
+      const terminalSessionId = typeof req.body?.terminalSessionId === "string" ? req.body.terminalSessionId : "";
+      if (!terminalSessionId) return res.status(400).json({ error: "terminalSessionId is required" });
+      const result = recordTerminalDecision(ctx.db, terminalSessionId, String(req.body?.message ?? ""));
+      ctx.broadcast("terminal:decision", result.decision);
+      if (result.task) ctx.broadcast("task:updated", result.task);
+      const terminal = ctx.terminalManager?.get(terminalSessionId);
+      if (terminal) ctx.broadcast("terminal:binding", terminal);
+      res.status(201).json(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not record the decision";
+      res.status(message === "Terminal not found" ? 404 : 400).json({ error: message });
     }
   });
 
