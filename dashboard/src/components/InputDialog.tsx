@@ -55,7 +55,13 @@ export function InputDialog({
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") handleSubmit();
+              // preventDefault: 제출로 다이얼로그가 언마운트되면 useModalA11y가 포커스를
+              // 열었던 버튼으로 되돌리는데, 기본 동작이 남아 있으면 눌린 Enter가 그 버튼을
+              // 다시 활성화해 다이얼로그가 재오픈된다.
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleSubmit();
+              }
               if (e.key === "Escape") onCancel();
             }}
             placeholder={placeholder}
