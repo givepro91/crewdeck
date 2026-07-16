@@ -8,6 +8,7 @@ import type { TerminalSession, TerminalSessionStatus } from "../../../shared/typ
 import { TERMINAL_AGENT_PROMPT } from "../../../shared/terminal-agent.js";
 import { finishTerminalBridgeAgentRun } from "./bridge.js";
 import { recoverInterruptedTask } from "../recovery.js";
+import { sanitizeReplayOutput, splitTerminalReplies } from "./escape-filter.js";
 import { TmuxBackend, type TmuxCommand } from "./tmux.js";
 
 const MAX_OUTPUT = 200 * 1024;
@@ -128,7 +129,8 @@ function toModel(
     rows: row.rows,
     status: row.status,
     exitCode: row.exit_code,
-    output: output ?? row.last_output ?? "",
+    // 리플레이 버퍼의 디바이스 질의·마우스 모드는 새 xterm에서 junk 입력을 유발한다.
+    output: sanitizeReplayOutput(output ?? row.last_output ?? ""),
     startedAt: row.started_at,
     endedAt: row.ended_at,
     backend: row.backend,
@@ -186,6 +188,18 @@ export class TerminalManager {
     if (this.persistentContextState(row) !== "connected") {
       this.tmux.killSession(row.runtime_id);
       return false;
+    }
+    // 구버전 create()가 만든 codex-home에는 AGENTS.md가 없다. 다음 codex 실행이
+    // lifecycle 계약과 defer된 MCP 도구를 받도록 복구 시점에 보증한다.
+    if (this.runtime) {
+      try {
+        const codexHome = resolve(this.runtime.dataDir, "terminal-runtime", "codex-home", row.id);
+        if (existsSync(codexHome)) {
+          writeFileSync(resolve(codexHome, "AGENTS.md"), `${TERMINAL_AGENT_PROMPT}\n`, { mode: 0o600 });
+        }
+      } catch {
+        // AGENTS.md 갱신 실패가 세션 복구 자체를 막아서는 안 된다.
+      }
     }
     try {
       const output = this.tmux.capture(row.runtime_id) || row.last_output;
@@ -438,10 +452,13 @@ export class TerminalManager {
       if (userCodexAuth && existsSync(userCodexAuth) && !existsSync(isolatedCodexAuth)) {
         symlinkSync(userCodexAuth, isolatedCodexAuth);
       }
+      // codex 0.144+는 config MCP 도구를 모델 기본 도구 목록에 싣지 않고 defer한다 —
+      // 지시문/프롬프트에 도구 이름이 언급된 턴에만 attach된다. config의
+      // developer_instructions 키는 더 이상 시스템 프롬프트에 주입되지 않으므로,
+      // codex가 전역 지시문으로 읽는 CODEX_HOME/AGENTS.md에 lifecycle 계약을 쓴다.
+      writeFileSync(resolve(codexHome, "AGENTS.md"), `${TERMINAL_AGENT_PROMPT}\n`, { mode: 0o600 });
       const tomlString = (value: string) => JSON.stringify(value);
       writeFileSync(resolve(codexHome, "config.toml"), [
-        "developer_instructions = " + tomlString(TERMINAL_AGENT_PROMPT),
-        "",
         "[mcp_servers.crewdeck]",
         "command = " + tomlString(this.runtime.mcpCommand.command),
         "args = [" + this.runtime.mcpCommand.args.map(tomlString).join(", ") + "]",
@@ -687,6 +704,15 @@ codex() {
   write(id: string, data: string): boolean {
     const terminal = this.active.get(id);
     if (!terminal || typeof data !== "string" || data.length > 64 * 1024) return false;
+    // 브라우저 xterm이 자동 생성한 제어 응답(색상/DA/CPR 보고)은 pane 키 입력이 아니다.
+    // send-keys로 pane에 넣으면 셸 프롬프트에 literal로 echo되므로(재진입 junk),
+    // 질의를 보낸 tmux attach 클라이언트 stdin으로 돌려준다.
+    if (terminal.backend === "tmux") {
+      const { replies, input } = splitTerminalReplies(data);
+      if (replies) terminal.pty.write(replies);
+      if (!input) return true;
+      data = input;
+    }
     if (!terminal.inputReady) {
       if (terminal.pendingInput.length + data.length > 64 * 1024) return false;
       terminal.pendingInput += data;

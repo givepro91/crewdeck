@@ -203,6 +203,22 @@ describe("local terminal manager", () => {
     });
   });
 
+  it.skipIf(!tmuxAvailable)("routes xterm control replies to the attach client instead of the pane", async () => {
+    const { manager } = setup(true, true);
+    const terminal = manager.create("w1");
+    expect(terminal.backend).toBe("tmux");
+    // xterm 자동 응답(색상 보고 + CPR)이 키 입력과 한 메시지로 도착하는 상황 —
+    // 응답이 send-keys로 pane에 들어가면 셸 프롬프트에 junk로 echo된다.
+    expect(manager.write(
+      terminal.id,
+      "\x1b]11;rgb:1717/1919/1d1d\x1b\\\x1b[24;80Rprintf 'REPLY_SPLIT=%s\\n' ok\n",
+    )).toBe(true);
+    await waitUntil(() => manager.get(terminal.id)?.output.includes("REPLY_SPLIT=ok") === true);
+    const output = manager.get(terminal.id)?.output ?? "";
+    expect(output).not.toContain("11;rgb:1717");
+    expect(output).not.toContain("24;80R");
+  });
+
   it.skipIf(!tmuxAvailable)("reattaches to the same persistent shell without blocking its active task", async () => {
     const { db, manager, runtime } = setup(true, true);
     const terminal = manager.create("w1");
@@ -364,7 +380,29 @@ describe("local terminal manager", () => {
     );
     expect(codexConfig).toContain("[mcp_servers.crewdeck.env]");
     expect(codexConfig).toContain("CREWDECK_API_KEY");
+    // codex 0.144+에서 developer_instructions 키는 무효 — 전역 지시문은 AGENTS.md로 주입한다.
+    expect(codexConfig).not.toContain("developer_instructions");
+    const codexAgents = readFileSync(
+      join(cwd, "terminal-runtime", "codex-home", terminal.id, "AGENTS.md"),
+      "utf8",
+    );
+    expect(codexAgents).toContain("crewdeck_get_context");
+    expect(codexAgents).toContain("todo -> in_progress -> in_review -> done");
     expect(events.some((event) => event.type === "terminal:data")).toBe(true);
+  });
+
+  it("sanitizes device queries and mouse enables out of the replay buffer", async () => {
+    const { db, manager } = setup();
+    const terminal = manager.create("w1");
+    manager.write(terminal.id, "exit\n");
+    await waitUntil(() => manager.get(terminal.id)?.status === "exited");
+    // 비정상 종료한 TUI가 남긴 raw 스트림을 재현: 색상 질의 + 마우스 트래킹 enable.
+    db.prepare("UPDATE terminal_sessions SET last_output = ? WHERE id = ?").run(
+      "prompt\x1b]10;?\x07\x1b]11;?\x1b\\\x1b[?1002h\x1b[?1006h\x1b[?2004h$ ",
+      terminal.id,
+    );
+    const replayed = manager.get(terminal.id)?.output ?? "";
+    expect(replayed).toBe("prompt\x1b[?2004h$ ");
   });
 
   it("falls back to PTY without argv secrets and revokes tokens on kill and natural exit", async () => {
