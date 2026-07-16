@@ -118,6 +118,33 @@ export interface TerminalDecision {
   createdAt: string;
 }
 
+export type TerminalActivityKind =
+  | "task_claimed"
+  | "provider_started"
+  | "command_finished"
+  | "file_changed"
+  | "verification_run"
+  | "blocked"
+  | "decision_recorded"
+  | "completion_requested"
+  | "quality_gate_result";
+
+export interface TerminalActivity {
+  id: string;
+  idempotencyKey: string;
+  workspaceId: string;
+  terminalSessionId: string;
+  projectId: string;
+  goalId: string | null;
+  taskId: string | null;
+  agentId: string | null;
+  provider: AgentProvider | null;
+  kind: TerminalActivityKind;
+  summary: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
 export interface TerminalBridgeTaskInput {
   title: string;
   description?: string;

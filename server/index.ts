@@ -25,6 +25,7 @@ import { createRecoveryRoutes } from "./api/routes/recovery.js";
 import { createWorkspaceRoutes } from "./api/routes/workspaces.js";
 import { createTerminalRoutes } from "./api/routes/terminals.js";
 import { createTerminalBridgeRoutes } from "./api/routes/terminal-bridge.js";
+import { createTerminalActivityRoutes } from "./api/routes/terminal-activity.js";
 import { createWSHandler } from "./api/websocket.js";
 import { TerminalManager, type TerminalCommand } from "./core/terminal/manager.js";
 import { agentActivityLog } from "./core/agent/activity-log.js";
@@ -375,6 +376,8 @@ export async function startServer(config: ServerConfig): Promise<void> {
   app.use("/api/recovery", createRecoveryRoutes(ctx));
   app.use("/api/workspaces", createWorkspaceRoutes(ctx));
   app.use("/api/terminals", createTerminalRoutes(ctx));
+  app.use("/api/terminal-activities", createTerminalActivityRoutes(ctx));
+  app.use("/api/terminal-bridge/activity", createTerminalActivityRoutes(ctx, { requireTerminalSessionIdForList: true }));
   app.use("/api/terminal-bridge", createTerminalBridgeRoutes(ctx));
 
   if (ctx.sessionManager) {

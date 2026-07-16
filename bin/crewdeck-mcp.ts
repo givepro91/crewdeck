@@ -95,6 +95,24 @@ const tools = [
       additionalProperties: false,
     },
   },
+  {
+    name: "crewdeck_report_activity",
+    description: "Record structured, redacted evidence for the currently bound Goal, Task, Agent, and Terminal. IDs are derived by Crewdeck; never include credentials in summary or metadata.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        idempotencyKey: { type: "string", description: "Stable retry key (1-128 URL-safe characters). Reuse it when retrying the same event." },
+        kind: {
+          type: "string",
+          enum: ["task_claimed", "provider_started", "command_finished", "file_changed", "verification_run", "blocked", "decision_recorded", "completion_requested", "quality_gate_result"],
+        },
+        summary: { type: "string" },
+        metadata: { type: "object", additionalProperties: true },
+      },
+      required: ["kind", "summary"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, any>): Promise<unknown> {
@@ -129,6 +147,20 @@ async function callTool(name: string, args: Record<string, any>): Promise<unknow
     return api("/terminal-bridge/decisions", {
       method: "POST",
       body: JSON.stringify({ workspaceId, terminalSessionId, message: args.message }),
+    });
+  }
+  if (name === "crewdeck_report_activity") {
+    if (!terminalSessionId) throw new Error("Crewdeck terminal session is missing");
+    return api("/terminal-bridge/activity", {
+      method: "POST",
+      body: JSON.stringify({
+        workspaceId,
+        terminalSessionId,
+        idempotencyKey: args.idempotencyKey ?? clientRequestId,
+        kind: args.kind,
+        summary: args.summary,
+        metadata: args.metadata ?? {},
+      }),
     });
   }
   throw new Error(`Unknown tool: ${name}`);
