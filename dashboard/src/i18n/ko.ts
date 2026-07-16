@@ -1187,6 +1187,8 @@ const ko = {
   workspaceNativeTerminal: "같은 터미널에서 답하세요",
   workspaceNativeTerminalHelp: "별도 채팅창이 아닙니다. Claude/Codex 대화에서 방향을 정하면 Crewdeck이 결정과 태스크 재개를 기록합니다.",
   workspaceTerminalRequiredForTask: "태스크를 연결할 활성 터미널이 필요합니다.",
+  workspaceStartTask: "착수",
+  workspaceTaskBoundTab: "{{tab}}에서 진행 중 — 클릭하면 해당 터미널로 이동합니다",
   workspaceNoReadyTask: "현재 에이전트가 수임할 수 있는 준비된 태스크가 없습니다.",
   workspaceCompletionSummary: "{{task}} 구현을 마치고 Quality Gate 검토를 요청했습니다.",
   workspaceNoTasksHint: "기획서를 만들고 태스크를 분할하면 실행 순서가 여기에 표시됩니다.",

@@ -51,6 +51,25 @@ function normalizeProvider(value: unknown): AgentProvider | null {
   return value;
 }
 
+/** 터미널이 놓아주면 안 되는 진행 상태 — 이 상태의 바인딩을 바꾸면 completion이 엉뚱한 태스크로 간다. */
+const IN_FLIGHT_TASK_STATUSES: readonly string[] = ["in_progress", "in_review", "blocked"];
+
+function taskBoundToOtherTerminal(db: Database, taskId: string, terminalId: string): boolean {
+  return db.prepare(`
+    SELECT 1 FROM terminal_sessions
+     WHERE status = 'active' AND active_task_id = ? AND id != ?
+  `).get(taskId, terminalId) !== undefined;
+}
+
+function assertTerminalNotBusy(db: Database, session: SessionRow, nextTaskId: string | null): void {
+  if (!session.active_task_id || nextTaskId === session.active_task_id) return;
+  const current = db.prepare("SELECT status FROM tasks WHERE id = ?")
+    .get(session.active_task_id) as { status: string } | undefined;
+  if (current && IN_FLIGHT_TASK_STATUSES.includes(current.status)) {
+    throw new Error("Terminal is busy with its active task");
+  }
+}
+
 export interface TerminalBindingInput {
   goalId?: string | null;
   agentId?: string | null;
@@ -82,7 +101,11 @@ export function bindTerminalSession(
       throw new Error("Task is assigned to another agent");
     }
     if (!agentId && task.assignee_id) agentId = task.assignee_id;
+    if (taskId !== session.active_task_id && taskBoundToOtherTerminal(db, taskId, terminalId)) {
+      throw new Error("Task is already bound to another terminal");
+    }
   }
+  assertTerminalNotBusy(db, session, taskId);
 
   const update = db.transaction(() => {
     db.prepare(`
@@ -120,34 +143,57 @@ function dependenciesDone(db: Database, task: TaskRow): boolean {
 export function claimNextTerminalTask(
   db: Database,
   terminalId: string,
-  input: Omit<TerminalBindingInput, "taskId"> = {},
+  input: TerminalBindingInput = {},
 ): Record<string, unknown> {
   const session = activeSessionRow(db, terminalId);
-  const goalId = input.goalId ?? session.goal_id;
+  const requestedTaskId = input.taskId ?? null;
+  let goalId = input.goalId ?? session.goal_id;
   const agentId = input.agentId === undefined ? session.agent_id : input.agentId;
   const provider = input.provider === undefined ? session.provider : normalizeProvider(input.provider);
-  if (!goalId) throw new Error("Select a goal before claiming a task");
-  recordByProject(db, "goals", goalId, session.project_id);
   if (agentId) recordByProject(db, "agents", agentId, session.project_id);
 
   if (session.active_task_id) {
     const current = recordByProject(db, "tasks", session.active_task_id, session.project_id);
-    if (["in_progress", "in_review", "blocked"].includes(String(current.status))) return current;
+    if (IN_FLIGHT_TASK_STATUSES.includes(String(current.status))) {
+      if (requestedTaskId && requestedTaskId !== session.active_task_id) {
+        throw new Error("Terminal is busy with its active task");
+      }
+      return current;
+    }
   }
 
-  const candidates = db.prepare(`
-    SELECT * FROM tasks
-     WHERE project_id = ? AND goal_id = ? AND status = 'todo'
-       AND parent_task_id IS NULL
-       AND (? IS NULL OR assignee_id IS NULL OR assignee_id = ?)
-       AND id NOT IN (
-         SELECT active_task_id FROM terminal_sessions
-          WHERE status = 'active' AND active_task_id IS NOT NULL AND id != ?
-       )
-     ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
-              sort_order, created_at
-  `).all(session.project_id, goalId, agentId, agentId, terminalId) as TaskRow[];
-  const task = candidates.find((candidate) => dependenciesDone(db, candidate));
+  let task: TaskRow | undefined;
+  if (requestedTaskId) {
+    // 사용자가 목록에서 지목한 태스크를 이 터미널로 수임한다 — 우선순위 큐를 타지 않는다.
+    const requested = recordByProject(db, "tasks", requestedTaskId, session.project_id) as unknown as TaskRow;
+    if (goalId && requested.goal_id !== goalId) throw new Error("Task does not belong to the selected goal");
+    goalId = requested.goal_id;
+    if (agentId && requested.assignee_id && requested.assignee_id !== agentId) {
+      throw new Error("Task is assigned to another agent");
+    }
+    if (requested.status !== "todo") throw new Error("Task is not ready to start");
+    if (taskBoundToOtherTerminal(db, requestedTaskId, terminalId)) {
+      throw new Error("Task is already bound to another terminal");
+    }
+    if (!dependenciesDone(db, requested)) throw new Error("Task has unfinished dependencies");
+    task = requested;
+  } else {
+    if (!goalId) throw new Error("Select a goal before claiming a task");
+    recordByProject(db, "goals", goalId, session.project_id);
+    const candidates = db.prepare(`
+      SELECT * FROM tasks
+       WHERE project_id = ? AND goal_id = ? AND status = 'todo'
+         AND parent_task_id IS NULL
+         AND (? IS NULL OR assignee_id IS NULL OR assignee_id = ?)
+         AND id NOT IN (
+           SELECT active_task_id FROM terminal_sessions
+            WHERE status = 'active' AND active_task_id IS NOT NULL AND id != ?
+         )
+       ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                sort_order, created_at
+    `).all(session.project_id, goalId, agentId, agentId, terminalId) as TaskRow[];
+    task = candidates.find((candidate) => dependenciesDone(db, candidate));
+  }
   if (!task) throw new Error("No ready task is available for this goal and agent");
   const claimedAgentId = agentId ?? task.assignee_id;
 

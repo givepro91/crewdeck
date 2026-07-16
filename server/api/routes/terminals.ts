@@ -72,6 +72,7 @@ export function createTerminalRoutes(ctx: AppContext): Router {
       const task = claimNextTerminalTask(ctx.db, req.params.id, {
         goalId: req.body?.goalId,
         agentId: req.body?.agentId,
+        taskId: req.body?.taskId,
         provider: req.body?.provider,
       });
       // 수임이 DB 상태로 끝나면 터미널의 에이전트는 아무것도 모른다 — 실행 중인

@@ -12,11 +12,13 @@ export function WorkspaceTerminal({
   activeGoalId = null,
   onContextStateChange,
   onSessionChange,
+  onSessionsChange,
 }: {
   workspaceId: string;
   activeGoalId?: string | null;
   onContextStateChange?: (state: TerminalSession["contextState"]) => void;
   onSessionChange?: (session: TerminalSession | null) => void;
+  onSessionsChange?: (sessions: TerminalSession[]) => void;
 }) {
   const { t } = useTranslation();
   const hostRef = useRef<HTMLDivElement>(null);
@@ -41,6 +43,10 @@ export function WorkspaceTerminal({
   useEffect(() => {
     onSessionChange?.(selectedSession);
   }, [onSessionChange, selectedSession]);
+
+  useEffect(() => {
+    onSessionsChange?.(sessions);
+  }, [onSessionsChange, sessions]);
 
   const openTerminal = useCallback(async (forceNew = false) => {
     setError(null);
@@ -245,11 +251,20 @@ export function WorkspaceTerminal({
       if (next) selectSession(next);
       window.setTimeout(() => xtermRef.current?.focus(), 0);
     };
+    // SessionWorkspace가 태스크 착수를 위해 직접 만든 터미널을 탭 목록에 편입한다.
+    const onOpened = (event: Event) => {
+      const terminal = (event as CustomEvent<TerminalSession>).detail;
+      if (terminal.workspaceId !== workspaceId) return;
+      setSessions((current) => [terminal, ...current.filter((session) => session.id !== terminal.id)]);
+      selectSession(terminal);
+    };
     window.addEventListener("crewdeck:terminal-binding", onBinding);
     window.addEventListener("crewdeck:terminal-focus", onFocus);
+    window.addEventListener("crewdeck:terminal-opened", onOpened);
     return () => {
       window.removeEventListener("crewdeck:terminal-binding", onBinding);
       window.removeEventListener("crewdeck:terminal-focus", onFocus);
+      window.removeEventListener("crewdeck:terminal-opened", onOpened);
     };
   }, [selectedSession, sessions, terminalId, workspaceId]);
 
@@ -341,8 +356,17 @@ export function WorkspaceTerminal({
                 className="flex h-full items-center gap-2 px-3"
               >
                 <span className={`h-1.5 w-1.5 rounded-full ${session.status === "active" ? "bg-success" : "bg-faint"}`} />
-                <span>{session.provider ? session.provider === "claude" ? "Claude" : "Codex" : t("terminalTab", { count: session.tabNumber })}</span>
-                {session.agentName && <span className="max-w-24 truncate text-[9px] text-faint">· {session.agentName}</span>}
+                {/* 태스크가 물린 탭은 태스크가 정체성 — 같은 provider·agent 탭끼리 구분되게 한다. */}
+                <span className="max-w-44 truncate">
+                  {session.activeTaskTitle
+                    ?? (session.provider ? providerLabel(session.provider) : t("terminalTab", { count: session.tabNumber }))}
+                </span>
+                {session.activeTaskTitle && session.provider && (
+                  <span className="text-[9px] text-faint">· {providerLabel(session.provider)}</span>
+                )}
+                {!session.activeTaskTitle && session.agentName && (
+                  <span className="max-w-24 truncate text-[9px] text-faint">· {session.agentName}</span>
+                )}
               </button>
               {session.status !== "active" && (
                 <button

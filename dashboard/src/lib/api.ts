@@ -415,7 +415,7 @@ export const api = {
       request<{ status: string; terminalId: string }>(`/terminals/${id}/dismiss`, { method: "POST" }),
     bind: (id: string, data: { goalId?: string | null; agentId?: string | null; taskId?: string | null; provider?: AgentProvider | null }) =>
       request<TerminalSession>(`/terminals/${id}/binding`, { method: "PATCH", body: JSON.stringify(data) }),
-    claimNext: (id: string, data: { goalId?: string | null; agentId?: string | null; provider?: AgentProvider | null }) =>
+    claimNext: (id: string, data: { goalId?: string | null; agentId?: string | null; taskId?: string | null; provider?: AgentProvider | null }) =>
       request<{ task: Record<string, unknown>; terminal: TerminalSession | null; kickoff: TerminalKickoff }>(`/terminals/${id}/claim-next`, { method: "POST", body: JSON.stringify(data) }),
     launch: (id: string, data: { provider: AgentProvider; goalId?: string | null; kickoff?: boolean }) =>
       request<{ status: TerminalLaunchStatus; runningProvider: AgentProvider | null; kickoffSent: boolean; terminal: TerminalSession }>(`/terminals/${id}/launch`, { method: "POST", body: JSON.stringify(data) }),
