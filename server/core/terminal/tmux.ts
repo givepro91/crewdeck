@@ -4,6 +4,11 @@ import { spawn, type IPty } from "node-pty";
 
 const MAX_CAPTURE = 200 * 1024;
 
+// tmux는 LC_ALL > LC_CTYPE > LANG 중 첫 값에 "UTF-8"이 없으면 non-UTF-8 클라이언트로 붙어
+// (client_utf8=0) 한글 같은 멀티바이트를 '_'로 뭉갠다. launchd 기동 시 로케일 env가 아예
+// 없으므로 -u로 UTF-8을 강제한다 — attach(입력·출력)와 capture-pane(스냅샷) 양쪽에 필요하다.
+const UTF8_ARGS = ["-u"];
+
 export interface TmuxCommand {
   command: string;
   args: string[];
@@ -68,6 +73,7 @@ export class TmuxBackend {
   attach(input: Pick<TmuxSessionInput, "runtimeId" | "cwd" | "cols" | "rows" | "env">): IPty {
     return spawn(this.command.command, [
       ...this.command.args,
+      ...UTF8_ARGS,
       "-L", this.socketName,
       "attach-session", "-t", input.runtimeId,
     ], {
@@ -142,6 +148,7 @@ export class TmuxBackend {
   ): string {
     return execFileSync(this.command.command, [
       ...this.command.args,
+      ...UTF8_ARGS,
       "-L", this.socketName,
       ...args,
     ], {

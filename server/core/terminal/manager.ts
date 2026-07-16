@@ -88,9 +88,23 @@ export type TerminalEvent =
     exitCode: number | null;
   } };
 
+const UTF8_LOCALE = "en_US.UTF-8";
+
 function clamp(value: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+/**
+ * PTY 환경에 UTF-8 로케일을 보장한다. launchd로 기동하면 LANG/LC_* 가 아예 없는데,
+ * tmux는 LC_ALL > LC_CTYPE > LANG 중 첫 값에 "UTF-8"이 없으면 non-UTF-8 클라이언트로
+ * 붙어(client_utf8=0) 멀티바이트 입력·출력을 '_'로 뭉갠다. 셸과 claude/codex CLI의
+ * 한글 출력도 같은 이유로 깨진다. 이미 UTF-8이면 사용자 설정을 그대로 둔다.
+ */
+function withUtf8Locale<T extends Record<string, string | undefined>>(env: T): T {
+  const configured = env.LC_ALL ?? env.LC_CTYPE ?? env.LANG;
+  if (configured && /utf-?8/i.test(configured)) return env;
+  return { ...env, LANG: env.LANG ?? UTF8_LOCALE, LC_CTYPE: UTF8_LOCALE };
 }
 
 function toModel(
@@ -175,7 +189,7 @@ export class TerminalManager {
         cwd: row.cwd,
         cols: row.cols,
         rows: row.rows,
-        env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" },
+        env: withUtf8Locale({ ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" }),
       });
       const pid = this.tmux.panePid(row.runtime_id) ?? row.pid;
       this.db.prepare(`
@@ -344,14 +358,14 @@ export class TerminalManager {
     const bridgeToken = this.runtime ? randomBytes(32).toString("hex") : null;
     const bridgeTokenHash = bridgeToken ? createHash("sha256").update(bridgeToken).digest("hex") : null;
     const runtimeDir = this.runtime ? resolve(this.runtime.dataDir, "terminal-runtime") : null;
-    const terminalEnv: Record<string, string | undefined> = {
+    const terminalEnv: Record<string, string | undefined> = withUtf8Locale({
       ...process.env,
       TERM: "xterm-256color",
       COLORTERM: "truecolor",
       CREWDECK_WORKSPACE_ID: workspace.id,
       CREWDECK_PROJECT_ID: workspace.project_id,
       CREWDECK_TERMINAL_ID: id,
-    };
+    });
     if (this.runtime && runtimeDir) {
       terminalEnv.CREWDECK_API_URL = this.runtime.apiBaseUrl;
       terminalEnv.CREWDECK_API_KEY = bridgeToken!;
