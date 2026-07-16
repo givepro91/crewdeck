@@ -82,6 +82,68 @@ describe("goal-bound terminal session", () => {
       .toThrow("Task does not belong to the selected goal");
   });
 
+  it("rejects binding a task that another active terminal already holds", () => {
+    const db = fixture();
+    db.prepare("INSERT INTO terminal_sessions (id, workspace_id, project_id, shell, cwd, status, goal_id, active_task_id) VALUES ('term2', 'w1', 'p1', '/bin/zsh', '.', 'active', 'g1', 't1')").run();
+
+    expect(() => bindTerminalSession(db, "term1", { goalId: "g1", taskId: "t1" }))
+      .toThrow("Task is already bound to another terminal");
+    // 종료된 터미널의 잔존 바인딩은 점유로 치지 않는다.
+    db.prepare("UPDATE terminal_sessions SET status = 'exited' WHERE id = 'term2'").run();
+    expect(() => bindTerminalSession(db, "term1", { goalId: "g1", taskId: "t1" })).not.toThrow();
+  });
+
+  it("refuses to rebind or clear a terminal while its active task is in flight", () => {
+    const db = fixture();
+    bindTerminalSession(db, "term1", { goalId: "g1", agentId: "a1", provider: "claude" });
+    claimNextTerminalTask(db, "term1");
+
+    db.prepare("INSERT INTO tasks (id, goal_id, project_id, title, status, sort_order, depends_on) VALUES ('t3', 'g1', 'p1', 'Another', 'todo', 2, '[]')").run();
+    expect(() => bindTerminalSession(db, "term1", { taskId: "t3" }))
+      .toThrow("Terminal is busy with its active task");
+    expect(() => bindTerminalSession(db, "term1", { goalId: "g1", taskId: null }))
+      .toThrow("Terminal is busy with its active task");
+    // 같은 태스크 유지(goal/provider만 갱신)는 허용 — launch 경로가 이 모양이다.
+    expect(() => bindTerminalSession(db, "term1", { goalId: "g1", provider: "codex" })).not.toThrow();
+    // done이 되면 교체 가능.
+    db.prepare("UPDATE tasks SET status = 'done' WHERE id = 't1'").run();
+    expect(() => bindTerminalSession(db, "term1", { taskId: "t3" })).not.toThrow();
+  });
+
+  it("claims the exact requested task instead of the priority queue", () => {
+    const db = fixture();
+    db.prepare("INSERT INTO tasks (id, goal_id, project_id, title, status, priority, sort_order, depends_on) VALUES ('t3', 'g1', 'p1', 'Urgent', 'todo', 'critical', 2, '[]')").run();
+    bindTerminalSession(db, "term1", { goalId: "g1", agentId: "a1", provider: "claude" });
+
+    const task = claimNextTerminalTask(db, "term1", { taskId: "t1" });
+
+    expect(task).toMatchObject({ id: "t1", status: "in_progress" });
+    expect(db.prepare("SELECT active_task_id FROM terminal_sessions WHERE id = 'term1'").get())
+      .toEqual({ active_task_id: "t1" });
+  });
+
+  it("rejects claiming a task that is not ready or already held elsewhere", () => {
+    const db = fixture();
+    expect(() => claimNextTerminalTask(db, "term1", { taskId: "t0" }))
+      .toThrow("Task is not ready to start");
+
+    db.prepare("INSERT INTO terminal_sessions (id, workspace_id, project_id, shell, cwd, status, goal_id, active_task_id) VALUES ('term2', 'w1', 'p1', '/bin/zsh', '.', 'active', 'g1', 't1')").run();
+    expect(() => claimNextTerminalTask(db, "term1", { taskId: "t1", agentId: "a1" }))
+      .toThrow("Task is already bound to another terminal");
+  });
+
+  it("refuses to claim a different task while the terminal is busy", () => {
+    const db = fixture();
+    bindTerminalSession(db, "term1", { goalId: "g1", agentId: "a1", provider: "claude" });
+    claimNextTerminalTask(db, "term1");
+    db.prepare("INSERT INTO tasks (id, goal_id, project_id, title, status, sort_order, depends_on) VALUES ('t3', 'g1', 'p1', 'Another', 'todo', 2, '[]')").run();
+
+    expect(() => claimNextTerminalTask(db, "term1", { taskId: "t3" }))
+      .toThrow("Terminal is busy with its active task");
+    // 같은 태스크 재요청은 멱등 — 현재 태스크를 그대로 돌려준다.
+    expect(claimNextTerminalTask(db, "term1", { taskId: "t1" })).toMatchObject({ id: "t1", status: "in_progress" });
+  });
+
   it("claims and requests the provider once, then continues idempotently", () => {
     const db = fixture();
     const launches: string[] = [];

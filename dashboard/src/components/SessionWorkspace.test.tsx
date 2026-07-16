@@ -205,6 +205,20 @@ describe("SessionWorkspace orchestration controls", () => {
     expect(await screen.findByRole("button", { name: "Start next task" })).toBeTruthy();
   });
 
+  it("starts the exact task from the task row action", async () => {
+    render(<SessionWorkspace workspaceId="w1" workspaceName="Workspace" goalId="g1" onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Local terminal surface" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+
+    await waitFor(() => expect(mocks.startNext).toHaveBeenCalledWith("term1", {
+      taskId: "t1",
+      goalId: "g1",
+      agentId: "a1",
+      provider: null,
+    }));
+  });
+
   it("prevents duplicate starts while the primary action is pending", async () => {
     let finishStart: ((value: unknown) => void) | undefined;
     mocks.startNext.mockReturnValue(new Promise((resolve) => { finishStart = resolve; }));

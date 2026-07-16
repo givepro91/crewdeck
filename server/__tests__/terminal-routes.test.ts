@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import { createServer, type Server } from "node:http";
+import { mkdtempSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
-import { createTerminalRoutes } from "../api/routes/terminals.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createDatabase, migrate } from "../db/schema.js";
+import { createTerminalRoutes } from "../api/routes/terminals.js";
 
 const servers: Server[] = [];
 const databases: ReturnType<typeof createDatabase>[] = [];
@@ -124,5 +127,44 @@ describe("terminal tab routes", () => {
     expect(db.prepare("SELECT kind FROM terminal_activities ORDER BY rowid").all())
       .toEqual([{ kind: "task_claimed" }, { kind: "provider_launch_requested" }]);
     expect(broadcast).toHaveBeenCalledWith("terminal:activity", expect.objectContaining({ kind: "task_claimed" }));
+  });
+
+  it("starts the exact task requested from the list instead of the priority queue", async () => {
+    const db = createDatabase(":memory:");
+    databases.push(db);
+    migrate(db);
+    db.exec(`
+      INSERT INTO projects (id, name, source, default_provider) VALUES ('p1', 'Project', 'new', 'codex');
+      INSERT INTO agents (id, project_id, name, role, provider) VALUES ('a1', 'p1', 'Coder', 'coder', 'codex');
+      INSERT INTO goals (id, project_id, title, description) VALUES ('g1', 'p1', 'Goal', 'Ship');
+      INSERT INTO workspaces (id, project_id, goal_id, active_goal_id, name, state)
+        VALUES ('w1', 'p1', 'g1', 'g1', 'Workspace', 'ready');
+      INSERT INTO tasks (id, goal_id, project_id, title, status, priority, sort_order)
+        VALUES ('t1', 'g1', 'p1', 'Urgent first', 'todo', 'critical', 0);
+      INSERT INTO tasks (id, goal_id, project_id, title, status, priority, sort_order)
+        VALUES ('t2', 'g1', 'p1', 'Picked from the list', 'todo', 'medium', 1);
+      INSERT INTO terminal_sessions (id, workspace_id, project_id, shell, cwd, goal_id, agent_id, status)
+        VALUES ('term1', 'w1', 'p1', '/bin/zsh', '/tmp', 'g1', 'a1', 'active');
+    `);
+    const write = vi.fn().mockReturnValue(true);
+    const { baseUrl } = await startTaskApi({
+      get: vi.fn().mockReturnValue({
+        id: "term1", workspaceId: "w1", projectId: "p1", status: "active", contextState: "connected",
+      }),
+      write,
+    }, db);
+
+    const response = await fetch(`${baseUrl}/api/terminals/term1/start-next`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ goalId: "g1", taskId: "t2", provider: "codex" }),
+    });
+
+    expect(response.status).toBe(200);
+    const payload = await response.json() as { task: Record<string, unknown> };
+    expect(payload.task).toMatchObject({ id: "t2", status: "in_progress" });
+    expect(db.prepare("SELECT status FROM tasks WHERE id = 't1'").get()).toEqual({ status: "todo" });
+    expect(db.prepare("SELECT active_task_id FROM terminal_sessions WHERE id = 'term1'").get())
+      .toEqual({ active_task_id: "t2" });
   });
 });

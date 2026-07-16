@@ -4,8 +4,9 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { spawn, type IPty } from "node-pty";
-import type { TerminalSession, TerminalSessionStatus } from "../../../shared/types.js";
+import type { AgentProvider, TerminalSession, TerminalSessionStatus } from "../../../shared/types.js";
 import { TERMINAL_AGENT_PROMPT } from "../../../shared/terminal-agent.js";
+import { detectRunningAgent } from "./agent-detect.js";
 import { finishTerminalBridgeAgentRun } from "./bridge.js";
 import { recoverInterruptedTask } from "../recovery.js";
 import { sanitizeReplayOutput, splitTerminalReplies } from "./escape-filter.js";
@@ -723,6 +724,21 @@ codex() {
     }
     terminal.pty.write(data);
     return true;
+  }
+
+  /**
+   * 터미널 foreground에서 실행 중인 에이전트 CLI(claude/codex)를 감지한다.
+   * tmux는 attach 클라이언트가 아니라 pane 셸의 자손을 봐야 한다.
+   */
+  runningAgent(id: string): AgentProvider | null {
+    const row = this.db.prepare(
+      "SELECT status, backend, runtime_id, pid FROM terminal_sessions WHERE id = ?",
+    ).get(id) as Pick<TerminalRow, "status" | "backend" | "runtime_id" | "pid"> | undefined;
+    if (!row || row.status !== "active") return null;
+    const rootPid = row.backend === "tmux" && row.runtime_id
+      ? this.tmux?.panePid(row.runtime_id) ?? null
+      : this.active.get(id)?.pty.pid ?? row.pid;
+    return detectRunningAgent(rootPid);
   }
 
   resize(id: string, colsInput: number, rowsInput: number): boolean {

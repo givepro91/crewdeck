@@ -113,6 +113,7 @@ export function createTerminalRoutes(ctx: AppContext): Router {
       const task = claimNextTerminalTask(ctx.db, req.params.id, {
         goalId: req.body?.goalId,
         agentId: req.body?.agentId,
+        taskId: req.body?.taskId,
         provider: req.body?.provider,
       });
       const terminal = manager.get(req.params.id);
@@ -136,6 +137,7 @@ export function createTerminalRoutes(ctx: AppContext): Router {
       const result = startNextTerminalTask(ctx.db, req.params.id, {
         goalId: req.body?.goalId,
         agentId: req.body?.agentId,
+        taskId: req.body?.taskId,
         provider: req.body?.provider,
       }, (provider) => manager.write(req.params.id, `${provider}\r`));
       const terminal = manager.get(req.params.id);

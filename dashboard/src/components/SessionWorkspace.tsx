@@ -45,6 +45,9 @@ interface WorkspaceTask {
   priority?: string;
 }
 
+/** 터미널이 놓아주면 안 되는 진행 상태 — 이 상태의 터미널에서는 바인딩을 뺏지 않는다. */
+const IN_FLIGHT_STATUSES = ["in_progress", "in_review", "blocked"];
+
 const STATUS_STYLES: Record<string, { dot: string; text: string }> = {
   todo: { dot: "bg-faint", text: "text-muted" },
   pending_approval: { dot: "bg-warning", text: "text-warning" },
@@ -100,6 +103,7 @@ export function SessionWorkspace({
   const { t } = useTranslation();
   const [selectedGoalId, setSelectedGoalId] = useState(goalId);
   const [selectedTerminal, setSelectedTerminal] = useState<TerminalSession | null>(null);
+  const [terminalSessions, setTerminalSessions] = useState<TerminalSession[]>([]);
   const [contextState, setContextState] = useState<TerminalSession["contextState"]>("unknown");
   const [decisions, setDecisions] = useState<TerminalDecision[]>([]);
   const [activities, setActivities] = useState<TerminalActivity[]>([]);
@@ -133,6 +137,12 @@ export function SessionWorkspace({
   const selectedGoalTasks = tasks.filter((item) => item.goal_id === selectedGoalId) as WorkspaceTask[];
   const selectedAgent = projectAgents.find((item) => item.id === selectedAgentId) ?? null;
   const selectedTerminalId = selectedTerminal?.id ?? null;
+  const activeSessions = terminalSessions.filter((item) => item.status === "active");
+  const taskTerminals = new Map(
+    activeSessions
+      .filter((item) => item.activeTaskId)
+      .map((item) => [item.activeTaskId as string, item]),
+  );
   const boundTask = selectedGoalTasks.find((item) => item.id === selectedTerminal?.activeTaskId) ?? null;
   const boundTaskStatus = boundTask?.status ?? selectedTerminal?.activeTaskStatus ?? null;
   const currentReview = reviews.find((item) => item.taskId === selectedTerminal?.activeTaskId) ?? null;
@@ -241,7 +251,10 @@ export function SessionWorkspace({
     if (!workspaceId) return;
     try {
       await api.workspaces.selectGoal(workspaceId, nextGoalId);
-      if (selectedTerminal?.status === "active") {
+      // 진행 중 태스크가 물린 터미널의 바인딩은 목표 전환으로 풀지 않는다 — 보기만 바꾼다.
+      const busy = selectedTerminal?.activeTaskId
+        && IN_FLIGHT_STATUSES.includes(selectedTerminal.activeTaskStatus ?? "");
+      if (selectedTerminal?.status === "active" && !busy) {
         const terminal = await api.terminals.bind(selectedTerminal.id, { goalId: nextGoalId, taskId: null });
         setSelectedTerminal(terminal);
       }
@@ -265,24 +278,69 @@ export function SessionWorkspace({
     }
   };
 
-  const bindTask = async (task: WorkspaceTask, focus = false) => {
-    if (!selectedTerminal) {
-      setActionError(t("workspaceTerminalRequiredForTask"));
+  /** 태스크를 물릴 터미널을 고른다 — 진행 중 태스크가 있는 터미널은 절대 뺏지 않는다. */
+  const resolveTargetTerminal = async (): Promise<TerminalSession> => {
+    const inFlight = (session: TerminalSession) =>
+      session.activeTaskId !== null && IN_FLIGHT_STATUSES.includes(session.activeTaskStatus ?? "");
+    if (selectedTerminal?.status === "active" && !inFlight(selectedTerminal)) return selectedTerminal;
+    const free = activeSessions.find(
+      (session) => session.id !== selectedTerminal?.id
+        && (!session.activeTaskId || session.activeTaskStatus === "done"),
+    );
+    if (free) return free;
+    if (!workspaceId) throw new Error(t("workspaceTerminalRequiredForTask"));
+    const created = await api.terminals.create({ workspaceId, cols: 120, rows: 32, forceNew: true });
+    window.dispatchEvent(new CustomEvent("crewdeck:terminal-opened", { detail: created }));
+    return created;
+  };
+
+  const bindTask = async (task: WorkspaceTask) => {
+    setActionError(null);
+    // 이미 다른 터미널에 물린 태스크는 바인딩을 뺏지 않고 그 탭으로 이동한다.
+    const holder = activeSessions.find((session) => session.activeTaskId === task.id);
+    if (holder) {
+      window.dispatchEvent(new CustomEvent("crewdeck:terminal-focus", { detail: { terminalId: holder.id } }));
       return;
     }
     setActionBusy(`task-${task.id}`);
-    setActionError(null);
     try {
-      const terminal = await api.terminals.bind(selectedTerminal.id, {
+      const target = await resolveTargetTerminal();
+      const terminal = await api.terminals.bind(target.id, {
         goalId: task.goal_id,
         taskId: task.id,
-        agentId: task.assignee_id ?? selectedTerminal.agentId ?? agentId ?? null,
+        agentId: task.assignee_id ?? target.agentId ?? agentId ?? null,
       });
       setSelectedTerminal(terminal);
       window.dispatchEvent(new CustomEvent("crewdeck:terminal-binding", { detail: terminal }));
-      if (focus) window.dispatchEvent(new CustomEvent("crewdeck:terminal-focus", { detail: { terminalId: terminal.id } }));
+      window.dispatchEvent(new CustomEvent("crewdeck:terminal-focus", { detail: { terminalId: terminal.id } }));
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : t("workspaceGoalActionFailed"));
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  /** 목록에서 지목한 태스크를 곧바로 착수한다 — 수임 + provider 실행이 한 호출(start-next)로 끝난다. */
+  const startTask = async (task: WorkspaceTask) => {
+    setActionError(null);
+    setActionBusy(`start-${task.id}`);
+    try {
+      const holder = activeSessions.find((session) => session.activeTaskId === task.id);
+      const target = holder ?? await resolveTargetTerminal();
+      const result = await api.terminals.startNext(target.id, {
+        taskId: task.id,
+        goalId: task.goal_id,
+        agentId: task.assignee_id ?? target.agentId ?? agentId ?? null,
+        provider: target.provider,
+      });
+      if (result.terminal) {
+        setSelectedTerminal(result.terminal);
+        window.dispatchEvent(new CustomEvent("crewdeck:terminal-binding", { detail: result.terminal }));
+      }
+      refresh();
+      window.dispatchEvent(new CustomEvent("crewdeck:terminal-focus", { detail: { terminalId: target.id } }));
+    } catch (cause) {
+      setActionError(cause instanceof Error ? cause.message : t("workspaceNoReadyTask"));
     } finally {
       setActionBusy(null);
     }
@@ -580,25 +638,49 @@ export function SessionWorkspace({
                 <div className="space-y-1.5">
                   {taskOrder.map((task, index) => {
                     const assignee = projectAgents.find((item) => item.id === task.assignee_id);
-                    const bound = selectedTerminal?.activeTaskId === task.id;
+                    const boundSession = taskTerminals.get(task.id) ?? null;
+                    const boundToSelected = boundSession !== null && boundSession.id === selectedTerminal?.id;
                     return (
-                      <button
+                      <div
                         key={task.id}
-                        type="button"
-                        onClick={() => { setCompactPanel(null); void bindTask(task); }}
-                        className={`group w-full rounded-md border px-2.5 py-2 text-left transition-colors ${bound ? "border-accent/60 bg-accent/10" : "border-transparent bg-fg/[0.025] hover:border-line hover:bg-fg/[0.04]"}`}
+                        className={`group flex w-full items-stretch rounded-md border transition-colors ${boundToSelected ? "border-accent/60 bg-accent/10" : boundSession ? "border-line bg-fg/[0.04]" : "border-transparent bg-fg/[0.025] hover:border-line hover:bg-fg/[0.04]"}`}
                       >
-                        <div className="flex items-start gap-2">
-                          <span className="mt-0.5 text-sm">{statusIcon(task.status)}</span>
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-1.5"><span className="font-mono text-[9px] text-faint">{String(index + 1).padStart(2, "0")}</span><span className="truncate text-[11px] font-medium text-fg">{task.title}</span></div>
-                            <div className="mt-1 flex items-center justify-between gap-2">
-                              <span className="truncate text-[9px] text-faint">{assignee?.name ?? t("workspaceUnassigned")}</span>
-                              <span className={`text-[9px] ${STATUS_STYLES[task.status]?.text ?? "text-muted"}`}>{t(`taskStatus_${task.status}`)}</span>
+                        <button
+                          type="button"
+                          onClick={() => { setCompactPanel(null); void bindTask(task); }}
+                          title={boundSession ? t("workspaceTaskBoundTab", { tab: t("terminalTab", { count: boundSession.tabNumber }) }) : undefined}
+                          className="min-w-0 flex-1 px-2.5 py-2 text-left"
+                        >
+                          <div className="flex items-start gap-2">
+                            <span className="mt-0.5 text-sm">{statusIcon(task.status)}</span>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono text-[9px] text-faint">{String(index + 1).padStart(2, "0")}</span>
+                                <span className="truncate text-[11px] font-medium text-fg">{task.title}</span>
+                                {boundSession && (
+                                  <span className={`flex shrink-0 items-center gap-0.5 rounded px-1 font-mono text-[8px] ${boundToSelected ? "bg-accent/15 text-accent" : "bg-fg/10 text-muted"}`}>
+                                    <TerminalWindow size={9} />{boundSession.tabNumber}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="mt-1 flex items-center justify-between gap-2">
+                                <span className="truncate text-[9px] text-faint">{assignee?.name ?? t("workspaceUnassigned")}</span>
+                                <span className={`text-[9px] ${STATUS_STYLES[task.status]?.text ?? "text-muted"}`}>{t(`taskStatus_${task.status}`)}</span>
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      </button>
+                        </button>
+                        {task.status === "todo" && (
+                          <button
+                            type="button"
+                            onClick={() => void startTask(task)}
+                            disabled={actionBusy !== null}
+                            className="mr-2 hidden shrink-0 items-center gap-1 self-center rounded-md border border-accent/40 px-2 py-1 text-[9px] font-medium text-accent hover:bg-accent/10 disabled:opacity-40 group-hover:flex"
+                          >
+                            {actionBusy === `start-${task.id}` ? <SpinnerGap size={10} className="animate-spin" /> : t("workspaceStartTask")}
+                          </button>
+                        )}
+                      </div>
                     );
                   })}
                   {taskOrder.length === 0 && <div className="rounded-md border border-dashed border-line p-4 text-center text-[10px] leading-5 text-faint">{t("workspaceNoTasksHint")}</div>}
@@ -650,6 +732,7 @@ export function SessionWorkspace({
                     activeGoalId={selectedGoalId}
                     onContextStateChange={setContextState}
                     onSessionChange={setSelectedTerminal}
+                    onSessionsChange={setTerminalSessions}
                   />
                 ) : (
                   <div className="flex h-full items-center justify-center bg-terminal text-xs text-terminal-muted">{t("terminalWorkspaceRequired")}</div>
@@ -700,7 +783,7 @@ export function SessionWorkspace({
                     return (
                       <article key={task.id} className="rounded-lg border border-danger/25 bg-danger/[0.04] p-3">
                         <div className="flex items-start gap-2"><WarningCircle size={15} weight="fill" className="mt-0.5 shrink-0 text-danger" /><div className="min-w-0"><h3 className="text-[11px] font-semibold text-fg">{task.title}</h3><p className="mt-1 text-[9px] leading-4 text-muted">{task.result_summary || task.description || t("workspaceBlockedFallback")}</p></div></div>
-                        <div className="mt-2 flex items-center justify-between border-t border-danger/15 pt-2"><span className="text-[9px] text-faint">{assignee?.name ?? t("workspaceUnassigned")}</span><button type="button" onClick={() => { setCompactPanel(null); void bindTask(task, true); }} className="flex items-center gap-1 rounded-md bg-danger px-2 py-1.5 text-[9px] font-semibold text-white hover:bg-danger/90"><TerminalWindow size={12} />{t("workspaceResolveWithAgent")}</button></div>
+                        <div className="mt-2 flex items-center justify-between border-t border-danger/15 pt-2"><span className="text-[9px] text-faint">{assignee?.name ?? t("workspaceUnassigned")}</span><button type="button" onClick={() => { setCompactPanel(null); void bindTask(task); }} className="flex items-center gap-1 rounded-md bg-danger px-2 py-1.5 text-[9px] font-semibold text-white hover:bg-danger/90"><TerminalWindow size={12} />{t("workspaceResolveWithAgent")}</button></div>
                       </article>
                     );
                   })}
