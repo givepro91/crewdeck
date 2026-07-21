@@ -2914,11 +2914,24 @@ export function createScheduler(
     // execution_mode='pty' 프로젝트의 태스크 실행은 터미널 자동 전진 드라이버가 소유한다.
     // 헤드리스 dispatch 와 겹치면 같은 태스크가 두 경로에서 두 번 실행된다.
     // (goal spec/decompose 는 위에서 이미 처리됐으므로 그대로 유지되고, 실행만 넘긴다.)
+    //
+    // 단, 드라이버가 굴러갈 PTY 레인(활성 터미널 + goal 이 걸린 workspace)이 없으면 넘기지
+    // 않고 헤드리스로 실행한다. 넘기기만 하면 아무도 태스크를 밀지 않아 프로젝트가 통째로
+    // 멈춘다 — pty 를 켜두고 워크스페이스를 닫아둔 상태가 정확히 그 경우다.
     const executionMode = db.prepare("SELECT execution_mode FROM projects WHERE id = ?")
       .get(projectId) as { execution_mode?: string } | undefined;
     if (executionMode?.execution_mode === "pty") {
-      scheduleNextPoll(projectId);
-      return;
+      const lane = db.prepare(`
+        SELECT COUNT(*) AS n
+          FROM terminal_sessions ts
+          JOIN workspaces w ON w.id = ts.workspace_id
+         WHERE ts.project_id = ? AND ts.status = 'active' AND w.active_goal_id IS NOT NULL
+      `).get(projectId) as { n: number };
+      if (lane.n > 0) {
+        scheduleNextPoll(projectId);
+        return;
+      }
+      log.debug(`pty mode without an active terminal lane — falling back to headless dispatch (${projectId})`);
     }
 
     // Launch all picked tasks in parallel (fire-and-forget, each manages its own lifecycle)
