@@ -29,6 +29,7 @@ import { createTerminalActivityRoutes } from "./api/routes/terminal-activity.js"
 import { createWSHandler } from "./api/websocket.js";
 import { TerminalManager, type TerminalCommand } from "./core/terminal/manager.js";
 import { reconcileInterruptedTerminalReviews } from "./core/terminal/review-loop.js";
+import { createTerminalAutoAdvance } from "./core/terminal/auto-advance.js";
 import { agentActivityLog } from "./core/agent/activity-log.js";
 import { readLatestCodexRateLimits } from "./core/agent/codex-usage.js";
 import { flushVerificationBroadcastOutbox } from "./core/quality-gate/outbox.js";
@@ -357,6 +358,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
     mcpCommand: terminalBridgeCommand("crewdeck-mcp"),
   });
   const ctx: AppContext = { db, wss, broadcast, terminalManager };
+  let autoAdvance: ReturnType<typeof createTerminalAutoAdvance> | null = null;
 
   // Wire the agent activity ring buffer to WebSocket (throttled to 1/sec per agent)
   agentActivityLog.setBroadcaster(broadcast);
@@ -416,6 +418,15 @@ export async function startServer(config: ServerConfig): Promise<void> {
     // 이후 주기적으로 — 태스크를 done 으로 만드는 경로(REST·터미널 브리지·review-loop)는
     // scheduler 큐 밖에서도 일어나므로 큐 poll 에 얹을 수 없다. unref 로 프로세스 종료는 막지 않는다.
     setInterval(sweep, GOAL_SQUASH_SWEEP_INTERVAL_MS).unref();
+  }
+
+  // 터미널 파이프라인 자동 전진 — execution_mode='pty' 프로젝트에서만 동작한다.
+  // 에이전트가 실제 PTY(TUI)에서 일하고 브리지로 in_review 를 보고하면 게이트를 돌리고,
+  // done 이면 같은 에이전트의 다음 태스크를 착수한다. 헤드리스 스케줄러는 pty 프로젝트의
+  // 태스크 실행을 건너뛰므로(scheduler 가드) 이중 실행되지 않는다.
+  if (ctx.sessionManager) {
+    autoAdvance = createTerminalAutoAdvance(db, terminalManager, ctx.sessionManager, broadcast);
+    autoAdvance.start();
   }
 
   // Health check
@@ -575,6 +586,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
     if (ctx.sessionManager) {
       ctx.sessionManager.killAll();
     }
+    autoAdvance?.stop();
     ctx.terminalManager?.killAll();
 
     // 2. 스케줄러 정지: 모든 active 프로젝트 큐 중단

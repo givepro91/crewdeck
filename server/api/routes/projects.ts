@@ -161,7 +161,7 @@ export function createProjectRoutes(ctx: AppContext): Router {
   // Update project
   router.patch("/:id", (req, res) => {
     // Accept both `github_config` (snake_case) and `github` (camelCase from dashboard)
-    const { name, mission, status, workdir: rawWorkdir, tech_stack, autopilot, dev_port, base_branch, default_provider, max_concurrency } = req.body;
+    const { name, mission, status, workdir: rawWorkdir, tech_stack, autopilot, dev_port, base_branch, default_provider, max_concurrency, execution_mode } = req.body;
     const github_config = req.body.github_config ?? req.body.github;
 
     // max_concurrency: goal 병렬 상한 (null = 전역 CREWDECK_MAX_CONCURRENCY 상속, 1..16 = 지정)
@@ -175,6 +175,11 @@ export function createProjectRoutes(ctx: AppContext): Router {
     // default_provider: 프로젝트 기본 실행 백엔드 (null = 전역 기본 상속)
     if (default_provider !== undefined && default_provider !== null && !["claude", "codex"].includes(default_provider)) {
       return res.status(400).json({ error: "Invalid default_provider. Must be one of: claude, codex (or null to inherit global)" });
+    }
+
+    // execution_mode: 'headless'(무인 stream-json 기본) | 'pty'(goal을 터미널에서 실행, 실시간 TUI 관찰)
+    if (execution_mode !== undefined && !["headless", "pty"].includes(execution_mode)) {
+      return res.status(400).json({ error: "Invalid execution_mode. Must be one of: headless, pty" });
     }
 
     // base_branch: squash/PR 반영 대상 브랜치 — 안전한 브랜치명만 허용
@@ -233,6 +238,10 @@ export function createProjectRoutes(ctx: AppContext): Router {
     const concClause = max_concurrency !== undefined ? "max_concurrency = ?," : "";
     const concParams = max_concurrency !== undefined ? [max_concurrency === null ? null : Number(max_concurrency)] : [];
 
+    // execution_mode: undefined = 변경 없음, 'headless'|'pty' = 지정
+    const execClause = execution_mode !== undefined ? "execution_mode = ?," : "";
+    const execParams = execution_mode !== undefined ? [execution_mode] : [];
+
     db.prepare(`
       UPDATE projects SET
         name = COALESCE(?, name),
@@ -246,6 +255,7 @@ export function createProjectRoutes(ctx: AppContext): Router {
         ${devPortClause}
         ${provClause}
         ${concClause}
+        ${execClause}
         updated_at = datetime('now')
       WHERE id = ?
     `).run(
@@ -260,6 +270,7 @@ export function createProjectRoutes(ctx: AppContext): Router {
       ...devPortParams,
       ...provParams,
       ...concParams,
+      ...execParams,
       req.params.id,
     );
 

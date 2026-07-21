@@ -2911,6 +2911,16 @@ export function createScheduler(
       return;
     }
 
+    // execution_mode='pty' 프로젝트의 태스크 실행은 터미널 자동 전진 드라이버가 소유한다.
+    // 헤드리스 dispatch 와 겹치면 같은 태스크가 두 경로에서 두 번 실행된다.
+    // (goal spec/decompose 는 위에서 이미 처리됐으므로 그대로 유지되고, 실행만 넘긴다.)
+    const executionMode = db.prepare("SELECT execution_mode FROM projects WHERE id = ?")
+      .get(projectId) as { execution_mode?: string } | undefined;
+    if (executionMode?.execution_mode === "pty") {
+      scheduleNextPoll(projectId);
+      return;
+    }
+
     // Launch all picked tasks in parallel (fire-and-forget, each manages its own lifecycle)
     for (const task of tasks) {
       // Reserve the goal lane before any asynchronous setup/spawn work. This

@@ -26,6 +26,7 @@ export function migrate(db: Database.Database): void {
       status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'paused')),
       autopilot TEXT NOT NULL DEFAULT 'off' CHECK (autopilot IN ('off', 'goal', 'full')),
       queue_stopped INTEGER NOT NULL DEFAULT 0,
+      execution_mode TEXT NOT NULL DEFAULT 'headless' CHECK (execution_mode IN ('headless', 'pty')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -435,6 +436,12 @@ export function migrate(db: Database.Database): void {
   const projectColsProv = db.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
   if (!projectColsProv.some((c) => c.name === "default_provider")) {
     db.exec("ALTER TABLE projects ADD COLUMN default_provider TEXT");
+  }
+
+  // execution_mode on projects — 'headless'(기본, stream-json 무인) | 'pty'(터미널 실행, 실시간 TUI 관찰)
+  const projectColsExec = db.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
+  if (!projectColsExec.some((c) => c.name === "execution_mode")) {
+    db.exec("ALTER TABLE projects ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'headless'");
   }
 
   // provider on sessions — 세션이 실제 돈 백엔드 (관찰·비용 귀속·failover 추적)
