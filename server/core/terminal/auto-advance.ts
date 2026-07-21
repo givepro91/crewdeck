@@ -158,7 +158,24 @@ export function createTerminalAutoAdvance(
    * 없으면 새로 띄워 바인딩만 해둔 뒤 null 을 돌려준다 — 셸이 준비될 시간을 벌기 위해
    * 착수는 다음 폴 틱으로 미룬다(생성 직후 write 하면 프롬프트가 아직 없을 수 있다).
    */
-  function resolveAgentTerminal(ws: WorkspaceRow, agentId: string): string | null {
+  function resolveAgentTerminal(ws: WorkspaceRow, agentId: string, taskId: string): string | null {
+    // 고른 태스크를 이미 쥐고 있는 활성 터미널이 있으면 그 터미널에서 착수한다.
+    // 유휴 판정은 태스크 기준(done/skipped)인데 nextReadyTask 는 todo 를 고르므로,
+    // todo 태스크를 쥔 터미널은 '유휴 아님'이면서 그 태스크는 '다음 착수 대상'이 된다.
+    // 그대로 두면 다른 유휴 터미널로 라우팅해 startNextTerminalTask 가
+    // "Task is already bound to another terminal" 로 거부하고, 5초마다 같은 실패가
+    // 영원히 반복된다(실측: 워크스페이스 하나가 2684회 경고 후에도 전진 못 함).
+    const holder = db.prepare(`
+      SELECT id, agent_id FROM terminal_sessions
+       WHERE workspace_id = ? AND status = 'active' AND active_task_id = ?
+       LIMIT 1
+    `).get(ws.workspace_id, taskId) as { id: string; agent_id: string | null } | undefined;
+    if (holder) {
+      // 담당자가 다른 터미널이 쥐고 있으면 어디로 라우팅해도 거부된다 — 조용히 넘긴다.
+      // (에러를 던져봐야 폴 틱마다 같은 로그만 쌓인다.)
+      return !holder.agent_id || holder.agent_id === agentId ? holder.id : null;
+    }
+
     // 이 에이전트에 이미 바인딩된 유휴 터미널을 최우선으로, 없으면 아직 에이전트가 안 붙은
     // 유휴 터미널을 입양한다. 입양 경로가 없으면 사용자가 방금 연 빈 터미널을 못 알아보고
     // 매번 새 터미널을 띄우게 된다(실측된 중복 생성 원인).
@@ -203,7 +220,7 @@ export function createTerminalAutoAdvance(
       return;
     }
 
-    const terminalId = resolveAgentTerminal(ws, next.assignee_id);
+    const terminalId = resolveAgentTerminal(ws, next.assignee_id, next.id);
     if (!terminalId) return; // 방금 띄운 터미널 — 다음 틱에 착수
 
     const terminal = manager.get(terminalId);
