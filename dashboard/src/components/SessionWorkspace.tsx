@@ -353,12 +353,10 @@ export function SessionWorkspace({
     }
   };
 
-  /** 작업 중 태스크의 담당 에이전트 라이브 세션을 우측 '관찰' 탭에서 연다.
-   *  좁은 화면에선 우측 드로어를 함께 연다(xl에선 이미 상시 노출 — Escape 흐름 보존). */
-  const openLiveAgent = (task: WorkspaceTask) => {
-    if (!task.assignee_id) return;
-    const assignee = projectAgents.find((item) => item.id === task.assignee_id);
-    setLiveAgent({ id: task.assignee_id, name: assignee?.name ?? t("workspaceUnassigned"), task: task.title });
+  /** 지금 이 태스크에서 실제로 working 인 에이전트(구현자든 검토자든)의 라이브 세션을
+   *  우측 '관찰' 탭에서 연다. 좁은 화면에선 우측 드로어를 함께 연다(xl은 이미 상시 노출 — Escape 흐름 보존). */
+  const openLiveAgent = (agent: { id: string; name: string }, task: WorkspaceTask) => {
+    setLiveAgent({ id: agent.id, name: agent.name, task: task.title });
     setLiveSelectToken((token) => token + 1);
     setRightPane("inspector");
     const wideViewport = typeof window.matchMedia === "function" && window.matchMedia("(min-width: 1280px)").matches;
@@ -691,6 +689,8 @@ export function SessionWorkspace({
                 <div className="space-y-1.5">
                   {taskOrder.map((task, index) => {
                     const assignee = projectAgents.find((item) => item.id === task.assignee_id);
+                    // 상태(in_progress/in_review 등)와 무관하게, 지금 이 태스크에서 실제로 도는 에이전트.
+                    const workingAgent = projectAgents.find((item) => item.current_task_id === task.id && item.status === "working");
                     const boundSession = taskTerminals.get(task.id) ?? null;
                     const boundToSelected = boundSession !== null && boundSession.id === selectedTerminal?.id;
                     return (
@@ -733,10 +733,10 @@ export function SessionWorkspace({
                             {actionBusy === `start-${task.id}` ? <SpinnerGap size={10} className="animate-spin" /> : t("workspaceStartTask")}
                           </button>
                         )}
-                        {task.status === "in_progress" && task.assignee_id && (
+                        {workingAgent && (
                           <button
                             type="button"
-                            onClick={() => openLiveAgent(task)}
+                            onClick={() => openLiveAgent(workingAgent, task)}
                             title={t("workspaceWatchLive")}
                             className="mr-2 flex shrink-0 items-center gap-1 self-center rounded-md border border-accent/40 px-2 py-1 text-[9px] font-medium text-accent hover:bg-accent/10"
                           >
