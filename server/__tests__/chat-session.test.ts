@@ -18,7 +18,15 @@ describe('resolveChatSession', () => {
     const r = resolveChatSession(deps, 'agent-1', '/repo');
     expect(r).toEqual({ session: spawned, reused: false });
     // 채팅 세션은 task에 묶이지 않으므로 taskId(4번째 인자)는 undefined로 전달된다.
-    expect(deps.spawnAgent).toHaveBeenCalledWith('agent-1', '/repo', 'chat-agent-1', undefined);
+    // resumeFromHistory: 채팅만 과거 대화 재개를 opt-in 한다(단발 호출은 기본 fresh).
+    expect(deps.spawnAgent).toHaveBeenCalledWith(
+      'agent-1',
+      '/repo',
+      'chat-agent-1',
+      undefined,
+      undefined,
+      { resumeFromHistory: true },
+    );
   });
 
   it('reuses an existing idle session (resume path)', () => {
@@ -50,7 +58,7 @@ describe('resolveChatSession', () => {
       'workspace-workspace-1-chat-agent-1',
       'task-1',
       undefined,
-      undefined,
+      { resumeFromHistory: true },
       { workspaceId: 'workspace-1', origin: 'terminal' },
     );
   });

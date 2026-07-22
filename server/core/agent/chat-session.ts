@@ -43,6 +43,9 @@ export function resolveChatSession(
     return { session: existing, reused: true };
   }
   // 새 spawn 시에만 taskId를 전달 → session.ts가 소환 컨텍스트를 시스템 프롬프트에 주입.
+  // resumeFromHistory: 채팅은 연속성이 곧 기능이라 과거 대화 재개를 opt-in 한다(단발
+  // 오케스트레이션 호출은 기본 fresh). keep-alive 가 살아 있는 동안은 위에서 재사용되므로,
+  // 이 플래그가 실제로 쓰이는 건 세션이 끊긴 뒤(서버 재시작 등) 첫 턴이다.
   const session = workspaceId
     ? deps.spawnAgent(
         agentId,
@@ -50,9 +53,9 @@ export function resolveChatSession(
         key,
         taskId,
         undefined,
-        undefined,
+        { resumeFromHistory: true },
         { workspaceId, origin: "terminal" },
       )
-    : deps.spawnAgent(agentId, workdir, key, taskId);
+    : deps.spawnAgent(agentId, workdir, key, taskId, undefined, { resumeFromHistory: true });
   return { session, reused: false };
 }
