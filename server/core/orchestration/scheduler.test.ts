@@ -227,3 +227,86 @@ describe("scheduler DAG dependency gate", () => {
     expect(spawnAgent).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * pty 프로젝트인데 터미널 레인이 없으면 스케줄러가 헤드리스로 폴백한다(프로젝트가 통째로
+ * 멈추는 걸 막는 안전장치). 그 폴백이 조용하면 사용자는 '터미널에서 실행'으로 설정해 두고
+ * 터미널 화면을 보는데 실제 실행은 백그라운드로 가고, 그 사실이 어디에도 안 보인다 —
+ * 2026-07-22 라이브에서 정확히 이 상태가 "PTY 모드인데 빈 터미널"로 관측됐다.
+ */
+describe("pty headless fallback visibility", () => {
+  let db: Database.Database;
+  let scheduler: ReturnType<typeof createScheduler>;
+  const projectId = "pty-fallback-project";
+
+  function fallbackActivities(): number {
+    return (db.prepare(
+      "SELECT COUNT(*) AS n FROM activities WHERE project_id = ? AND message LIKE '%백그라운드로 실행%'",
+    ).get(projectId) as { n: number }).n;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    db = createDatabase(":memory:");
+    migrate(db);
+    db.prepare(
+      "INSERT INTO projects (id, name, source, execution_mode) VALUES (?, 'Project', 'new', 'pty')",
+    ).run(projectId);
+    db.prepare("INSERT INTO agents (id, project_id, name, role) VALUES ('pty-agent', ?, 'Builder', 'backend')")
+      .run(projectId);
+    db.prepare("INSERT INTO goals (id, project_id, title, description) VALUES ('pty-goal', ?, 'Goal', 'Fallback')")
+      .run(projectId);
+    db.prepare(
+      `INSERT INTO tasks (id, goal_id, project_id, title, status, assignee_id, depends_on)
+       VALUES ('pty-task', 'pty-goal', ?, 'Implement', 'todo', 'pty-agent', '[]')`,
+    ).run(projectId);
+    const sessionManager = {
+      spawnAgent: vi.fn(),
+      getSession: vi.fn(() => undefined),
+      getSessionRecord: vi.fn(() => undefined),
+      killSession: vi.fn(),
+      killAll: vi.fn(),
+      pauseSession: vi.fn(),
+      resumeSession: vi.fn(),
+      setProviderOverride: vi.fn(),
+      clearProviderOverride: vi.fn(),
+    } as unknown as SessionManager;
+    scheduler = createScheduler(db, sessionManager, () => {});
+  });
+
+  afterEach(() => {
+    scheduler.stopQueue(projectId);
+    db.close();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("tells the user once when it falls back to headless with no terminal lane", async () => {
+    scheduler.startQueue(projectId);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(fallbackActivities()).toBe(1);
+
+    // 폴마다 같은 경고를 쌓지 않는다 — 상태가 바뀔 때만 알린다.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(fallbackActivities()).toBe(1);
+  });
+
+  it("stays silent while a terminal lane owns execution", async () => {
+    db.prepare(`
+      INSERT INTO workspaces (id, project_id, goal_id, active_goal_id, name, kind, state, worktree_path, worktree_branch)
+      VALUES ('pty-ws', ?, 'pty-goal', 'pty-goal', 'WS', 'goal', 'ready', '/tmp/pty-ws', 'workspace/pty-goal')
+    `).run(projectId);
+    db.prepare(`
+      INSERT INTO terminal_sessions (id, workspace_id, project_id, shell, cwd, status, goal_id)
+      VALUES ('pty-term', 'pty-ws', ?, '/bin/zsh', '/tmp/pty-ws', 'active', 'pty-goal')
+    `).run(projectId);
+
+    scheduler.startQueue(projectId);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    // 터미널 드라이버가 실행을 소유하므로 폴백이 아니다 — 경고도, 헤드리스 dispatch 도 없다.
+    expect(fallbackActivities()).toBe(0);
+    expect(db.prepare("SELECT status FROM tasks WHERE id = 'pty-task'").get()).toEqual({ status: "todo" });
+  });
+});

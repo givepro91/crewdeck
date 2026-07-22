@@ -93,6 +93,23 @@ describe("goal-bound terminal session", () => {
     expect(() => bindTerminalSession(db, "term1", { goalId: "g1", taskId: "t1" })).not.toThrow();
   });
 
+  it("rejects binding a task that a headless session is running", () => {
+    const db = fixture();
+    // PTY 레인이 없으면 스케줄러가 헤드리스로 폴백한다. 그 상태에서 진행 중 태스크를 클릭하면
+    // UI 가 빈 터미널을 만들어 물리는데, 실행 주체는 백그라운드라 그 터미널엔 CLI 가 없다 —
+    // 소유자가 둘이 되는 순간 무출력이 스톨로 오판돼 멀쩡한 태스크가 blocked 로 뒤집혔다.
+    db.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = 't1'").run();
+    db.prepare(
+      "INSERT INTO sessions (id, agent_id, task_id, status, origin) VALUES ('s1', 'a1', 't1', 'active', 'orchestration')",
+    ).run();
+
+    expect(() => bindTerminalSession(db, "term1", { goalId: "g1", taskId: "t1" }))
+      .toThrow("Task is running in the background");
+    // 그 실행이 끝나면 평소대로 붙일 수 있다.
+    db.prepare("UPDATE sessions SET status = 'completed', ended_at = datetime('now') WHERE id = 's1'").run();
+    expect(() => bindTerminalSession(db, "term1", { goalId: "g1", taskId: "t1" })).not.toThrow();
+  });
+
   it("refuses to rebind or clear a terminal while its active task is in flight", () => {
     const db = fixture();
     bindTerminalSession(db, "term1", { goalId: "g1", agentId: "a1", provider: "claude" });

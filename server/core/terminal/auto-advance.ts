@@ -357,11 +357,24 @@ export function createTerminalAutoAdvance(
       await advanceReview(row.terminal_id, ws.project_id, row.task_id);
     }
     // 2) 응답이 끊긴 채 진행 중인 태스크를 사람에게 넘긴다 — PTY 의 유일한 타임아웃.
+    //
+    // 무출력은 "이 터미널이 그 태스크를 집행 중"일 때만 정지 신호다. 바인딩만 보고 판정하면
+    // 두 종류의 터미널이 오탐에 걸린다(2026-07-22 라이브 실측: 멀쩡히 돌던 태스크 2건이
+    // blocked 로 뒤집혔고, 스케줄러 자동 재시도가 그걸 todo 로 되돌려 중복 착수 직전까지 갔다):
+    //   - provider IS NULL — 에이전트 CLI 를 한 번도 띄운 적 없는 터미널. 진행 중 태스크를
+    //     클릭하면 UI 가 빈 셸을 만들어 바인딩하는데(SessionWorkspace), 셸은 영원히 무출력이다.
+    //   - 헤드리스 세션이 그 태스크를 소유 — PTY 레인이 없어 스케줄러가 폴백한 상태(scheduler).
+    //     실행은 백그라운드에서 정상 진행 중인데 터미널만 조용하다.
     const running = db.prepare(`
       SELECT ts.id AS terminal_id, ts.active_task_id AS task_id
         FROM terminal_sessions ts
         JOIN tasks t ON t.id = ts.active_task_id
        WHERE ts.workspace_id = ? AND ts.status = 'active' AND t.status = 'in_progress'
+         AND ts.provider IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM sessions s
+            WHERE s.task_id = t.id AND s.status = 'active' AND s.origin = 'orchestration'
+         )
     `).all(ws.workspace_id) as Array<{ terminal_id: string; task_id: string }>;
     for (const row of running) {
       const idleMs = manager.outputIdleMs(row.terminal_id);

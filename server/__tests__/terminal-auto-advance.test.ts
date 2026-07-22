@@ -138,6 +138,9 @@ describe("terminal auto-advance", () => {
     // 에이전트 CLI 가 입력 대기(신뢰 온보딩·로그인 만료 등)에 걸린 상태 — 프로세스는 살아 있어
     // runningAgent() 는 '정상 실행 중'으로 보고, 화면이 정지해 출력만 끊긴다.
     db.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = 'tNext'").run();
+    // 실물에선 startNextTerminalTask 가 착수와 함께 provider 를 남긴다 — 그게 "이 터미널이
+    // 이 태스크를 집행 중"이라는 표식이고, 스톨 판정은 그 표식이 있을 때만 성립한다.
+    db.prepare("UPDATE terminal_sessions SET provider = 'claude' WHERE id = 'termHolder'").run();
     const { driver, writes } = driverFor(db, { runningAgent: "codex", outputIdleMs: 11 * 60_000 });
     vi.useFakeTimers();
 
@@ -157,6 +160,43 @@ describe("terminal auto-advance", () => {
     db.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = 'tNext'").run();
     // 긴 빌드·테스트 중에도 TUI 는 스피너와 경과시간을 갱신하므로 출력이 이어진다.
     const { driver } = driverFor(db, { runningAgent: "codex", outputIdleMs: 30_000 });
+    vi.useFakeTimers();
+
+    driver.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+    driver.stop();
+
+    expect(db.prepare("SELECT status FROM tasks WHERE id = 'tNext'").get()).toEqual({ status: "in_progress" });
+  });
+
+  it("does not stall-block a task whose terminal never launched an agent CLI", async () => {
+    const db = fixture();
+    // 사용자가 진행 중 태스크를 클릭하면 UI 가 새 터미널을 만들어 바인딩한다. goal 이 이미
+    // 점유돼 있으면 드라이버는 착수하지 않으므로 그 터미널엔 CLI 가 없고(provider NULL),
+    // 빈 셸은 영원히 무출력이다 — 이걸 스톨로 세면 멀쩡한 태스크가 blocked 로 뒤집힌다.
+    db.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = 'tNext'").run();
+    const { driver } = driverFor(db, { outputIdleMs: 30 * 60_000 });
+    vi.useFakeTimers();
+
+    driver.start();
+    await vi.advanceTimersByTimeAsync(5_000);
+    driver.stop();
+
+    expect(db.prepare("SELECT status FROM tasks WHERE id = 'tNext'").get()).toEqual({ status: "in_progress" });
+  });
+
+  it("does not stall-block a task that a headless session owns", async () => {
+    const db = fixture();
+    // PTY 레인이 없어 스케줄러가 헤드리스로 폴백한 상태(2026-07-22 라이브 실측). 실행은
+    // 백그라운드에서 정상 진행 중인데 터미널만 조용하다 — 터미널 무출력은 이 태스크의
+    // 정지 신호가 아니다.
+    db.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = 'tNext'").run();
+    db.prepare("UPDATE terminal_sessions SET provider = 'claude' WHERE id = 'termHolder'").run();
+    db.prepare(
+      "INSERT INTO sessions (id, agent_id, task_id, status, origin) "
+      + "VALUES ('s1', 'a1', 'tNext', 'active', 'orchestration')",
+    ).run();
+    const { driver } = driverFor(db, { runningAgent: "codex", outputIdleMs: 11 * 60_000 });
     vi.useFakeTimers();
 
     driver.start();

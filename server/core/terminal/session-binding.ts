@@ -62,6 +62,22 @@ function taskBoundToOtherTerminal(db: Database, taskId: string, terminalId: stri
   `).get(taskId, terminalId) !== undefined;
 }
 
+/**
+ * 헤드리스(오케스트레이션) 세션이 이 태스크를 실행 중인가.
+ *
+ * PTY 레인이 없으면 스케줄러가 헤드리스로 폴백한다(scheduler). 그 상태에서 진행 중인
+ * 태스크를 터미널에 물리면 CLI 없는 빈 셸이 태스크를 쥔 것처럼 보이는데 실제 실행은
+ * 백그라운드에서 따로 돌고, 어느 쪽도 상대를 모른다 — 사람 눈엔 "PTY 모드인데 빈 터미널"
+ * 이고 드라이버 눈엔 "무출력 터미널"이라 멀쩡한 태스크가 스톨로 오판된다(2026-07-22 실측).
+ * 소유자가 하나여야 그 혼선이 생기지 않으므로, 실행 중인 쪽이 놓을 때까지 붙이지 않는다.
+ */
+function taskRunningHeadless(db: Database, taskId: string): boolean {
+  return db.prepare(`
+    SELECT 1 FROM sessions
+     WHERE task_id = ? AND status = 'active' AND origin = 'orchestration'
+  `).get(taskId) !== undefined;
+}
+
 function assertTerminalNotBusy(db: Database, session: SessionRow, nextTaskId: string | null): void {
   if (!session.active_task_id || nextTaskId === session.active_task_id) return;
   const current = db.prepare("SELECT status FROM tasks WHERE id = ?")
@@ -104,6 +120,9 @@ export function bindTerminalSession(
     if (!agentId && task.assignee_id) agentId = task.assignee_id;
     if (taskId !== session.active_task_id && taskBoundToOtherTerminal(db, taskId, terminalId)) {
       throw new Error("Task is already bound to another terminal");
+    }
+    if (taskId !== session.active_task_id && taskRunningHeadless(db, taskId)) {
+      throw new Error("Task is running in the background — attach it to a terminal after that run finishes");
     }
   }
   assertTerminalNotBusy(db, session, taskId);
