@@ -836,6 +836,9 @@ export function createScheduler(
   const STUCK_POLL_THRESHOLD = 30; // ~30s of empty polls before warning
   const STUCK_REWARN_MS = 5 * 60 * 1000; // re-warn every 5 min
 
+  /** 헤드리스 폴백을 이미 알린 pty 프로젝트 — 상태가 바뀔 때만 알리기 위한 dedup. */
+  const ptyFallbackNotified = new Set<string>();
+
   /**
    * Explain WHY pickNextTasks is returning nothing even though work exists.
    * Returns a short Korean summary suitable for the activity feed.
@@ -2947,10 +2950,27 @@ export function createScheduler(
          WHERE ts.project_id = ? AND ts.status = 'active' AND w.active_goal_id IS NOT NULL
       `).get(projectId) as { n: number };
       if (lane.n > 0) {
+        ptyFallbackNotified.delete(projectId);
         scheduleNextPoll(projectId);
         return;
       }
-      log.debug(`pty mode without an active terminal lane — falling back to headless dispatch (${projectId})`);
+      // 이 폴백은 조용하면 안 된다. 사용자는 '터미널에서 실행'으로 설정해 두고 터미널 화면을
+      // 보는데 실제 실행은 백그라운드로 간다 — 그 사실이 어디에도 안 보이면 빈 터미널을
+      // 버그로 읽는다(2026-07-22 실측). 상태가 바뀔 때만 한 번 알린다.
+      if (!ptyFallbackNotified.has(projectId)) {
+        ptyFallbackNotified.add(projectId);
+        log.warn(`pty mode without an active terminal lane — falling back to headless dispatch (${projectId})`);
+        try {
+          db.prepare(
+            "INSERT INTO activities (project_id, type, message) VALUES (?, 'autopilot_warning', ?)",
+          ).run(
+            projectId,
+            "🟡 터미널 실행 모드지만 열린 터미널이 없어 백그라운드로 실행합니다"
+            + " — 터미널에서 보려면 작업 화면에서 터미널을 열어두세요",
+          );
+        } catch { /* best-effort */ }
+        broadcast("project:updated", { projectId });
+      }
     }
 
     // Launch all picked tasks in parallel (fire-and-forget, each manages its own lifecycle)
