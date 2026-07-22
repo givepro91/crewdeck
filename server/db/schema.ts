@@ -127,6 +127,7 @@ export function migrate(db: Database.Database): void {
       provider_failover_redispatched_session_id TEXT,
       task_id TEXT,         -- task this session was spawned to execute (redispatch correlation)
       runtime_session_id TEXT, -- provider conversation id (session separation/recovery evidence)
+      workdir TEXT,         -- cwd this session ran in — resume 후보 판정용 (아래 주석)
       token_usage INTEGER DEFAULT 0,
       cost_usd REAL DEFAULT 0,
       token_usage_reported INTEGER,
@@ -673,6 +674,13 @@ export function migrate(db: Database.Database): void {
   }
   if (!sessionRunCols.some((c) => c.name === "execution_spec_version_id")) {
     db.exec("ALTER TABLE sessions ADD COLUMN execution_spec_version_id TEXT");
+  }
+  // workdir: 이 세션이 실행된 cwd. Claude CLI 의 대화 저장소는 cwd 별로 갈리므로
+  // (`~/.claude/projects/<cwd-slug>/<conversation>.jsonl`), 다른 cwd 에서 만든
+  // runtime_session_id 로 `--resume` 하면 반드시 실패한다. resume 후보를 같은 workdir 로
+  // 좁히는 근거 컬럼. 기존 행은 NULL — 어디서 돌았는지 알 수 없으므로 후보에서 제외한다.
+  if (!sessionRunCols.some((c) => c.name === "workdir")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN workdir TEXT");
   }
 
   // tasks status CHECK recreate — 'skipped' terminal state (W0 마이그레이션 안전화).

@@ -345,11 +345,21 @@ export function createClaudeCodeAdapter(runtime: {
 
         const result = await runAttempt(resumeId);
 
-        // If resume failed with "unknown session" error, retry fresh
+        // resume 시도가 "대화를 시작조차 못 하고" 죽었으면 fresh 로 재시도한다.
+        // 문구 매칭(isUnknownSessionError)만으로 판정하지 않는 이유: CLI 판마다 stale resume
+        // 문구가 달라지고(2.1.x = "No conversation found"), 문구가 어긋나면 재시도가 통째로
+        // 안 걸려 error_during_execution 이 호출자에게 그대로 터진다(실측 회귀). 문구 대신
+        // "턴이 0" 이라는 관측 사실을 1차 신호로 쓴다.
+        // 제외 조건:
+        // - exitCode === null: signal 종료(timeout/kill) — 재시도해도 같은 벽에 부딪히고
+        //   idle timeout 만큼 더 태운다.
+        // - rate limit: fresh 재시도해도 한도는 그대로다. 아래 rate-limit 분기(failover)로 보낸다.
         if (
           resumeId &&
           result.exitCode !== 0 &&
-          isUnknownSessionError(result.stderr)
+          result.exitCode !== null &&
+          !isRateLimitError(result.stderr) &&
+          (isUnknownSessionError(result.stderr) || producedNoTurn(result.stdout))
         ) {
           log.info(
             `Session "${resumeId}" unavailable, retrying with fresh session`,
@@ -555,15 +565,41 @@ function extractSessionId(output: string): string | null {
 }
 
 /**
+ * 이 실행이 대화를 시작조차 못 했는지 — stream-json 에 assistant/user 턴 이벤트가 하나도
+ * 없으면 true. stale `--resume` 은 CLI 가 프롬프트를 보내기 전에 죽으므로 항상 턴 0 이다.
+ * 정상 실패(모델이 응답하다 끊김)는 assistant 이벤트가 남아 여기 걸리지 않는다.
+ */
+function producedNoTurn(stdout: string): boolean {
+  for (const line of stdout.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event.type === "assistant" || event.type === "user") return false;
+      if (event.type === "result" && typeof event.num_turns === "number" && event.num_turns > 0) {
+        return false;
+      }
+    } catch { /* 비 JSON 라인은 턴 근거가 아니다 */ }
+  }
+  return true;
+}
+
+/**
  * Check if error indicates an unknown/expired session.
  * Paperclip auto-retries with fresh session in this case.
+ *
+ * "no conversation found" 은 실제 CLI(2.1.x)가 stale `--resume` 에 내는 문구다.
+ * Claude CLI 의 대화 저장소는 cwd 별로 갈리므로, 같은 agent 의 직전 세션이 goal
+ * worktree(`.crewdeck-worktrees/...`)에서 돌았다면 프로젝트 루트에서의 재개는 반드시
+ * 실패한다 — 이 패턴이 없으면 fresh 재시도가 안 걸려 `error_during_execution`
+ * (num_turns:0, 텍스트 없음)이 그대로 호출자에게 터진다. 실측: 목표 AI 생성 500.
  */
 function isUnknownSessionError(stderr: string): boolean {
   const lower = stderr.toLowerCase();
   return (
     lower.includes("unknown session") ||
     lower.includes("session not found") ||
-    lower.includes("invalid session")
+    lower.includes("invalid session") ||
+    lower.includes("no conversation found")
   );
 }
 

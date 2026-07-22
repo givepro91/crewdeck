@@ -1,6 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
 import { getBackend, type AgentSession, type AgentProvider } from "./adapters/backend.js";
 import { resolveProviderTrace, loadProviderConfig } from "./provider.js";
 import { createLogger } from "../../utils/logger.js";
@@ -60,6 +60,15 @@ export interface SessionPromptOptions {
   omitUnstructuredTaskOutput?: boolean;
   /** Start a provider conversation with no resume chain. */
   forceNewSession?: boolean;
+  /** 과거 세션 이력(sessions.runtime_session_id)에서 대화를 이어받는다 — **opt-in**.
+   *  기본이 fresh 인 이유: crewdeck 의 spawn 은 대부분 spawn→send→killSession 단발이고
+   *  프롬프트가 자족적이다(프로젝트 컨텍스트·기존 목표·CLAUDE.md 를 매번 전량 주입).
+   *  단발 호출이 무관한 이전 대화를 이어받으면 맥락이 오염되고(실측: 목표 제안이 autopilot
+   *  goal worktree 의 cto 대화를 재개하려 함), CLI 저장소가 cwd 별로 갈려 하드 실패까지 났다.
+   *  프로세스 내 keep-alive 세션의 연속 send 는 이 옵션과 무관하다 — 어댑터가 자기
+   *  lastSessionId 로 이어간다. 이 옵션이 기여하는 건 keep-alive 가 끊긴 뒤(서버 재시작 등)
+   *  첫 턴을 과거 대화로 되살리는 경우뿐이라, 채팅처럼 연속성이 곧 기능인 경로만 켠다. */
+  resumeFromHistory?: boolean;
   /** Generator(구현·fix) 스텝 경계 전용: 이 goal 의 pending 조향(steering) 노트를 시스템
    *  프롬프트 말미에 주입하고 큐를 소진(injected=1)한다. Evaluator 세션은 이 옵션을
    *  설정하지 않으므로 주입 대상에서 제외된다(Generator-Evaluator 분리 유지). */
@@ -263,12 +272,24 @@ export function createSessionManager(
       // no text), which surfaces as "Goal suggestion produced no text output".
       // Filter by provider so a Claude spawn never resumes a Codex thread id (and vice
       // versa) — a provider mismatch would re-trigger the same hard failure.
-      const lastSession = db.prepare(
-        `SELECT runtime_session_id FROM sessions
-          WHERE agent_id = ? AND status = 'completed' AND provider = ?
-            AND runtime_session_id IS NOT NULL
-          ORDER BY ended_at DESC LIMIT 1`,
-      ).get(agentId, provider) as { runtime_session_id: string } | undefined;
+      // Filter by workdir for the same reason: Claude CLI 의 대화 저장소는 cwd 별로 갈린다
+      // (`~/.claude/projects/<cwd-slug>/`). goal worktree 에서 돈 세션의 id 를 프로젝트
+      // 루트 spawn 에 넘기면 CLI 가 "No conversation found" 로 즉사한다(실측). 어댑터가
+      // fresh 로 자동 복구하긴 하지만, 애초에 성립할 수 없는 후보라 넘기지 않는다.
+      // workdir IS NULL(컬럼 도입 전 legacy 행)은 어디서 돌았는지 알 수 없어 제외한다.
+      // 조회 자체가 resumeFromHistory opt-in 경로 전용이다 — 단발 호출은 후보를 찾지 않는다.
+      const sessionWorkdir = resolvePath(projectWorkdir);
+      const wantsHistoryResume = promptOptions?.resumeFromHistory === true
+        && !promptOptions?.forceNewSession;
+      const lastSession = wantsHistoryResume
+        ? db.prepare(
+            `SELECT runtime_session_id FROM sessions
+              WHERE agent_id = ? AND status = 'completed' AND provider = ?
+                AND runtime_session_id IS NOT NULL
+                AND workdir = ?
+              ORDER BY ended_at DESC LIMIT 1`,
+          ).get(agentId, provider, sessionWorkdir) as { runtime_session_id: string } | undefined
+        : undefined;
 
       // 모델 매핑: agent.model은 Claude 별칭(opus/sonnet). Codex엔 codexModelMap으로 변환(없으면 -m 생략).
       const modelForBackend = provider === "codex"
@@ -319,13 +340,15 @@ export function createSessionManager(
             agent_id, status, provider,
             provider_trace_resolved_provider, provider_trace_resolution_source, task_id,
             process_owner_token, execution_run_id, execution_spec_version_id,
-            workspace_id, session_key, origin
-          ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+            workspace_id, session_key, origin, workdir
+          ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
         `)
         // resolved_provider = 실제로 실행된 provider(failover override 반영). 기본 해석과
         // override가 갈릴 때 sessions.provider와 provider_trace_resolved_provider가 어긋나지
         // 않도록 override를 포함한 `provider`를 기록한다.
         // task_id: 이 세션이 실행하는 task — failover 재디스패치 backfill의 세션↔task 귀속에 쓴다.
+        // workdir: 어댑터가 실제로 cwd로 쓰는 값과 같은 정규화(resolvePath)로 기록해야
+        // 다음 spawn의 resume 후보 비교가 성립한다.
         .get(
           agentId,
           provider,
@@ -338,6 +361,7 @@ export function createSessionManager(
           workspaceId,
           key,
           origin,
+          sessionWorkdir,
         ) as { id: string };
       keyToSessionRecord.set(key, {
         sessionKey: key,
